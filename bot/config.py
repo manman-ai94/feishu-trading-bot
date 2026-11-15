@@ -32,7 +32,8 @@ def _load_env_file(path: Path, problems: list[str]) -> None:
     # Notepad on Windows may save with a BOM, or in the system's own encoding.
     for encoding in ("utf-8-sig", locale.getpreferredencoding(False)):
         try:
-            load_dotenv(path, override=False, encoding=encoding)
+            # interpolate=False: a secret that happens to contain "${...}" must stay as it is.
+            load_dotenv(path, override=False, interpolate=False, encoding=encoding)
             return
         except UnicodeDecodeError:
             continue

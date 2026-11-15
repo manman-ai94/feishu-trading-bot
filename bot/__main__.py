@@ -4,6 +4,7 @@
     python -m bot run           start the bot
     python -m bot status        print the current account status in the console
     python -m bot brief morning send a brief right now (morning | evening | weekly)
+    python -m bot setenv        write NAME=value lines from standard input into .env
 """
 from __future__ import annotations
 
@@ -137,6 +138,32 @@ def send_brief(cfg: Config, kind: str) -> int:
     return 0
 
 
+def set_env(env_file: str, stdin=None) -> int:
+    """Reads NAME=value lines from standard input and writes them into .env.
+
+    Only the names are printed. The values are never shown or logged.
+    """
+    from pathlib import Path
+
+    from .envfile import parse_assignments, write_env_values
+
+    stream = stdin if stdin is not None else sys.stdin
+    raw = stream.buffer.read() if hasattr(stream, "buffer") else stream.read()
+    text = raw.decode("utf-8-sig", errors="replace") if isinstance(raw, bytes) else raw
+    updates, skipped, bad = parse_assignments(text)
+    if bad:
+        _print("[X]", f"这几行不是 NAME=value 的格式，没有写入任何内容：{'、'.join(bad)}")
+        return 1
+    if skipped:
+        _print("[!]", f"留空没改：{'、'.join(skipped)}")
+    if not updates:
+        _print("[!]", "没有收到要写入的内容")
+        return 0
+    write_env_values(Path(env_file), updates)
+    _print("[OK]", f"已写入 {env_file}：{'、'.join(updates)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Windows consoles default to a legacy code page; make Chinese output safe.
     for stream in (sys.stdout, sys.stderr):
@@ -151,7 +178,11 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("status", help="在命令行里打印当前账户状态")
     brief = commands.add_parser("brief", help="立刻发送一份简报")
     brief.add_argument("kind", choices=["morning", "evening", "weekly"])
+    commands.add_parser("setenv", help="把标准输入里的 NAME=value 写进 .env（只显示名字，不显示值）")
     args = parser.parse_args(argv)
+
+    if args.command == "setenv":
+        return set_env(args.env)
 
     cfg, problems = load_config(args.env)
 
