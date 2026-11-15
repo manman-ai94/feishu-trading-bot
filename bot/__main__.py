@@ -169,15 +169,22 @@ def ask(cfg: Config, question: str) -> int:
     from .journal import Journal
     from .market import build_market_context
 
+    import time
+
     okx = build_okx(cfg)
-    analyst, resolver, _ = build_ai(cfg, okx, Journal(cfg.db_path))
+    journal = Journal(cfg.db_path)
+    analyst, resolver, _ = build_ai(cfg, okx, journal)
     named = resolver.find_in_text(question, limit=2)
     market = "\n\n".join(build_market_context(okx, inst_id).to_text() for inst_id in named)
+    started = time.time()
     try:
         print(analyst.answer(question, market, None, in_group=True))
     except AnalystUnavailable as exc:
         _print("[X]", str(exc))
         return 1
+    finally:
+        used = journal.usage_between(int(started), time.time() + 1)
+        print(f"\n[用量] 用时 {time.time() - started:.0f} 秒，联网搜索 {used['web_searches']} 次，约 {used['cost_usd']:.3f} 美元（估算）")
     return 0
 
 

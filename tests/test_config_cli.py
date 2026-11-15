@@ -204,7 +204,8 @@ def test_ask_command_without_a_claude_key_explains_itself(tmp_path, monkeypatch,
     monkeypatch.setattr("bot.app.build_okx", lambda cfg: OnlineOkx())
     monkeypatch.chdir(tmp_path)
     code = main(["--env", str(tmp_path / "missing.env"), "ask", "BTC 现在怎么看"])
-    assert code == 1 and "还没有配置 Claude 的 API key" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert code == 1 and "还没有配置 Claude 的 API key" in output and "[用量]" in output and "约 0.000 美元" in output
 
 
 def test_run_refuses_to_start_without_feishu_credentials(tmp_path, capsys):
