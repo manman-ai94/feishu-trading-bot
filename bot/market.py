@@ -6,10 +6,13 @@ to use only these numbers.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .indicators import atr, ema, recent_range, rsi
-from .models import Ticker
+from .models import Candle, OpenInterest, Ticker
 from .okx_client import OkxClient, OkxError, OkxNetworkError
 
 log = logging.getLogger(__name__)
@@ -52,6 +55,7 @@ class MarketContext:
     inst_id: str
     ticker: Ticker | None = None
     funding_rate: float | None = None
+    open_interest: OpenInterest | None = None
     views: list[TimeframeView] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -70,6 +74,10 @@ class MarketContext:
                 lines.append(f"24 小时涨跌：{ticker.change_24h_pct:+.2f}%")
         if self.funding_rate is not None:
             lines.append(f"当前资金费率 (funding rate)：{self.funding_rate * 100:+.4f}%")
+        if self.open_interest is not None:
+            interest = _open_interest_text(self.open_interest)
+            if interest:
+                lines.append(f"持仓量 (open interest)：{interest}")
         for view in self.views:
             parts = [f"收盘 {_px(view.close)}", f"趋势 {view.trend}"]
             if view.ema20 is not None:
@@ -90,8 +98,59 @@ class MarketContext:
         return "\n".join(lines)
 
 
-def _px(value: float) -> str:
-    return f"{value:,.2f}"
+def fmt_price(value: float) -> str:
+    """Two decimals for gold or BTC, more for coins that cost cents or less."""
+    size = abs(value)
+    if size >= 100 or size == 0:
+        return f"{value:,.2f}"
+    decimals = min(12, 3 - math.floor(math.log10(size)))
+    return f"{value:,.{decimals}f}"
+
+
+_px = fmt_price
+
+
+def _open_interest_text(interest: OpenInterest) -> str:
+    parts = []
+    if interest.coins:
+        parts.append(f"{interest.coins:,.0f} 单位标的")
+    if interest.usd:
+        parts.append(f"约 {interest.usd / 1e8:,.2f} 亿美元")
+    return "，".join(parts)
+
+
+def quote_line(okx: OkxClient, inst_id: str) -> str:
+    """One line with the latest price, straight from OKX, no AI involved."""
+    ticker = okx.ticker(inst_id)
+    parts = []
+    if ticker.change_24h_pct is not None:
+        parts.append(f"24 小时 {ticker.change_24h_pct:+.2f}%")
+    if ticker.high_24h and ticker.low_24h:
+        parts.append(f"区间 {fmt_price(ticker.low_24h)} 到 {fmt_price(ticker.high_24h)}")
+    try:
+        funding = okx.funding_rate(inst_id)
+    except (OkxError, OkxNetworkError):
+        funding = None
+    if funding is not None:
+        parts.append(f"资金费率 {funding * 100:+.4f}%")
+    detail = f"（{'，'.join(parts)}）" if parts else ""
+    return f"**{inst_id}** {fmt_price(ticker.last)}{detail}"
+
+
+def candles_text(inst_id: str, bar: str, candles: list[Candle], tz: ZoneInfo) -> str:
+    """Raw candles as text, oldest first, for the AI to read exact highs and lows."""
+    if not candles:
+        return f"{inst_id} 没有 {bar} K 线数据。"
+    stamp = "%Y-%m-%d" if bar.endswith(("D", "W", "M")) else "%m-%d %H:%M"
+    lines = [f"{inst_id} 的 {bar} K 线，共 {len(candles)} 根，从旧到新，时间为 {tz.key}。标 * 的一根还没收盘。"]
+    for candle in candles:
+        moment = datetime.fromtimestamp(candle.ts / 1000, tz=tz).strftime(stamp)
+        mark = "" if candle.confirmed else " *"
+        lines.append(
+            f"{moment} 开 {fmt_price(candle.open)} 高 {fmt_price(candle.high)} "
+            f"低 {fmt_price(candle.low)} 收 {fmt_price(candle.close)}{mark}"
+        )
+    return "\n".join(lines)
 
 
 def build_market_context(okx: OkxClient, inst_id: str) -> MarketContext:
@@ -104,6 +163,10 @@ def build_market_context(okx: OkxClient, inst_id: str) -> MarketContext:
         context.funding_rate = okx.funding_rate(inst_id)
     except (OkxError, OkxNetworkError) as exc:
         log.info("no funding rate for %s: %s", inst_id, exc)
+    try:
+        context.open_interest = okx.open_interest(inst_id)
+    except (OkxError, OkxNetworkError) as exc:
+        log.info("no open interest for %s: %s", inst_id, exc)
     for bar, limit, label, lookback in TIMEFRAMES:
         try:
             candles = okx.candles(inst_id, bar, limit)

@@ -27,6 +27,19 @@ CREATE TABLE IF NOT EXISTS events (
     payload TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+CREATE TABLE IF NOT EXISTS ai_usage (
+    ts INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 1,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    web_searches INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_ts ON ai_usage (ts);
 """
 
 
@@ -89,6 +102,44 @@ class Journal:
                 (int(start), int(end)),
             ).fetchall()
         return [(row["ts"], row["total_eq"]) for row in rows]
+
+    def record_usage(
+        self,
+        purpose: str,
+        model: str,
+        requests: int = 1,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        web_searches: int = 0,
+        cost_usd: float = 0.0,
+        ts: float | None = None,
+    ) -> None:
+        """One row per piece of AI work (a question, a brief), however many API requests it took."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO ai_usage (ts, purpose, model, requests, input_tokens, output_tokens, cache_read_tokens,"
+                " cache_write_tokens, web_searches, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(ts or time.time()), purpose, model, requests, input_tokens, output_tokens, cache_read_tokens,
+                 cache_write_tokens, web_searches, cost_usd),
+            )
+            self._db.commit()
+
+    def usage_between(self, start: float, end: float) -> dict:
+        """AI use in [start, end): pieces of work, web searches and estimated cost in USD.
+
+        Sorting a message (purpose 'routing') and self-checks count towards the
+        cost but not as pieces of work.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COALESCE(SUM(CASE WHEN purpose IN ('routing', 'self-check') THEN 0 ELSE 1 END), 0) AS jobs,"
+                " COALESCE(SUM(web_searches), 0) AS web_searches, COALESCE(SUM(cost_usd), 0) AS cost_usd"
+                " FROM ai_usage WHERE ts >= ? AND ts < ?",
+                (int(start), int(end)),
+            ).fetchone()
+        return {"jobs": row["jobs"], "web_searches": row["web_searches"], "cost_usd": row["cost_usd"]}
 
     def close(self) -> None:
         with self._lock:

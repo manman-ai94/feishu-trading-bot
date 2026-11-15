@@ -10,8 +10,11 @@ from bot.__main__ import main
 from bot.config import load_config, parse_weekly
 from bot.okx_client import OkxNetworkError
 
-PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "ALERT_", "BRIEF_", "GROUP_")
-NAMES = ("OWNER_OPEN_ID", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES", "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR")
+PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_")
+NAMES = (
+    "OWNER_OPEN_ID", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
+    "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR",
+)  # fmt: skip
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -42,7 +45,9 @@ def test_empty_configuration_lists_what_is_missing():
     assert any("/whoami" in item for item in problems)
     assert not cfg.has_okx_keys
     assert cfg.watch_instruments == ("XAU-USDT-SWAP",)
-    assert (cfg.model_quick, cfg.model_daily, cfg.model_deep) == ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
+    assert (cfg.model_quick, cfg.model_daily, cfg.model_deep) == ("claude-haiku-5-5", "claude-opus-5-5", "claude-opus-5-5")
+    assert (cfg.effort_daily, cfg.effort_deep) == ("medium", "high")
+    assert cfg.web_search and cfg.ai_monthly_budget_usd == 180.0 and cfg.knowledge_dir == Path("knowledge")
     assert (cfg.brief_morning, cfg.brief_evening, cfg.weekly_review) == (time(6, 0), time(14, 0), (6, time(17, 0)))
     assert str(cfg.tz) == "America/Los_Angeles"
     assert cfg.group_show_pnl and cfg.group_owner_only  # the owner's chosen defaults
@@ -65,6 +70,20 @@ def test_complete_env_file(tmp_path):
     assert cfg.brief_morning is None and cfg.brief_evening == time(21, 30) and cfg.weekly_review == (4, time(16, 0))
     assert cfg.alert_margin_ratio is None and cfg.alert_liq_distance_pct == 5.0 and cfg.alert_daily_loss_usd == 500.0
     assert cfg.poll_seconds == 5  # never faster than every 5 seconds
+
+
+def test_ai_settings_can_be_changed(tmp_path):
+    path = write_env(tmp_path, "MODEL_DAILY=claude-sonnet-5-5\nEFFORT_DAILY=LOW\nEFFORT_DEEP=max\nWEB_SEARCH=false\nAI_MONTHLY_BUDGET_USD=off\nKNOWLEDGE_DIR=kb\n")
+    cfg, _ = load_config(path)
+    assert (cfg.model_daily, cfg.effort_daily, cfg.effort_deep) == ("claude-sonnet-5-5", "low", "max")
+    assert not cfg.web_search and cfg.ai_monthly_budget_usd is None and cfg.knowledge_dir == Path("kb")
+
+
+def test_mistakes_in_the_ai_settings_are_explained(tmp_path):
+    path = write_env(tmp_path, "EFFORT_DAILY=turbo\nAI_MONTHLY_BUDGET_USD=lots\n")
+    cfg, problems = load_config(path)
+    assert cfg.effort_daily == "medium" and cfg.ai_monthly_budget_usd == 180.0
+    assert any("EFFORT_DAILY" in item for item in problems) and any("AI_MONTHLY_BUDGET_USD" in item for item in problems)
 
 
 def test_values_left_empty_fall_back_to_defaults(tmp_path):
@@ -143,6 +162,49 @@ def test_selfcheck_with_nothing_configured(tmp_path, monkeypatch, capsys):
     assert "有 4 项没通过" in output
     for expected in ("OKX 行情读取失败", "还没填 OKX 的三个 key", "还没有配置 Claude 的 API key", "还没填飞书的 App ID"):
         assert expected in output
+
+
+class OnlineOkx:
+    """Public market data works; there are no account keys."""
+
+    def __new__(cls):
+        from .helpers import FakeOkx
+
+        okx = FakeOkx()
+        okx.sync_clock = lambda: 0.12
+        return okx
+
+
+def test_selfcheck_shows_that_other_instruments_can_be_looked_up(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("bot.app.build_okx", lambda cfg: OnlineOkx())
+    monkeypatch.chdir(tmp_path)
+    code = main(["--env", str(tmp_path / "missing.env"), "selfcheck"])
+    output = capsys.readouterr().out
+    assert code == 1  # the keys are still missing
+    for expected in (
+        "XAU-USDT-SWAP 最新价 2,650.00",
+        "其他品种也能查：BTC 对应 BTC-USDT-SWAP",
+        "其他品种也能查：以太坊 对应 ETH-USDT-SWAP",
+        "资料库文件夹 knowledge，现有 0 个文件",
+    ):
+        assert expected in output
+    assert not (tmp_path / "data").exists()  # a self-check writes nothing to disk
+
+
+def test_quote_command_prints_prices_without_any_keys(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("bot.app.build_okx", lambda cfg: OnlineOkx())
+    code = main(["--env", str(tmp_path / "missing.env"), "quote", "BTC", "黄金", "AAPL"])
+    output = capsys.readouterr().out
+    assert code == 1  # one of the three is not on OKX
+    assert "[OK] BTC：BTC-USDT-SWAP 2,650.00（24 小时 +1.92%" in output
+    assert "[OK] 黄金：XAU-USDT-SWAP 2,650.00" in output and "[X] OKX 上没有找到 AAPL" in output
+
+
+def test_ask_command_without_a_claude_key_explains_itself(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("bot.app.build_okx", lambda cfg: OnlineOkx())
+    monkeypatch.chdir(tmp_path)
+    code = main(["--env", str(tmp_path / "missing.env"), "ask", "BTC 现在怎么看"])
+    assert code == 1 and "还没有配置 Claude 的 API key" in capsys.readouterr().out
 
 
 def test_run_refuses_to_start_without_feishu_credentials(tmp_path, capsys):

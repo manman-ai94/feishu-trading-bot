@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 
 import requests
 
-from .models import AccountSnapshot, AccountState, Candle, Position, StopOrder, Ticker, to_float
+from .models import AccountSnapshot, AccountState, Candle, OpenInterest, Position, StopOrder, Ticker, to_float
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +171,22 @@ class OkxClient:
     def funding_rate(self, inst_id: str) -> float | None:
         data = self._get("/api/v5/public/funding-rate", {"instId": inst_id})
         return to_float(data[0].get("fundingRate")) if data else None
+
+    def instruments(self, inst_type: str) -> list[dict]:
+        """Every instrument of one type (SPOT, SWAP, ...), as OKX lists them."""
+        return self._get("/api/v5/public/instruments", {"instType": inst_type})
+
+    def open_interest(self, inst_id: str) -> OpenInterest | None:
+        """Open interest of a perpetual or futures contract. None for spot."""
+        parts = inst_id.split("-")
+        if len(parts) < 3:
+            return None
+        inst_type = "SWAP" if parts[-1] == "SWAP" else "FUTURES"
+        data = self._get("/api/v5/public/open-interest", {"instType": inst_type, "instId": inst_id})
+        if not data:
+            return None
+        row = data[0]
+        return OpenInterest(coins=to_float(row.get("oiCcy")), usd=to_float(row.get("oiUsd")))
 
     # --------------------------------------------------------------- private
 

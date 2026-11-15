@@ -4,6 +4,8 @@
     python -m bot run           start the bot
     python -m bot status        print the current account status in the console
     python -m bot brief morning send a brief right now (morning | evening | weekly)
+    python -m bot quote BTC ETH print the latest OKX price of the given instruments
+    python -m bot ask "问题"    ask the AI one market question in the console (no account data)
     python -m bot setenv        write NAME=value lines from standard input into .env
     python -m bot checkenv      say whether each key sits in the right line (shows no values)
     python -m bot clearenv NAME empty the given lines of .env
@@ -22,9 +24,12 @@ def _print(mark: str, text: str) -> None:
 
 def selfcheck(cfg: Config, problems: list[str]) -> int:
     """Walks through every connection and says, in plain words, what works."""
-    from .analyst import Analyst, AnalystUnavailable
-    from .app import build_okx
+    from .analyst import AnalystUnavailable
+    from .app import build_ai, build_okx
     from .feishu_client import FeishuClient
+    from .instruments import InstrumentResolver
+    from .journal import Journal
+    from .market import fmt_price
     from .okx_client import OkxError, OkxNetworkError
 
     failures = 0
@@ -46,7 +51,14 @@ def selfcheck(cfg: Config, problems: list[str]) -> int:
             _print("[OK]", f"能连上 OKX，时间相差 {offset:+.2f} 秒")
         for inst_id in cfg.watch_instruments:
             ticker = okx.ticker(inst_id)
-            _print("[OK]", f"{inst_id} 最新价 {ticker.last:,.2f}")
+            _print("[OK]", f"{inst_id} 最新价 {fmt_price(ticker.last)}")
+        resolver = InstrumentResolver(okx)
+        for name in ("BTC", "以太坊"):
+            inst_id = resolver.resolve(name)
+            if inst_id is None:
+                _print("[!]", f"没能在 OKX 的品种列表里找到 {name}，问其他品种时可能查不到行情")
+            else:
+                _print("[OK]", f"其他品种也能查：{name} 对应 {inst_id}，最新价 {fmt_price(okx.ticker(inst_id).last)}")
     except (OkxError, OkxNetworkError) as exc:
         failures += 1
         _print("[X]", f"OKX 行情读取失败：{exc}")
@@ -67,12 +79,20 @@ def selfcheck(cfg: Config, problems: list[str]) -> int:
             _print("   ", "常见原因：key 填错、Passphrase 不对、这台机器的 IP 不在这把 key 的白名单里")
 
     print("\n== 4. Claude ==")
+    analyst, _, knowledge = build_ai(cfg, okx, Journal(":memory:"))  # a self-check leaves no records
     try:
-        Analyst(cfg).ping()
+        analyst.ping()
         _print("[OK]", f"Claude 接口可用（{cfg.model_quick}）")
+        _print("[OK]", f"平时用 {cfg.model_daily} 的 {cfg.effort_daily} 档，“深度”用 {cfg.model_deep} 的 {cfg.effort_deep} 档")
+        try:
+            analyst.check_web_search()
+            _print("[OK]", "联网搜索可用，AI 能查新闻和经济数据")
+        except AnalystUnavailable as exc:
+            _print("[!]", f"联网搜索用不了，AI 只能看 OKX 的行情：{exc}")
     except AnalystUnavailable as exc:
         failures += 1
         _print("[X]", str(exc))
+    _print("[OK]", f"资料库文件夹 {cfg.knowledge_dir}，现有 {len(knowledge.summary())} 个文件")
 
     print("\n== 5. 飞书 ==")
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:
@@ -89,7 +109,7 @@ def selfcheck(cfg: Config, problems: list[str]) -> int:
             else:
                 _print("[!]", "还没填 OWNER_OPEN_ID，先 run 起来，私聊机器人发送 /whoami")
             if not cfg.group_chat_id:
-                _print("[!]", "还没填 GROUP_CHAT_ID，群里的简报和通知暂时不会发。在群里 @机器人 发送 /whoami 可以拿到")
+                _print("[!]", "还没登记群，群里的简报和通知暂时不会发。把机器人加进群后，在群里 @机器人 发送“登记本群”就行")
         except Exception as exc:
             failures += 1
             _print("[X]", f"飞书连接失败：{exc}")
@@ -117,9 +137,52 @@ def print_status(cfg: Config) -> int:
     return 0
 
 
+def print_quotes(cfg: Config, names: list[str]) -> int:
+    """Prints the latest OKX price of each name: a quick check that any instrument can be looked up."""
+    from .app import build_okx
+    from .instruments import InstrumentResolver
+    from .market import quote_line
+    from .okx_client import OkxError, OkxNetworkError
+
+    okx = build_okx(cfg)
+    resolver = InstrumentResolver(okx)
+    failures = 0
+    for name in names:
+        inst_id = resolver.resolve(name)
+        if inst_id is None:
+            failures += 1
+            _print("[X]", f"OKX 上没有找到 {name}")
+            continue
+        try:
+            _print("[OK]", f"{name}：{quote_line(okx, inst_id).replace('**', '')}")
+        except (OkxError, OkxNetworkError) as exc:
+            failures += 1
+            _print("[X]", f"{name}（{inst_id}）读取失败：{exc}")
+    return 1 if failures else 0
+
+
+def ask(cfg: Config, question: str) -> int:
+    """One market question, answered in the console exactly as the bot would in a group
+    that does not see the account. A way to try the AI and its tools without Feishu."""
+    from .analyst import AnalystUnavailable
+    from .app import build_ai, build_okx
+    from .journal import Journal
+    from .market import build_market_context
+
+    okx = build_okx(cfg)
+    analyst, resolver, _ = build_ai(cfg, okx, Journal(cfg.db_path))
+    named = resolver.find_in_text(question, limit=2)
+    market = "\n\n".join(build_market_context(okx, inst_id).to_text() for inst_id in named)
+    try:
+        print(analyst.answer(question, market, None, in_group=True))
+    except AnalystUnavailable as exc:
+        _print("[X]", str(exc))
+        return 1
+    return 0
+
+
 def send_brief(cfg: Config, kind: str) -> int:
-    from .analyst import Analyst
-    from .app import build_okx, setup_logging
+    from .app import build_ai, build_okx, setup_logging
     from .feishu_client import FeishuClient
     from .journal import Journal
     from .monitor import Monitor
@@ -128,7 +191,8 @@ def send_brief(cfg: Config, kind: str) -> int:
     setup_logging(cfg)
     journal = Journal(cfg.db_path)
     okx = build_okx(cfg)
-    reporter = Reporter(cfg, FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain), okx, Analyst(cfg), journal)
+    analyst, _, _ = build_ai(cfg, okx, journal)
+    reporter = Reporter(cfg, FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain), okx, analyst, journal)
     reporter.monitor = Monitor(okx, cfg, journal, lambda event: None)
     if cfg.has_okx_keys:
         reporter.monitor.poll_once()
@@ -236,6 +300,10 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("status", help="在命令行里打印当前账户状态")
     brief = commands.add_parser("brief", help="立刻发送一份简报")
     brief.add_argument("kind", choices=["morning", "evening", "weekly"])
+    quote = commands.add_parser("quote", help="打印几个品种在 OKX 的最新价，例如 quote BTC ETH 黄金")
+    quote.add_argument("names", nargs="+", metavar="NAME")
+    question = commands.add_parser("ask", help="在命令行里问 AI 一个行情问题（不带账户数据），用来试 AI 和它的工具")
+    question.add_argument("question")
     commands.add_parser("setenv", help="把标准输入里的 NAME=value 写进 .env（只显示名字，不显示值）")
     commands.add_parser("checkenv", help="检查每个密钥是不是填在了对的位置（只显示名字，不显示值）")
     clear = commands.add_parser("clearenv", help="把 .env 里指定的几项清空")
@@ -257,6 +325,10 @@ def main(argv: list[str] | None = None) -> int:
         return print_status(cfg)
     if args.command == "brief":
         return send_brief(cfg, args.kind)
+    if args.command == "quote":
+        return print_quotes(cfg, args.names)
+    if args.command == "ask":
+        return ask(cfg, args.question)
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:
         print("还没填飞书的 FEISHU_APP_ID 和 FEISHU_APP_SECRET，机器人无法启动。先运行：python -m bot selfcheck")
@@ -265,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[!] {problem}")
     from .app import run
 
-    run(cfg)
+    run(cfg, args.env)
     return 0
 
 

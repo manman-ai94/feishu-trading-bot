@@ -108,3 +108,18 @@ def test_journal_round_trip(tmp_path):
     reopened = Journal(tmp_path / "nested" / "bot.db")  # data survives a restart
     assert reopened.has_event("opened", 0, 3000)
     reopened.close()
+
+
+def test_ai_usage_is_added_up_per_period():
+    journal = Journal(":memory:")
+    journal.record_usage("question", "claude-opus-5-5", requests=3, input_tokens=9000, output_tokens=1500, web_searches=2, cost_usd=0.12, ts=1000)
+    journal.record_usage("morning brief", "claude-opus-5-5", cost_usd=0.30, web_searches=4, ts=1500)
+    journal.record_usage("routing", "claude-haiku-5-5", cost_usd=0.001, ts=1600)
+    journal.record_usage("self-check", "claude-haiku-5-5", cost_usd=0.002, ts=1700)
+    journal.record_usage("question", "claude-opus-5-5", cost_usd=0.5, ts=5000)
+
+    totals = journal.usage_between(0, 2000)
+    assert totals["jobs"] == 2 and totals["web_searches"] == 6  # sorting messages and self-checks are not "jobs"
+    assert abs(totals["cost_usd"] - 0.423) < 1e-9  # but what they cost is counted
+    assert journal.usage_between(2000, 9000) == {"jobs": 1, "web_searches": 0, "cost_usd": 0.5}
+    assert journal.usage_between(9000, 9999) == {"jobs": 0, "web_searches": 0, "cost_usd": 0}

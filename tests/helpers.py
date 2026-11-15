@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from bot.analyst import AnalystUnavailable
 from bot.config import Config
 from bot.feishu_client import IncomingMessage
-from bot.models import AccountSnapshot, AccountState, Candle, Position, StopOrder, Ticker
+from bot.models import AccountSnapshot, AccountState, Candle, OpenInterest, Position, StopOrder, Ticker
 
 OWNER = "ou_owner"
 FRIEND = "ou_friend"
@@ -137,7 +137,27 @@ class FakeOkx:
     def candles(self, inst_id: str, bar: str = "1H", limit: int = 200) -> list[Candle]:
         if self.market_error:
             raise self.market_error
-        return [Candle(i * 60_000, 2600.0 + i, 2601.0 + i, 2599.0 + i, 2600.5 + i) for i in range(60)]
+        return [Candle(i * 60_000, 2600.0 + i, 2601.0 + i, 2599.0 + i, 2600.5 + i) for i in range(min(limit, 60))]
+
+    def open_interest(self, inst_id: str) -> OpenInterest | None:
+        if self.market_error:
+            raise self.market_error
+        return OpenInterest(coins=18000.0, usd=1.2e9) if inst_id.endswith("-SWAP") else None
+
+    # What OKX lists: perpetuals and spot pairs, one of them suspended.
+    LISTED = {
+        "SWAP": ["XAU-USDT-SWAP", "BTC-USDT-SWAP", "BTC-USD-SWAP", "ETH-USDT-SWAP", "DOGE-USDT-SWAP"],
+        "SPOT": ["BTC-USDT", "ETH-USDT", "OKB-USDT", "LUNA-USDT"],
+    }
+
+    def instruments(self, inst_type: str) -> list[dict]:
+        self.instrument_reads = getattr(self, "instrument_reads", 0) + 1
+        if self.market_error:
+            raise self.market_error
+        return [
+            {"instId": inst_id, "instType": inst_type, "state": "suspend" if inst_id == "LUNA-USDT" else "live"}
+            for inst_id in self.LISTED.get(inst_type, [])
+        ]
 
 
 class FakeAnalyst:
@@ -160,8 +180,11 @@ class FakeAnalyst:
         self.calls.append(("route", {"text": text}))
         return self.intent
 
-    def answer(self, question, market_text, account_text, in_group, deep=False):
-        return self._record("answer", question=question, market_text=market_text, account_text=account_text, in_group=in_group, deep=deep)
+    def answer(self, question, market_text, account_text, in_group, deep=False, history=None):
+        return self._record(
+            "answer", question=question, market_text=market_text, account_text=account_text, in_group=in_group,
+            deep=deep, history=list(history or []),
+        )  # fmt: skip
 
     def brief(self, kind, market_text, account_text, journal_text, for_owner, shared_with_group=False):
         return self._record(

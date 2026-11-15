@@ -23,6 +23,7 @@ FEISHU_DOMAINS = {
 
 WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 OFF_WORDS = ("off", "none", "关")  # how the owner switches a feature off in .env
+EFFORTS = ("low", "medium", "high", "xhigh", "max")  # how hard the AI thinks; higher costs more and takes longer
 
 
 def _get(name: str, default: str = "") -> str:
@@ -104,9 +105,14 @@ class Config:
 
     # Claude
     anthropic_api_key: str = field(default="", repr=False)
-    model_quick: str = "claude-haiku-5-5"
-    model_daily: str = "claude-sonnet-5-5"
-    model_deep: str = "claude-opus-5-5"
+    model_quick: str = "claude-haiku-5-5"  # sorts incoming messages
+    model_daily: str = "claude-opus-5-5"  # questions and briefs
+    model_deep: str = "claude-opus-5-5"  # "深度" questions and the weekly review
+    effort_daily: str = "medium"
+    effort_deep: str = "high"
+    web_search: bool = True  # the AI may search the web for news and economic data
+    ai_monthly_budget_usd: float | None = 180.0  # above this the AI switches to its cheapest setting
+    knowledge_dir: Path = Path("knowledge")
 
     # Behaviour
     timezone: str = "America/Los_Angeles"
@@ -132,6 +138,12 @@ class Config:
     @property
     def has_okx_keys(self) -> bool:
         return bool(self.okx_api_key and self.okx_secret_key and self.okx_passphrase)
+
+    def register_group(self, chat_id: str) -> None:
+        """The one setting that changes while the bot runs: the owner registers
+        a group from inside Feishu. Every part of the bot shares this object, so
+        the briefs and alerts follow at once."""
+        object.__setattr__(self, "group_chat_id", chat_id)
 
 
 def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, list[str]]:
@@ -177,6 +189,13 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
             problems.append(f"WEEKLY_REVIEW 的格式应该像 SUN 17:00，现在是 {weekly_raw!r}")
             weekly = None
 
+    def _effort(name: str, default: str) -> str:
+        raw = _get(name, default).lower()
+        if raw not in EFFORTS:
+            problems.append(f"{name} 只能填 {'、'.join(EFFORTS)} 之一，现在是 {raw!r}")
+            return default
+        return raw
+
     instruments = tuple(
         item.strip().upper() for item in _get("WATCH_INSTRUMENTS", "XAU-USDT-SWAP").split(",") if item.strip()
     )
@@ -205,8 +224,13 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         watch_instruments=instruments or ("XAU-USDT-SWAP",),
         anthropic_api_key=secrets["ANTHROPIC_API_KEY"],
         model_quick=_get("MODEL_QUICK", "claude-haiku-5-5"),
-        model_daily=_get("MODEL_DAILY", "claude-sonnet-5-5"),
+        model_daily=_get("MODEL_DAILY", "claude-opus-5-5"),
         model_deep=_get("MODEL_DEEP", "claude-opus-5-5"),
+        effort_daily=_effort("EFFORT_DAILY", "medium"),
+        effort_deep=_effort("EFFORT_DEEP", "high"),
+        web_search=_get_bool("WEB_SEARCH", True),
+        ai_monthly_budget_usd=_get_float("AI_MONTHLY_BUDGET_USD", 180.0, problems),
+        knowledge_dir=Path(_get("KNOWLEDGE_DIR", "knowledge")),
         timezone=timezone,
         poll_seconds=max(5, _get_int("POLL_SECONDS", 30, problems)),
         snapshot_minutes=max(1, _get_int("SNAPSHOT_MINUTES", 15, problems)),

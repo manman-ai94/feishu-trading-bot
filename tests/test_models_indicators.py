@@ -86,3 +86,35 @@ def test_recent_range():
     candles = [Candle(0, 1, 9, 1, 1), Candle(1, 1, 5, 2, 1), Candle(2, 1, 6, 3, 1)]
     assert recent_range(candles, 2) == (6, 2)
     assert recent_range([], 5) is None
+
+
+def test_prices_keep_the_decimals_that_matter():
+    from bot.market import fmt_price
+
+    assert fmt_price(67890.123) == "67,890.12" and fmt_price(2650) == "2,650.00" and fmt_price(100) == "100.00"
+    assert fmt_price(65.4321) == "65.43" and fmt_price(1.23456) == "1.235"
+    assert fmt_price(0.123456) == "0.1235" and fmt_price(0.00001234) == "0.00001234"
+    assert fmt_price(0) == "0.00" and fmt_price(-0.5) == "-0.5000"
+
+
+def test_candles_text_marks_the_open_candle_and_uses_local_time():
+    from zoneinfo import ZoneInfo
+
+    from bot.market import candles_text
+    from bot.models import Candle
+
+    candles = [Candle(1_800_000_000_000, 100.0, 110.0, 95.0, 105.0), Candle(1_800_003_600_000, 105.0, 106.0, 104.0, 105.5, confirmed=False)]
+    text = candles_text("BTC-USDT-SWAP", "1H", candles, ZoneInfo("America/Los_Angeles"))
+    lines = text.splitlines()
+    assert "共 2 根" in lines[0] and "America/Los_Angeles" in lines[0]
+    assert lines[1] == "01-15 00:00 开 100.00 高 110.00 低 95.00 收 105.00" and lines[2].endswith("收 105.50 *")
+    assert candles_text("BTC-USDT-SWAP", "1D", candles, ZoneInfo("UTC")).splitlines()[1].startswith("2027-01-15 开")
+    assert "没有" in candles_text("BTC-USDT-SWAP", "1H", [], ZoneInfo("UTC"))
+
+
+def test_quote_line_needs_no_ai():
+    from bot.market import quote_line
+
+    from .helpers import FakeOkx
+
+    assert quote_line(FakeOkx(), "BTC-USDT-SWAP") == "**BTC-USDT-SWAP** 2,650.00（24 小时 +1.92%，区间 2,590.00 到 2,660.00，资金费率 +0.0100%）"

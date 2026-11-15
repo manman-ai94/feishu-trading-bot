@@ -165,6 +165,14 @@ class Ticker:
         return (self.last - self.open_24h) / self.open_24h * 100.0
 
 
+@dataclass(frozen=True)
+class OpenInterest:
+    """Open contracts of a perpetual or futures market, in coins and in USD."""
+
+    coins: float | None = None
+    usd: float | None = None
+
+
 @dataclass
 class AccountState:
     """One consistent read of the account, as used by the monitor and reports."""

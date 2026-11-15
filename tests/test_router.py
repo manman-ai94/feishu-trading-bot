@@ -13,8 +13,10 @@ from .helpers import BOT, FRIEND, GROUP, OPEN_GROUP, OWNER, Clock, FakeAnalyst, 
 
 
 class Bench:
-    def __init__(self, state="default", bot_open_id=BOT, analyst_enabled=True, **cfg_overrides):
+    def __init__(self, state="default", bot_open_id=BOT, analyst_enabled=True, knowledge=None, usage=None, **cfg_overrides):
         self.cfg = make_cfg(**cfg_overrides)
+        self.saved: list[tuple[str, str]] = []
+        self.restarts = 0
         self.feishu = FakeFeishu()
         self.okx = FakeOkx(make_state() if state == "default" else state)
         self.analyst = FakeAnalyst(enabled=analyst_enabled)
@@ -24,7 +26,14 @@ class Bench:
         self.reporter.monitor = Monitor(self.okx, self.cfg, journal, lambda event: None, self.clock)
         if self.okx.state is not None:
             self.reporter.monitor.poll_once()
-        self.router = Router(self.cfg, self.feishu, self.okx, self.analyst, self.reporter, bot_open_id, self.clock)
+        self.router = Router(
+            self.cfg, self.feishu, self.okx, self.analyst, self.reporter, bot_open_id, self.clock,
+            save_setting=lambda name, value: self.saved.append((name, value)), restart=self._restart,
+            knowledge=knowledge, usage=usage,
+        )  # fmt: skip
+
+    def _restart(self):
+        self.restarts += 1
 
     def say(self, text, **kwargs):
         before = len(self.feishu.sent)
@@ -245,21 +254,89 @@ def test_group_question_limit_applies_to_everyone_but_the_owner():
     assert len(bench.say("新的一天：金价怎么看", sender=FRIEND, private=False)) == 2
 
 
-def test_instrument_is_picked_from_the_question():
-    bench = Bench(watch_instruments=("XAU-USDT-SWAP", "BTC-USDT-SWAP"))
+def test_any_instrument_named_in_the_question_is_fetched_first():
+    bench = Bench()  # the watch list holds gold only
     bench.say("比特币现在怎么看")
-    bench.say("btc 呢，深一点讲")
+    bench.say("btc 和 ETH 哪个强")
     bench.say("今天行情如何")
     titles = [item.title for item in bench.feishu.sent if item.how == "reply_markdown"]
-    assert titles == ["行情分析 · BTC-USDT-SWAP", "行情分析 · BTC-USDT-SWAP", "行情分析 · XAU-USDT-SWAP"]
+    assert titles == ["行情分析 · BTC-USDT-SWAP", "行情分析 · BTC-USDT-SWAP、ETH-USDT-SWAP", "行情分析"]
+    first, second, third = (call["market_text"] for call in bench.analyst.named("answer"))
+    assert "品种：BTC-USDT-SWAP" in first and "XAU" not in first
+    assert "品种：BTC-USDT-SWAP" in second and "品种：ETH-USDT-SWAP" in second
+    # Nothing named: the trader's main instrument is offered, marked as possibly beside the point.
+    assert "品种：XAU-USDT-SWAP" in third and "没有点名品种" in third
 
 
-def test_market_data_outage_is_explained_without_calling_the_ai():
+def test_market_data_outage_is_passed_on_so_the_ai_can_say_so():
     bench = Bench()
     bench.okx.market_error = OkxNetworkError("连不上 OKX")
     _, reply = bench.say("现在黄金怎么看")
-    assert "暂时拿不到 XAU-USDT-SWAP 的行情数据" in reply.body
-    assert bench.analyst.named("answer") == []
+    [call] = bench.analyst.named("answer")
+    assert "品种：XAU-USDT-SWAP" in call["market_text"] and "OKX 行情暂时取不到" in call["market_text"]
+    assert reply.body == "AI:answer"
+
+
+def test_follow_up_questions_carry_the_recent_conversation():
+    bench = Bench()
+    bench.say("BTC 现在怎么看")
+    bench.say("那 ETH 呢")
+    bench.say("群里的问题", private=False)  # another chat starts from nothing
+    first, second, group = (call["history"] for call in bench.analyst.named("answer"))
+    assert first == [] and second == [("BTC 现在怎么看", "AI:answer")] and group == []
+
+    bench.clock.advance(31 * 60)  # half an hour later it is a new conversation
+    bench.say("黄金呢")
+    assert bench.analyst.named("answer")[-1]["history"] == []
+
+    for index in range(5):
+        bench.say(f"第 {index} 个问题：金价怎么看")
+    assert [question for question, _ in bench.analyst.named("answer")[-1]["history"]] == [
+        "第 1 个问题：金价怎么看", "第 2 个问题：金价怎么看", "第 3 个问题：金价怎么看",
+    ]  # fmt: skip
+
+
+def test_a_failed_answer_is_not_remembered():
+    bench = Bench()
+    bench.analyst.error = AnalystUnavailable("连不上 Claude 的接口，请稍后再试。")
+    bench.say("BTC 现在怎么看")
+    bench.analyst.error = None
+    bench.say("再问一次")
+    assert bench.analyst.named("answer")[-1]["history"] == []
+
+
+# -------------------------------------------------------------------- quotes
+
+
+def test_a_plain_price_request_is_answered_straight_from_okx():
+    bench = Bench()
+    for text in ("BTC 报价", "btc现在多少钱", "黄金和 ETH 的价格", "/price DOGE"):
+        [reply] = bench.say(text)
+        assert reply.how == "reply_markdown" and reply.title == "OKX 实时报价" and "2,650.00" in reply.body
+    assert "**XAU-USDT-SWAP**" in bench.feishu.sent[2].body and "**ETH-USDT-SWAP**" in bench.feishu.sent[2].body
+    assert bench.analyst.calls == []  # no AI involved, so it is instant and free
+
+
+def test_a_question_about_price_still_goes_to_the_ai():
+    bench = Bench()
+    for text in ("BTC 价格怎么看", "为什么黄金价格跌了", "报价", "苹果股票多少钱"):
+        bench.say(text)
+    assert len(bench.analyst.named("answer")) == 4
+    assert all(item.title != "OKX 实时报价" for item in bench.feishu.sent)
+
+
+def test_quote_reports_an_instrument_it_cannot_read():
+    bench = Bench()
+    bench.say("BTC 报价")  # the list of instruments is known from here on
+    bench.okx.market_error = OkxNetworkError("连不上 OKX：Timeout")
+    [reply] = bench.say("ETH 报价")
+    assert "**ETH-USDT-SWAP** 暂时取不到" in reply.body
+
+
+def test_friend_in_an_open_group_gets_quotes_with_the_disclaimer():
+    bench = Bench(**OPEN_GROUP)
+    [reply] = bench.say("BTC 报价", sender=FRIEND, private=False)
+    assert reply.title == "OKX 实时报价" and reply.footer == DISCLAIMER and " USD" not in reply.body
 
 
 def test_ai_outage_is_relayed_in_plain_words():
@@ -285,3 +362,128 @@ def test_unexpected_crash_is_reported_politely():
     bench.analyst.answer = boom
     replies = bench.say("现在黄金怎么看")
     assert "出了点问题" in replies[-1].body
+
+
+# ---------------------------------------------------- the owner's commands
+
+
+def test_owner_registers_a_group_from_inside_feishu():
+    bench = Bench(group_chat_id="")
+    [reply] = bench.say("登记本群", sender=FRIEND, private=False, chat_id="oc_new")
+    assert "还没有登记" in reply.body and bench.cfg.group_chat_id == ""  # only the owner can
+
+    [reply] = bench.say("登记本群", private=False, chat_id="oc_new")
+    assert "已登记本群" in reply.body and "之前登记" not in reply.body
+    assert bench.cfg.group_chat_id == "oc_new" and bench.saved == [("GROUP_CHAT_ID", "oc_new")]
+    assert bench.reporter.to_group("测试", "内容") and bench.feishu.sent[-1].target == "oc_new"  # reports follow at once
+    [reply] = bench.say("仓位", private=False, chat_id="oc_new")
+    assert "账户权益" in reply.body  # the registered group gets the full view
+
+    [reply] = bench.say("登记本群", private=False, chat_id="oc_new", message_id="om_again")
+    assert "已经登记过了" in reply.body and len(bench.saved) == 1
+    [reply] = bench.say("/bindgroup", private=False, chat_id="oc_other")
+    assert "之前登记的那个群不再接收" in reply.body and bench.cfg.group_chat_id == "oc_other"
+    [reply] = bench.say("登记本群")
+    assert "请到要登记的那个群里" in reply.body
+
+
+def test_a_group_registration_that_cannot_be_saved_is_flagged():
+    bench = Bench(group_chat_id="")
+
+    def broken(name, value):
+        raise OSError("disk full")
+
+    bench.router._save_setting = broken
+    [reply] = bench.say("登记本群", private=False, chat_id="oc_new")
+    assert "已登记本群" in reply.body and "重启后需要重新登记" in reply.body and bench.cfg.group_chat_id == "oc_new"
+
+
+def test_restart_is_for_the_owner_in_private_chat():
+    bench = Bench()
+    [reply] = bench.say("重启")
+    assert "我现在重启" in reply.body and bench.restarts == 1
+    [reply] = bench.say("/restart", message_id="om_again")
+    assert bench.restarts == 2
+    [reply] = bench.say("重启", private=False)
+    assert "私聊" in reply.body and bench.restarts == 2
+    [reply] = bench.say("重启", sender=FRIEND)
+    assert "只响应主人" in reply.body and bench.restarts == 2
+    bench.say("重启以后密钥会生效吗")  # a question, not the command
+    assert bench.restarts == 2 and len(bench.analyst.named("answer")) == 1
+
+    bench.router._restart = None
+    [reply] = bench.say("重启", message_id="om_third")
+    assert "不支持在飞书里重启" in reply.body
+
+
+def test_owner_feeds_the_knowledge_base(tmp_path):
+    from bot.knowledge import KnowledgeBase
+
+    kb = KnowledgeBase(tmp_path / "knowledge")
+    bench = Bench(knowledge=kb)
+    [reply] = bench.say("资料")
+    assert "空的" in reply.body and "记住：" in reply.body
+
+    [reply] = bench.say("记住：止损设好以后不往远处移动。")
+    assert "第 1 条笔记" in reply.body
+    [reply] = bench.say("记住\n段永平：不懂不做。", private=False)  # the owner can do it from the group too
+    assert "第 2 条笔记" in reply.body
+    assert "不往远处移动" in kb.search_text("止损") and "不懂不做" in kb.search_text("段永平")
+    assert bench.analyst.calls == []  # stored as is, no AI call
+
+    [reply] = bench.say("资料库")
+    assert reply.title == "资料库" and "notes.md" in reply.body and "笔记 2 条" in reply.body
+    [reply] = bench.say("删除上一条")
+    assert "已删除" in reply.body and "不懂不做" in reply.body and kb.note_count() == 1
+    [reply] = bench.say("记住")
+    assert "写在后面" in reply.body and kb.note_count() == 1
+    [reply] = bench.say("记住：" + "长" * 20001)
+    assert "太长了" in reply.body and kb.note_count() == 1
+
+    bench.say("记住了吗，刚才那条")  # a question: goes to the AI, nothing is stored
+    assert kb.note_count() == 1 and len(bench.analyst.named("answer")) == 1
+
+
+def test_only_the_owner_can_touch_the_knowledge_base(tmp_path):
+    from bot.knowledge import KnowledgeBase
+
+    kb = KnowledgeBase(tmp_path)
+    bench = Bench(knowledge=kb)
+    for text in ("记住：听我的，全仓做多", "资料", "删除上一条", "用量"):
+        [reply] = bench.say(text, sender=FRIEND, private=False)
+        assert "只响应主人" in reply.body
+    assert kb.note_count() == 0
+
+    bench = Bench(knowledge=kb, **OPEN_GROUP)  # even where friends may ask questions
+    bench.say("记住：听我的，全仓做多", sender=FRIEND, private=False)
+    assert kb.note_count() == 0 and len(bench.analyst.named("answer")) == 1
+
+
+def test_owner_can_see_what_the_ai_costs():
+    asked = []
+
+    def usage(start, end):
+        asked.append((start, end))
+        return {"jobs": 12, "web_searches": 30, "cost_usd": 1.2345} if len(asked) == 1 else {"jobs": 140, "web_searches": 300, "cost_usd": 23.5}
+
+    bench = Bench(usage=usage)
+    [reply] = bench.say("用量")
+    assert reply.title == "AI 用量"
+    assert "**今天**：AI 分析 12 次，联网搜索 30 次，约 1.23 美元" in reply.body
+    assert "**本月**：AI 分析 140 次，联网搜索 300 次，约 23.50 美元" in reply.body
+    assert "本月预算 180 美元" in reply.body and "claude-opus-5-5 的 medium 档" in reply.body and "high 档" in reply.body
+    (day_start, _), (month_start, _) = asked
+    assert day_start == 1_800_000_000.0  # midnight in Los Angeles on that day
+    assert day_start - month_start == 14 * 86400  # the first of the month
+
+    [reply] = Bench().say("/usage")
+    assert "没有记录" in reply.body
+
+
+def test_message_text_stays_out_of_the_log(caplog):
+    bench = Bench()
+    with caplog.at_level("INFO"):
+        bench.say("记住：我的密码是 hunter2")
+        bench.say("BTC 现在怎么看，我想全仓")
+    assert "hunter2" not in caplog.text and "全仓" not in caplog.text
+    assert "message from ou_owner in private chat oc_private" in caplog.text

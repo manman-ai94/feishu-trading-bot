@@ -7,6 +7,10 @@
 data/
 logs/
 
+# The owner's knowledge base (private notes and documents)
+knowledge/*
+!knowledge/README.md
+
 # Python
 .venv/
 __pycache__/

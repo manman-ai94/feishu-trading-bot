@@ -212,3 +212,29 @@ def test_the_client_has_no_way_to_trade_or_move_funds():
     public_names = [name for name in dir(OkxClient) if not name.startswith("_")]
     assert not [name for name in public_names if any(word in name.lower() for word in forbidden)]
     assert not hasattr(OkxClient, "_post")
+
+
+def test_instruments_and_open_interest_are_public_requests():
+    okx, session = client(
+        {
+            "/api/v5/public/instruments": [ok([{"instId": "BTC-USDT-SWAP", "state": "live"}])],
+            "/api/v5/public/open-interest": [ok([{"instId": "BTC-USDT-SWAP", "oi": "100", "oiCcy": "18000.5", "oiUsd": "1200000000"}])],
+        }
+    )
+    assert okx.instruments("SWAP") == [{"instId": "BTC-USDT-SWAP", "state": "live"}]
+    interest = okx.open_interest("BTC-USDT-SWAP")
+    assert interest.coins == 18000.5 and interest.usd == 1.2e9
+    assert okx.open_interest("BTC-USDT") is None  # spot: nothing to ask
+    urls = [url for url, _ in session.requests]
+    assert urls == [
+        "https://okx.test/api/v5/public/instruments?instType=SWAP",
+        "https://okx.test/api/v5/public/open-interest?instType=SWAP&instId=BTC-USDT-SWAP",
+    ]
+    assert all("OK-ACCESS-KEY" not in headers for _, headers in session.requests)
+
+
+def test_open_interest_without_data_or_fields():
+    okx, _ = client({"/api/v5/public/open-interest": [ok([]), ok([{"instId": "XAU-USDT-SWAP", "oi": "5"}])]})
+    assert okx.open_interest("XAU-USDT-SWAP") is None
+    interest = okx.open_interest("XAU-USDT-SWAP")
+    assert interest.coins is None and interest.usd is None
