@@ -52,7 +52,7 @@ def test_complete_env_file(tmp_path):
     path = write_env(
         tmp_path,
         "# 注释\nFEISHU_APP_ID=cli_a\nFEISHU_APP_SECRET=s\nFEISHU_DOMAIN=lark\nOWNER_OPEN_ID=ou_1\nGROUP_CHAT_ID=oc_1\n"
-        "OKX_API_KEY=k\nOKX_SECRET_KEY=s\nOKX_PASSPHRASE=p\nOKX_DEMO=true\nANTHROPIC_API_KEY=sk\n"
+        "OKX_API_KEY=k\nOKX_SECRET_KEY=s2\nOKX_PASSPHRASE=p\nOKX_DEMO=true\nANTHROPIC_API_KEY=sk-ant-x\n"
         "WATCH_INSTRUMENTS=xau-usdt-swap, BTC-USDT-SWAP\nBRIEF_MORNING=off\nBRIEF_EVENING=21:30\nWEEKLY_REVIEW=fri 16:00\n"
         "ALERT_MARGIN_RATIO=off\nALERT_DAILY_LOSS_USD=500\nGROUP_SHOW_PNL=FALSE\nGROUP_OWNER_ONLY=no\nPOLL_SECONDS=1\n",
     )
@@ -96,15 +96,16 @@ def test_env_file_in_an_unreadable_encoding_is_reported(tmp_path, monkeypatch):
 
 
 def test_real_environment_wins_over_the_file(tmp_path):
-    os.environ["FEISHU_APP_ID"] = "from_environment"
-    cfg, _ = load_config(write_env(tmp_path, "FEISHU_APP_ID=from_file\n"))
-    assert cfg.feishu_app_id == "from_environment"
+    os.environ["FEISHU_APP_ID"] = "cli_from_environment"
+    cfg, _ = load_config(write_env(tmp_path, "FEISHU_APP_ID=cli_from_file\n"))
+    assert cfg.feishu_app_id == "cli_from_environment"
 
 
 def test_secrets_are_not_in_the_config_repr(tmp_path):
-    path = write_env(tmp_path, "FEISHU_APP_SECRET=feishu-secret\nOKX_API_KEY=okx-key\nOKX_SECRET_KEY=okx-secret\nOKX_PASSPHRASE=okx-pass\nANTHROPIC_API_KEY=sk-ant\n")
+    path = write_env(tmp_path, "FEISHU_APP_SECRET=feishu-secret\nOKX_API_KEY=okx-key\nOKX_SECRET_KEY=okx-secret\nOKX_PASSPHRASE=okx-pass\nANTHROPIC_API_KEY=sk-ant-key\n")
     cfg, _ = load_config(path)
-    for secret in ("feishu-secret", "okx-key", "okx-secret", "okx-pass", "sk-ant"):
+    assert cfg.feishu_app_secret == "feishu-secret" and cfg.anthropic_api_key == "sk-ant-key"
+    for secret in ("feishu-secret", "okx-key", "okx-secret", "okx-pass", "sk-ant-key"):
         assert secret not in repr(cfg)
 
 

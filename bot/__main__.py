@@ -5,6 +5,8 @@
     python -m bot status        print the current account status in the console
     python -m bot brief morning send a brief right now (morning | evening | weekly)
     python -m bot setenv        write NAME=value lines from standard input into .env
+    python -m bot checkenv      say whether each key sits in the right line (shows no values)
+    python -m bot clearenv NAME empty the given lines of .env
 """
 from __future__ import annotations
 
@@ -161,6 +163,62 @@ def set_env(env_file: str, stdin=None) -> int:
         return 0
     write_env_values(Path(env_file), updates)
     _print("[OK]", f"已写入 {env_file}：{'、'.join(updates)}")
+    _warn_about_misplaced_keys(env_file)
+    return 0
+
+
+def _warn_about_misplaced_keys(env_file: str) -> None:
+    """After writing: point out, by name only, any key that sits in the wrong line."""
+    from dotenv import dotenv_values
+
+    from .envfile import check_secret_shapes
+
+    try:
+        values = dotenv_values(env_file, interpolate=False, encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    for finding in check_secret_shapes(values):
+        if finding.status == "wrong":
+            _print("[X]", f"{finding.name} 好像填错位置了：{finding.note}。机器人会当它没填，请再运行一次，只重填这一项")
+
+
+def check_env(env_file: str) -> int:
+    """Says whether each key looks like it belongs in its line. Shows names only."""
+    from .config import read_secret_values
+    from .envfile import check_secret_shapes
+
+    wrong = 0
+    for finding in check_secret_shapes(read_secret_values(env_file)):
+        if finding.status == "ok":
+            _print("[OK]", f"{finding.name} 格式对")
+        elif finding.status == "empty":
+            _print("[--]", f"{finding.name} 还空着")
+        elif finding.status == "unsure":
+            _print("[??]", f"{finding.name} 拿不准：{finding.note}。会照常使用")
+        else:
+            wrong += 1
+            _print("[X]", f"{finding.name} 填错位置了：{finding.note}")
+    if wrong:
+        print(f"\n有 {wrong} 项填错了位置，机器人会当它们没填。请只重填这几项。")
+        return 1
+    return 0
+
+
+def clear_env(env_file: str, names: list[str]) -> int:
+    """Empties the given lines of .env, for example a key that was pasted into the wrong line."""
+    from pathlib import Path
+
+    from .envfile import NAME_PATTERN, write_env_values
+
+    bad = [name for name in names if not NAME_PATTERN.fullmatch(name)]
+    if bad:
+        _print("[X]", f"这不是配置项的名字，没有改动任何内容：{'、'.join(bad)}")
+        return 1
+    if not Path(env_file).exists():
+        _print("[X]", f"找不到 {env_file}")
+        return 1
+    write_env_values(Path(env_file), {name: "" for name in names})
+    _print("[OK]", f"已清空 {env_file} 里的：{'、'.join(names)}")
     return 0
 
 
@@ -179,10 +237,17 @@ def main(argv: list[str] | None = None) -> int:
     brief = commands.add_parser("brief", help="立刻发送一份简报")
     brief.add_argument("kind", choices=["morning", "evening", "weekly"])
     commands.add_parser("setenv", help="把标准输入里的 NAME=value 写进 .env（只显示名字，不显示值）")
+    commands.add_parser("checkenv", help="检查每个密钥是不是填在了对的位置（只显示名字，不显示值）")
+    clear = commands.add_parser("clearenv", help="把 .env 里指定的几项清空")
+    clear.add_argument("names", nargs="+", metavar="NAME")
     args = parser.parse_args(argv)
 
     if args.command == "setenv":
         return set_env(args.env)
+    if args.command == "checkenv":
+        return check_env(args.env)
+    if args.command == "clearenv":
+        return clear_env(args.env, args.names)
 
     cfg, problems = load_config(args.env)
 

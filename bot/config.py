@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
+from .envfile import SECRET_NAMES, check_secret_shapes
+
 FEISHU_DOMAINS = {
     "feishu": "https://open.feishu.cn",
     "lark": "https://open.larksuite.com",
@@ -38,6 +40,13 @@ def _load_env_file(path: Path, problems: list[str]) -> None:
         except UnicodeDecodeError:
             continue
     problems.append(f"读不懂 {path} 的文字编码。请用记事本打开它，另存为，编码选 UTF-8")
+
+
+def read_secret_values(env_file: str | os.PathLike | None = ".env") -> dict[str, str]:
+    """The keys as the bot would read them. For shape checks only: never print the values."""
+    if env_file and Path(env_file).exists():
+        _load_env_file(Path(env_file), [])
+    return {name: _get(name) for name in SECRET_NAMES}
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -174,19 +183,27 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
     if not instruments:
         problems.append("WATCH_INSTRUMENTS 至少要填一个品种，例如 XAU-USDT-SWAP")
 
+    # A key pasted into the wrong line counts as "not filled in": it must never
+    # be sent to a company it does not belong to.
+    secrets = {name: _get(name) for name in SECRET_NAMES}
+    for finding in check_secret_shapes(secrets):
+        if finding.status == "wrong":
+            secrets[finding.name] = ""
+            problems.append(f"{finding.name} 填错位置了（{finding.note}），机器人当它没填。请重新填这一项")
+
     cfg = Config(
-        feishu_app_id=_get("FEISHU_APP_ID"),
-        feishu_app_secret=_get("FEISHU_APP_SECRET"),
+        feishu_app_id=secrets["FEISHU_APP_ID"],
+        feishu_app_secret=secrets["FEISHU_APP_SECRET"],
         feishu_domain=FEISHU_DOMAINS[domain_key],
         owner_open_id=_get("OWNER_OPEN_ID"),
         group_chat_id=_get("GROUP_CHAT_ID"),
-        okx_api_key=_get("OKX_API_KEY"),
-        okx_secret_key=_get("OKX_SECRET_KEY"),
-        okx_passphrase=_get("OKX_PASSPHRASE"),
+        okx_api_key=secrets["OKX_API_KEY"],
+        okx_secret_key=secrets["OKX_SECRET_KEY"],
+        okx_passphrase=secrets["OKX_PASSPHRASE"],
         okx_demo=_get_bool("OKX_DEMO", False),
         okx_base_url=_get("OKX_BASE_URL", "https://www.okx.com").rstrip("/"),
         watch_instruments=instruments or ("XAU-USDT-SWAP",),
-        anthropic_api_key=_get("ANTHROPIC_API_KEY"),
+        anthropic_api_key=secrets["ANTHROPIC_API_KEY"],
         model_quick=_get("MODEL_QUICK", "claude-haiku-5-5"),
         model_daily=_get("MODEL_DAILY", "claude-sonnet-5-5"),
         model_deep=_get("MODEL_DEEP", "claude-opus-5-5"),
