@@ -1,0 +1,135 @@
+"""Pure formatting: turns account data and events into text.
+
+Two versions of everything:
+  private -> with balances and PnL amounts. For the owner's direct chat, and
+             for the group while GROUP_SHOW_PNL=true (the owner's default).
+  public  -> instrument / direction / price levels only. For the group when
+             GROUP_SHOW_PNL=false.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from .models import AccountState, Position
+from .monitor import Event
+
+DISCLAIMER = "仅供参考，不构成投资建议。"
+
+
+def _px(value: float | None) -> str:
+    return "未知" if value is None else f"{value:,.2f}"
+
+
+def _money(value: float | None, signed: bool = False) -> str:
+    if value is None:
+        return "未知"
+    return f"{value:+,.2f} USD" if signed else f"{value:,.2f} USD"
+
+
+def _side(position: Position) -> str:
+    return "多" if position.direction == "long" else "空"
+
+
+def _stop(value: float | None) -> str:
+    return "无" if value is None else f"{value:,.2f}"
+
+
+def position_lines(position: Position, with_amounts: bool) -> list[str]:
+    lines = [f"**{position.inst_id} {_side(position)}单**"]
+    if with_amounts:
+        size = f"- 数量 {position.qty:g} 张"
+        if position.lever:
+            size += f"，杠杆 {position.lever:g} 倍"
+        if position.notional_usd is not None:
+            size += f"，名义价值 {_money(position.notional_usd)}"
+        lines.append(size)
+    lines.append(f"- 均价 {_px(position.avg_px)}，标记价 {_px(position.mark_px)}")
+    if with_amounts:
+        pnl = f"- 浮动盈亏 {_money(position.upl, signed=True)}"
+        if position.upl_ratio is not None:
+            pnl += f"（{position.upl_ratio * 100:+.2f}%）"
+        lines.append(pnl)
+        if position.liq_px:
+            distance = position.liq_distance_pct
+            suffix = f"，相距 {distance:.2f}%" if distance is not None else ""
+            lines.append(f"- 预估强平价 {_px(position.liq_px)}{suffix}")
+    lines.append(f"- 止损 {_stop(position.stop_loss)}，止盈 {_stop(position.take_profit)}")
+    return lines
+
+
+def status_markdown(state: AccountState, day_change: float | None, private: bool, show_amounts_in_group: bool = False) -> str:
+    """The status card body."""
+    with_amounts = private or show_amounts_in_group
+    lines: list[str] = []
+    if with_amounts:
+        snapshot = state.snapshot
+        lines.append(f"**账户权益** {_money(snapshot.total_eq)}")
+        if snapshot.upl is not None:
+            lines.append(f"- 浮动盈亏 {_money(snapshot.upl, signed=True)}")
+        if day_change is not None:
+            lines.append(f"- 今日权益变化 {_money(day_change, signed=True)}（含出入金）")
+        if snapshot.mgn_ratio is not None:
+            lines.append(f"- 保证金率 {snapshot.mgn_ratio * 100:.0f}%（到 100% 开始强平）")
+        lines.append("")
+    if not state.positions:
+        lines.append("当前没有持仓。")
+    for position in state.positions:
+        lines.extend(position_lines(position, with_amounts))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def account_text(state: AccountState, day_change: float | None) -> str:
+    """Plain-text account summary for the AI (owner-only prompts)."""
+    snapshot = state.snapshot
+    lines = [f"账户权益 {_money(snapshot.total_eq)}"]
+    if snapshot.mgn_ratio is not None:
+        lines.append(f"保证金率 {snapshot.mgn_ratio * 100:.0f}%（到 100% 开始强平）")
+    if day_change is not None:
+        lines.append(f"今日权益变化 {_money(day_change, signed=True)}（含出入金）")
+    if not state.positions:
+        lines.append("当前没有持仓。")
+    for position in state.positions:
+        parts = [
+            f"{position.inst_id} {_side(position)}单 {position.qty:g} 张",
+            f"均价 {_px(position.avg_px)}",
+            f"标记价 {_px(position.mark_px)}",
+            f"浮动盈亏 {_money(position.upl, signed=True)}",
+        ]
+        if position.lever:
+            parts.append(f"杠杆 {position.lever:g} 倍")
+        if position.liq_px:
+            parts.append(f"预估强平价 {_px(position.liq_px)}")
+        parts.append(f"止损 {_stop(position.stop_loss)}")
+        parts.append(f"止盈 {_stop(position.take_profit)}")
+        lines.append("，".join(parts))
+    return "\n".join(lines)
+
+
+def event_markdown(event: Event, private: bool) -> str:
+    lines = event.private_lines if private else event.public_lines
+    return "\n".join(f"- {line}" for line in lines if line)
+
+
+def journal_text(events: list[dict], tz: ZoneInfo) -> str:
+    if not events:
+        return "没有记录。"
+    lines = []
+    for event in events:
+        if event["kind"].startswith("job_"):
+            continue
+        moment = datetime.fromtimestamp(event["ts"], tz=tz).strftime("%m-%d %H:%M")
+        lines.append(f"{moment} {event['summary']}")
+    return "\n".join(lines) or "没有记录。"
+
+
+def equity_text(series: list[tuple[int, float]]) -> str:
+    if len(series) < 2:
+        return "记录太少，无法比较。"
+    values = [value for _, value in series]
+    start, end = values[0], values[-1]
+    return (
+        f"期初 {_money(start)}，期末 {_money(end)}，变化 {_money(end - start, signed=True)}（含出入金）；"
+        f"期间最高 {_money(max(values))}，最低 {_money(min(values))}。"
+    )

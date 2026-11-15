@@ -1,0 +1,173 @@
+"""Plain data objects shared by the rest of the bot."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+def to_float(value) -> float | None:
+    """OKX sends every number as a string, and "" when a field does not apply."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class StopOrder:
+    """A take-profit / stop-loss attached to a position."""
+
+    algo_id: str
+    sl_trigger_px: float | None = None
+    tp_trigger_px: float | None = None
+
+
+@dataclass(frozen=True)
+class Position:
+    inst_id: str
+    inst_type: str
+    pos_side: str  # "long", "short" or "net"
+    mgn_mode: str  # "cross" or "isolated"
+    qty: float  # contracts; always positive, see `direction`
+    direction: str  # "long" or "short"
+    avg_px: float | None = None
+    mark_px: float | None = None
+    upl: float | None = None
+    upl_ratio: float | None = None
+    lever: float | None = None
+    liq_px: float | None = None
+    notional_usd: float | None = None
+    mgn_ratio: float | None = None
+    pos_id: str = ""
+    u_time: int = 0
+    stops: tuple[StopOrder, ...] = ()
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        """Identifies "the same position" across two polls."""
+        return (self.inst_id, self.mgn_mode, self.direction)
+
+    @property
+    def liq_distance_pct(self) -> float | None:
+        """How far the mark price is from the liquidation price, in percent."""
+        if not self.liq_px or not self.mark_px:
+            return None
+        return abs(self.mark_px - self.liq_px) / self.mark_px * 100.0
+
+    @property
+    def stop_loss(self) -> float | None:
+        prices = [s.sl_trigger_px for s in self.stops if s.sl_trigger_px]
+        if not prices:
+            return None
+        # The stop that would trigger first: highest for a long, lowest for a short.
+        return max(prices) if self.direction == "long" else min(prices)
+
+    @property
+    def take_profit(self) -> float | None:
+        prices = [s.tp_trigger_px for s in self.stops if s.tp_trigger_px]
+        if not prices:
+            return None
+        return min(prices) if self.direction == "long" else max(prices)
+
+    @classmethod
+    def from_okx(cls, row: dict) -> "Position | None":
+        raw_qty = to_float(row.get("pos"))
+        if not raw_qty:
+            return None  # OKX can return empty rows for closed positions
+        pos_side = row.get("posSide") or "net"
+        if pos_side in ("long", "short"):
+            direction = pos_side
+        else:
+            direction = "long" if raw_qty > 0 else "short"
+        stops = tuple(
+            StopOrder(
+                algo_id=str(item.get("algoId", "")),
+                sl_trigger_px=to_float(item.get("slTriggerPx")),
+                tp_trigger_px=to_float(item.get("tpTriggerPx")),
+            )
+            for item in (row.get("closeOrderAlgo") or [])
+        )
+        return cls(
+            inst_id=row.get("instId", ""),
+            inst_type=row.get("instType", ""),
+            pos_side=pos_side,
+            mgn_mode=row.get("mgnMode", ""),
+            qty=abs(raw_qty),
+            direction=direction,
+            avg_px=to_float(row.get("avgPx")),
+            mark_px=to_float(row.get("markPx")),
+            upl=to_float(row.get("upl")),
+            upl_ratio=to_float(row.get("uplRatio")),
+            lever=to_float(row.get("lever")),
+            liq_px=to_float(row.get("liqPx")),
+            notional_usd=to_float(row.get("notionalUsd")),
+            mgn_ratio=to_float(row.get("mgnRatio")),
+            pos_id=str(row.get("posId", "")),
+            u_time=int(to_float(row.get("uTime")) or 0),
+            stops=stops,
+        )
+
+
+@dataclass(frozen=True)
+class AccountSnapshot:
+    total_eq: float | None = None  # total equity in USD
+    adj_eq: float | None = None
+    avail_eq: float | None = None
+    upl: float | None = None
+    mgn_ratio: float | None = None  # liquidation starts at <= 1.0 (OKX: adjEq / mmr)
+    imr: float | None = None
+    mmr: float | None = None
+    notional_usd: float | None = None
+    u_time: int = 0
+
+    @classmethod
+    def from_okx(cls, row: dict) -> "AccountSnapshot":
+        return cls(
+            total_eq=to_float(row.get("totalEq")),
+            adj_eq=to_float(row.get("adjEq")),
+            avail_eq=to_float(row.get("availEq")),
+            upl=to_float(row.get("upl")),
+            mgn_ratio=to_float(row.get("mgnRatio")),
+            imr=to_float(row.get("imr")),
+            mmr=to_float(row.get("mmr")),
+            notional_usd=to_float(row.get("notionalUsd")),
+            u_time=int(to_float(row.get("uTime")) or 0),
+        )
+
+
+@dataclass(frozen=True)
+class Candle:
+    ts: int  # open time, milliseconds
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+    confirmed: bool = True
+
+
+@dataclass(frozen=True)
+class Ticker:
+    inst_id: str
+    last: float
+    bid: float | None = None
+    ask: float | None = None
+    open_24h: float | None = None
+    high_24h: float | None = None
+    low_24h: float | None = None
+    ts: int = 0
+
+    @property
+    def change_24h_pct(self) -> float | None:
+        if not self.open_24h:
+            return None
+        return (self.last - self.open_24h) / self.open_24h * 100.0
+
+
+@dataclass
+class AccountState:
+    """One consistent read of the account, as used by the monitor and reports."""
+
+    snapshot: AccountSnapshot
+    positions: list[Position] = field(default_factory=list)

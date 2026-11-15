@@ -1,0 +1,5 @@
+lark-oapi==1.7.5
+anthropic==2.8.0
+python-dotenv==1.2.4
+requests==2.34.2
+tzdata==2026.6

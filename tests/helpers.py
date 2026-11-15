@@ -1,0 +1,186 @@
+"""Fakes shared by the tests. Nothing here touches the network."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from bot.analyst import AnalystUnavailable
+from bot.config import Config
+from bot.feishu_client import IncomingMessage
+from bot.models import AccountSnapshot, AccountState, Candle, Position, StopOrder, Ticker
+
+OWNER = "ou_owner"
+FRIEND = "ou_friend"
+BOT = "ou_bot"
+GROUP = "oc_group"
+
+
+# The stricter set-up the owner can switch back to: the group sees price
+# levels only, and group members may ask the bot about the market.
+OPEN_GROUP = dict(group_show_pnl=False, group_owner_only=False)
+
+
+def make_cfg(**overrides) -> Config:
+    values = dict(
+        feishu_app_id="cli_test",
+        feishu_app_secret="secret",
+        owner_open_id=OWNER,
+        group_chat_id=GROUP,
+        okx_api_key="key",
+        okx_secret_key="secret",
+        okx_passphrase="pass",
+        anthropic_api_key="sk-test",
+    )
+    values.update(overrides)
+    return Config(**values)
+
+
+def make_position(**overrides) -> Position:
+    values = dict(
+        inst_id="XAU-USDT-SWAP",
+        inst_type="SWAP",
+        pos_side="net",
+        mgn_mode="cross",
+        qty=2.0,
+        direction="long",
+        avg_px=2650.0,
+        mark_px=2660.0,
+        upl=20.0,
+        upl_ratio=0.0377,
+        lever=10.0,
+        liq_px=2400.0,
+        notional_usd=5320.0,
+        stops=(StopOrder("a1", sl_trigger_px=2630.0, tp_trigger_px=2700.0),),
+    )
+    values.update(overrides)
+    return Position(**values)
+
+
+def make_state(positions=None, **snapshot) -> AccountState:
+    values = dict(total_eq=10000.0, upl=20.0, mgn_ratio=12.5)
+    values.update(snapshot)
+    return AccountState(AccountSnapshot(**values), [make_position()] if positions is None else list(positions))
+
+
+def make_message(text: str, sender: str = OWNER, private: bool = True, mentions=(BOT,), message_id: str = "", **overrides) -> IncomingMessage:
+    values = dict(
+        message_id=message_id or f"om_{abs(hash((text, sender, private)))}",
+        chat_id="oc_private" if private else GROUP,
+        chat_type="p2p" if private else "group",
+        sender_open_id=sender,
+        text=text,
+        mentioned_open_ids=() if private else tuple(mentions),
+    )
+    values.update(overrides)
+    return IncomingMessage(**values)
+
+
+@dataclass
+class Sent:
+    how: str  # send_text | reply_text | send_markdown | reply_markdown
+    target: str
+    body: str
+    title: str = ""
+    footer: str | None = None
+    receive_id_type: str = ""
+    template: str = ""
+
+    @property
+    def everything(self) -> str:
+        return f"{self.title}\n{self.body}\n{self.footer or ''}"
+
+
+class FakeFeishu:
+    def __init__(self):
+        self.sent: list[Sent] = []
+
+    def send_text(self, receive_id, text, receive_id_type="chat_id"):
+        self.sent.append(Sent("send_text", receive_id, text, receive_id_type=receive_id_type))
+
+    def reply_text(self, message_id, text):
+        self.sent.append(Sent("reply_text", message_id, text))
+
+    def send_markdown(self, receive_id, title, markdown, receive_id_type="chat_id", template="blue", footer=None):
+        self.sent.append(Sent("send_markdown", receive_id, markdown, title, footer, receive_id_type, template))
+
+    def reply_markdown(self, message_id, title, markdown, template="blue", footer=None):
+        self.sent.append(Sent("reply_markdown", message_id, markdown, title, footer, template=template))
+
+    def to(self, target: str) -> list[Sent]:
+        return [item for item in self.sent if item.target == target]
+
+
+class FakeOkx:
+    """Stands in for OkxClient: an account state plus simple market data."""
+
+    def __init__(self, state: AccountState | None = None):
+        self.state = state
+        self.error: Exception | None = None
+        self.market_error: Exception | None = None
+        self.account_reads = 0
+
+    def account_state(self) -> AccountState:
+        self.account_reads += 1
+        if self.error:
+            raise self.error
+        return self.state
+
+    def ticker(self, inst_id: str) -> Ticker:
+        if self.market_error:
+            raise self.market_error
+        return Ticker(inst_id, 2650.0, open_24h=2600.0, high_24h=2660.0, low_24h=2590.0)
+
+    def funding_rate(self, inst_id: str) -> float:
+        if self.market_error:
+            raise self.market_error
+        return 0.0001
+
+    def candles(self, inst_id: str, bar: str = "1H", limit: int = 200) -> list[Candle]:
+        if self.market_error:
+            raise self.market_error
+        return [Candle(i * 60_000, 2600.0 + i, 2601.0 + i, 2599.0 + i, 2600.5 + i) for i in range(60)]
+
+
+class FakeAnalyst:
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.intent = "analysis"
+        self.error: AnalystUnavailable | None = None
+        self.calls: list[tuple[str, dict]] = []
+
+    def _record(self, name: str, **details) -> str:
+        self.calls.append((name, details))
+        if self.error:
+            raise self.error
+        return f"AI:{name}"
+
+    def named(self, name: str) -> list[dict]:
+        return [details for call, details in self.calls if call == name]
+
+    def route_intent(self, text):
+        self.calls.append(("route", {"text": text}))
+        return self.intent
+
+    def answer(self, question, market_text, account_text, in_group, deep=False):
+        return self._record("answer", question=question, market_text=market_text, account_text=account_text, in_group=in_group, deep=deep)
+
+    def brief(self, kind, market_text, account_text, journal_text, for_owner, shared_with_group=False):
+        return self._record(
+            "brief", kind=kind, market_text=market_text, account_text=account_text, journal_text=journal_text,
+            for_owner=for_owner, shared_with_group=shared_with_group,
+        )
+
+    def weekly_review(self, market_text, journal_text, equity_text, shared_with_group=False):
+        return self._record("weekly", market_text=market_text, journal_text=journal_text, equity_text=equity_text, shared_with_group=shared_with_group)
+
+
+class Clock:
+    """A clock the test moves by hand."""
+
+    def __init__(self, now: float):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
