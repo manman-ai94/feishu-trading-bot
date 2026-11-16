@@ -138,7 +138,11 @@ def account_text(state: AccountState, day_change: float | None, risk: AccountRis
     lines = [f"账户权益 {_money(snapshot.total_eq)}"]
     if risk_pct:
         budget = f"，按现在的权益约 {_money(snapshot.total_eq * risk_pct / 100)}" if snapshot.total_eq else ""
-        lines.append(f"交易员自己定的规则：一笔交易止损触发时最多亏权益的 {risk_pct:g}%{budget}")
+        lines.append(
+            f"交易员自己定的规则：一笔交易止损触发时最多亏权益的 {risk_pct:g}%{budget}。"
+            "这条规则一律按“止损触发时账户比现在少多少”来对照，程序的提醒也是这样算的；"
+            "从开仓均价算的盈亏可以作为补充提一句，但说超没超规则时只用从现在算的数，口径前后保持一致。"
+        )
     if risk is not None:
         lines.append("（下面的实际杠杆、强平距离折合几天的波幅、止损触发时亏多少，是程序按 OKX 的数字算好的，可以直接引用。）")
     lines.extend(currency_lines(state))

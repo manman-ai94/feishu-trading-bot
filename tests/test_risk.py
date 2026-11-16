@@ -193,6 +193,7 @@ def test_the_ai_knows_the_owners_risk_rule_and_how_orders_are_given():
 
     text = account_text(make_state([gold()], total_eq=1850.0), None, account(gold()), risk_pct=1.0)
     assert "交易员自己定的规则：一笔交易止损触发时最多亏权益的 1%，按现在的权益约 18.50 USD" in text
+    assert "一律按“止损触发时账户比现在少多少”来对照" in text  # one basis, so answers do not contradict
     assert "不要说没有权限" in ANALYST_SYSTEM and "不要让他“去 @机器人”" in ANALYST_SYSTEM and "只发数字也行" in ANALYST_SYSTEM
 
 
