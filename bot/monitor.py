@@ -233,6 +233,7 @@ class Monitor:
         self._positions: dict[tuple, Position] | None = None
         self._last_snapshot_at = 0.0
         self._cooldowns: dict[tuple[str, str], float] = {}
+        self._wake = threading.Event()  # set by the OKX stream: read the account now, not at the next tick
         self._bare_since: dict[tuple, float] = {}  # positions without a stop-loss, and since when
         self._failures = 0
         self._down_reported = False
@@ -295,13 +296,19 @@ class Monitor:
             self._safe_notify(event)
         return state
 
+    def poke(self, reason: str = "") -> None:
+        """Read the account as soon as possible: OKX pushed a change (see okx_stream.py)."""
+        log.info("monitor woken by the OKX stream (%s)", reason or "push")
+        self._wake.set()
+
     def run_forever(self, stop: threading.Event) -> None:
         while not stop.is_set():
             try:
                 self.poll_once()
             except Exception:  # keep the loop alive whatever happens
                 log.exception("monitor poll crashed")
-            stop.wait(self._cfg.poll_seconds)
+            self._wake.wait(self._cfg.poll_seconds)
+            self._wake.clear()
 
     # ------------------------------------------------------------- internals
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from .analyst import Analyst, Usage
 from .config import Config
 from .crowd import Crowd
+from .okx_stream import OkxStream, stream_url
 from .risk import RiskGauge
 from .envfile import write_env_values
 from .feishu_client import FeishuClient, IncomingMessage
@@ -119,6 +120,21 @@ def build_ai(
     return analyst, resolver, knowledge
 
 
+def start_stream(cfg: Config, monitor: Monitor, stop: threading.Event) -> OkxStream | None:
+    """OKX's private WebSocket, which wakes the monitor the moment something changes. The regular
+    poll carries on regardless; without the stream an alert simply waits for the next tick."""
+    if not cfg.okx_stream:
+        log.info("okx stream: off (OKX_STREAM=false); positions are read every %d seconds", cfg.poll_seconds)
+        return None
+    url = cfg.okx_ws_url or stream_url(cfg.okx_base_url, cfg.okx_demo)
+    if not url:
+        log.warning("okx stream: no WebSocket address known for %s; set OKX_WS_URL to use it", cfg.okx_base_url)
+        return None
+    stream = OkxStream(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, url, monitor.poke)
+    threading.Thread(target=stream.run_forever, args=(stop,), name="okx-stream", daemon=True).start()
+    return stream
+
+
 RESTART_DELAY_SECONDS = 2.0  # long enough for the "restarting" reply to leave
 
 
@@ -171,6 +187,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     if cfg.has_okx_keys:
         monitor.poll_once()  # first read, so the start-up message has the positions
         threading.Thread(target=monitor.run_forever, args=(stop,), name="monitor", daemon=True).start()
+        start_stream(cfg, monitor, stop)
     else:
         log.warning("no OKX keys configured: position monitoring is off")
 

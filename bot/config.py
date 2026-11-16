@@ -106,6 +106,8 @@ class Config:
     okx_passphrase: str = field(default="", repr=False)
     okx_demo: bool = False
     okx_base_url: str = "https://www.okx.com"
+    okx_stream: bool = True  # OKX's private WebSocket wakes the monitor the moment a position or stop changes
+    okx_ws_url: str = ""  # empty = the stream that belongs to OKX_BASE_URL
     watch_instruments: tuple[str, ...] = ("XAU-USDT-SWAP",)
 
     # Claude
@@ -345,6 +347,8 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         okx_passphrase=secrets["OKX_PASSPHRASE"],
         okx_demo=okx_demo,
         okx_base_url=_get("OKX_BASE_URL", "https://www.okx.com").rstrip("/"),
+        okx_stream=_get_bool("OKX_STREAM", True),
+        okx_ws_url=_get("OKX_WS_URL"),
         watch_instruments=instruments or ("XAU-USDT-SWAP",),
         anthropic_api_key=secrets["ANTHROPIC_API_KEY"],
         model_quick=_get("MODEL_QUICK", "claude-haiku-5-5"),
