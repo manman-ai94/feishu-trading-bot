@@ -104,7 +104,7 @@ def test_a_losing_stop_out_and_a_liquidation_count_a_stop_in_profit_does_not():
     ]
     closed = [
         Closed.from_okx(closed_row(NOW - 20 * HOUR + 2)),
-        Closed.from_okx(closed_row(NOW - 10 * HOUR + 2, realized="55.0")),
+        Closed.from_okx(closed_row(NOW - 10 * HOUR + 2, realized="55.0", pnl="66.6")),
         Closed.from_okx(closed_row(NOW - 8 * HOUR + 2, realized="900.0")),
         Closed.from_okx(closed_row(NOW - 5 * HOUR, realized="-1700", close_type="3")),
     ]
@@ -115,6 +115,17 @@ def test_a_losing_stop_out_and_a_liquidation_count_a_stop_in_profit_does_not():
         ("止损", NOW - 2 * HOUR, None),
     ]
     assert [hit.at for hit in stop_hits(closed, triggers, NOW - 6 * HOUR)] == [NOW - 5 * HOUR + 0, NOW - 2 * HOUR]
+
+
+def test_a_stop_at_break_even_is_not_a_loss_because_of_the_funding_paid_while_holding():
+    triggers = [Trigger(XAU, "sl", NOW - HOUR, 3845.0)]
+    # Moved to just above the entry, but three days of funding and the fees make the realised P&L negative.
+    held = Closed.from_okx(closed_row(NOW - HOUR + 2, realized="-21.4", pnl="4.0", fee="-1.4", fundingFee="-24.0"))
+    assert stop_hits([held], triggers, NOW - 24 * HOUR) == []
+    lost = Closed.from_okx(closed_row(NOW - HOUR + 2, realized="-21.4", pnl="-0.1"))
+    assert [hit.realized for hit in stop_hits([lost], triggers, NOW - 24 * HOUR)] == [-21.4]
+    unpriced = Closed.from_okx(closed_row(NOW - HOUR + 2, realized="-21.4", pnl=""))  # no price figure: the total decides
+    assert len(stop_hits([unpriced], triggers, NOW - 24 * HOUR)) == 1
 
 
 # ------------------------------------------------------------- the circuit breaker
@@ -315,6 +326,33 @@ def test_a_record_that_is_late_is_waited_for_once_and_then_the_poll_numbers_are_
     monitor, okx, events, waits = watch([])  # no records at all: nothing to wait for
     monitor.poll_once()
     assert waits == [] and events[0].title == "平仓：XAU-USDT-SWAP 多单"
+
+
+def test_an_earlier_partial_close_is_not_taken_for_the_stop_out_just_seen():
+    # Part of the position was closed by hand ten minutes ago; now the stop took the rest, and OKX has
+    # not written that yet.
+    earlier = closed_row(NOW - 600, realized="+120.0", close_type="1", closeTotalPos="5000")
+    monitor, okx, events, waits = watch([earlier], [trigger_row(NOW + 27)])
+    monitor.poll_once()
+    [event] = events
+    assert waits == [2.0]
+    assert event.title == "平仓：XAU-USDT-SWAP 多单" and "平仓前浮动盈亏" in event.private_lines[1]
+    assert not any("+120.00" in line for line in event.private_lines)
+
+    # Once OKX has written it, the full close is the one reported.
+    monitor, okx, events, waits = watch([earlier, closed_row(NOW + 28)], [trigger_row(NOW + 27)])
+    monitor.poll_once()
+    assert events[0].title == "止损触发：XAU-USDT-SWAP 多单" and waits == []
+    assert events[0].private_lines[2].startswith("已实现盈亏 -306.70 USDT")
+
+
+def test_a_full_close_from_before_the_last_read_is_not_this_close():
+    monitor, okx, events, waits = watch([closed_row(NOW - 60)])  # the position was still there at NOW
+    monitor.poll_once()
+    assert waits == [2.0] and events[0].title == "平仓：XAU-USDT-SWAP 多单"
+    monitor, okx, events, waits = watch([closed_row(NOW - 5)])  # within the allowance for the clocks
+    monitor.poll_once()
+    assert waits == [] and events[0].private_lines[0] == "平仓方式：平仓单（不是止盈止损单触发的）（全部平仓）"
 
 
 def test_the_close_alert_goes_out_when_the_records_cannot_be_read():

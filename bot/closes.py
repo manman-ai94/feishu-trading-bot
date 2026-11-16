@@ -24,9 +24,11 @@ from .models import to_float
 
 log = logging.getLogger(__name__)
 
-CLOSE_TYPES = {"1": "部分平仓", "2": "全部平仓", "3": "强平", "4": "部分强平", "5": "自动减仓 (ADL)", "6": "自动减仓 (ADL)"}
+CLOSE_TYPES = {"1": "部分平仓", "2": "全部平仓", "3": "强平", "4": "部分强平", "5": "部分自动减仓 (ADL)", "6": "自动减仓 (ADL)"}
 LIQUIDATION_TYPES = ("3", "4")
 ADL_TYPES = ("5", "6")
+# The record OKX leaves when a position is gone: closed in full, liquidated in full, or deleveraged in full.
+FULL_CLOSE_TYPES = ("2", "3", "6")
 # A stop that went off and the close it caused are recorded this close together, in seconds.
 BEFORE_TRIGGER_SECONDS = 60
 AFTER_TRIGGER_SECONDS = 300
@@ -147,9 +149,11 @@ def how_it_closed(closed: Closed, triggers: list[Trigger]) -> str:
 def stop_hits(closed: list[Closed], triggers: list[Trigger], since: float) -> list[Hit]:
     """Losing stop-outs and liquidations at or after `since`, oldest first.
 
-    A stop that went off counts unless the close it caused is known to have made money (a stop
-    moved into profit is not a loss). A stop whose close cannot be found still counts: when in
-    doubt the breaker errs towards caution."""
+    A stop that went off counts unless the close it caused is known to have made money on the price
+    (a stop moved into profit is not a loss). The price alone decides, not the realised P&L: that
+    takes in the fees and the funding paid over the whole holding, so a stop moved to break-even on a
+    position held for days would look like a loss. A stop whose close cannot be found still counts:
+    when in doubt the breaker errs towards caution."""
     hits: list[Hit] = []
     matched: set[int] = set()
     for trigger in triggers:
@@ -159,7 +163,8 @@ def stop_hits(closed: list[Closed], triggers: list[Trigger], since: float) -> li
         match = min(candidates, key=lambda pair: abs(pair[1].closed_at - trigger.at)) if candidates else None
         if match is not None:
             matched.add(match[0])
-            if match[1].realized is not None and match[1].realized >= 0:
+            on_price = match[1].pnl if match[1].pnl is not None else match[1].realized
+            if on_price is not None and on_price >= 0:
                 continue
         hits.append(
             Hit(trigger.inst_id, "止损", trigger.at, match[1].realized if match else None, match[1].ccy if match else "")

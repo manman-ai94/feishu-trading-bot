@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable
 
-from .closes import close_lines, how_it_closed, read_closed, read_triggers
+from .closes import FULL_CLOSE_TYPES, close_lines, how_it_closed, read_closed, read_triggers
 from .config import Config
 from .journal import Journal
 from .models import AccountState, Position
@@ -22,7 +22,9 @@ log = logging.getLogger(__name__)
 QTY_TOLERANCE = 1e-9
 FAILURES_BEFORE_ALERT = 3
 NO_STOP_REPEAT_SECONDS = 24 * 3600  # a position left without a stop is pointed out again this often
-CLOSE_RECORD_SECONDS = 15 * 60  # a close OKX recorded this recently is the one just seen
+# A close record counts for the position just gone only if OKX wrote it after the last read that still
+# saw the position, less this much for the two clocks disagreeing.
+CLOSE_RECORD_MARGIN_SECONDS = 10
 CLOSE_RECORD_WAIT_SECONDS = 2.0  # OKX may write the record a moment after the position goes
 NO_STOP_SETTING = "no_stop_alert:"  # in the journal: when each position was last pointed out, so a restart does not repeat it
 RISK_LEVELS_SETTING = "risk_levels"  # in the journal: the level each risk reading was last reported at
@@ -236,6 +238,7 @@ class Monitor:
         self._lock = threading.Lock()
         self._state: AccountState | None = None
         self._positions: dict[tuple, Position] | None = None
+        self._read_at: float | None = None  # when self._positions was read
         self._last_snapshot_at = 0.0
         self._cooldowns: dict[tuple[str, str], float] = {}
         self._wake = threading.Event()  # set by the OKX stream: read the account now, not at the next tick
@@ -282,6 +285,7 @@ class Monitor:
         else:
             events.extend(self._as_recorded(event) for event in diff_positions(self._positions, current))
         self._positions = current
+        self._read_at = now
         with self._lock:
             self._state = state
 
@@ -346,9 +350,14 @@ class Monitor:
         )
 
     def _close_record(self, inst_id: str):
+        """OKX's record of the close just seen: a full close written after the last read that still saw
+        the position. An older record, such as a partial close earlier on, is not this close."""
+        since = (self._read_at or 0.0) - CLOSE_RECORD_MARGIN_SECONDS
         for attempt in range(2):
             history = read_closed(self._okx)
-            recent = [c for c in history if c.inst_id == inst_id and c.closed_at >= self._clock() - CLOSE_RECORD_SECONDS]
+            recent = [
+                c for c in history if c.inst_id == inst_id and c.close_type in FULL_CLOSE_TYPES and c.closed_at >= since
+            ]
             if recent:
                 return recent[-1]
             if not history or attempt:
