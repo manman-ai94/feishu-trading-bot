@@ -279,3 +279,18 @@ def test_weekly_review_stays_private_in_a_levels_only_group():
     assert "平仓：XAU-USDT-SWAP 多单" in call["journal_text"] and "变化 +100.00 USD" in call["equity_text"]
     assert [item.target for item in feishu.sent] == [OWNER]
     assert feishu.sent[0].title.startswith("本周复盘")
+
+
+def test_the_weekly_review_comes_with_the_weeks_track_record():
+    reporter, feishu, _, _, clock, journal = build()
+    reporter.send_weekly_review()
+    assert [item.title for item in feishu.to(OWNER)] == ["本周复盘 · " + reporter.now_local().strftime("%m月%d日")]  # nothing recorded, no card
+
+    feishu.sent.clear()
+    journal.record_analysis(
+        "question", "XAU-USDT-SWAP", "long", 3880.0, [{"side": "long", "trigger": 3900, "target": 3950, "invalid": 3860}], ts=clock() - 86400
+    )
+    reporter.send_weekly_review()
+    record = [item for item in feishu.sent if item.title == "本周成绩单"]
+    assert [item.target for item in record] == [OWNER]  # the owner only, also when the review is shared with the group
+    assert "最近 7 天" in record[0].body and "记录了 1 次带点位的分析" in record[0].body

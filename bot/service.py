@@ -16,6 +16,7 @@ from .models import AccountState
 from .monitor import Event, Monitor
 from .okx_client import OkxClient
 from .reports import DISCLAIMER, account_text, equity_text, event_markdown, journal_text, status_markdown
+from .track import scorecard_markdown
 from .upkeep import downtime_text
 
 log = logging.getLogger(__name__)
@@ -167,6 +168,10 @@ class Reporter:
         self._owner_safely(title, text, "purple")
         if shared:
             self.to_group(title, text, "purple", footer=DISCLAIMER)
+        # The week's track record goes with the review, to the owner only: figures, not AI text.
+        if self._cfg.track_record and self._journal.analyses_between(start, end):
+            record = scorecard_markdown(self._journal, self._clock(), self._cfg.tz, 7, None, self._cfg.track_window_hours)
+            self._owner_safely("本周成绩单", record, "green")
 
     def _owner_safely(self, title: str, markdown: str, template: str) -> None:
         """Send to the owner; a failure there must not stop the group copy."""
