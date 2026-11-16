@@ -15,8 +15,8 @@ SEARCHED = sorted(path for path in LIBRARY.glob("*.md") if not path.name.startsw
 
 
 def test_the_library_ships_with_the_code():
-    assert [path.name for path in SEARCHED] == ["duan-yongping-principles.md"]
-    assert (LIBRARY / "_sources-duan-yongping.md").exists()
+    assert [path.name for path in SEARCHED] == ["duan-yongping-principles.md", "gold-drivers-reference.md"]
+    assert (LIBRARY / "_sources-duan-yongping.md").exists() and (LIBRARY / "_sources-gold-drivers.md").exists()
 
 
 @pytest.mark.parametrize("path", SEARCHED, ids=lambda path: path.name)

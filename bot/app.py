@@ -204,7 +204,8 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     if cfg.has_okx_keys:
         monitor.poll_once()  # first read, so the start-up message has the positions
         threading.Thread(target=monitor.run_forever, args=(stop,), name="monitor", daemon=True).start()
-        start_stream(cfg, monitor, stop)
+        stream = start_stream(cfg, monitor, stop)
+        desk.stream_status = stream.status if stream is not None else (lambda: f"没开，每 {cfg.poll_seconds} 秒读一次账户")
     else:
         log.warning("no OKX keys configured: position monitoring is off")
 

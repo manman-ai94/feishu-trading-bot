@@ -34,6 +34,11 @@ PING_SECONDS = 25  # OKX drops a connection that is quiet for 30 seconds
 FIRST_RETRY_SECONDS = 5
 MAX_RETRY_SECONDS = 300
 MIN_POKE_GAP_SECONDS = 2.0  # a burst of pushes makes one read, not ten
+LOGIN_WAIT_SECONDS = 30  # no answer to the login by then: connect again
+
+
+class LoginRefused(Exception):
+    """OKX turned the login down, or never answered it. The connection is dropped and tried again later."""
 
 
 REGIONAL_URLS = {
@@ -96,6 +101,9 @@ class OkxStream:
         self._clock = clock
         self._last_poke = 0.0
         self.logged_in = False
+        self.subscribed = False
+        self._refused = False
+        self.last_error = ""  # why the last connection ended, for the settings card
 
     # ----------------------------------------------------------------- messages
 
@@ -111,6 +119,7 @@ class OkxStream:
         event = message.get("event")
         if event == "login":
             self.logged_in = message.get("code") == "0"
+            self._refused = not self.logged_in
             if self.logged_in:
                 log.info("okx stream: logged in")
             else:
@@ -138,10 +147,22 @@ class OkxStream:
 
     # ---------------------------------------------------------------- the loop
 
+    def status(self) -> str:
+        """One line for the settings card."""
+        if self.logged_in and self.subscribed:
+            return "已连上，止损被打、仓位变化、强平预警几秒内就提醒"
+        why = f"（上次断开：{self.last_error}）" if self.last_error else ""
+        return f"没连上，正在重连{why}；期间照常定时读账户"
+
     def run_forever(self, stop: threading.Event) -> None:
         connect = self._connect
         if connect is None:
-            from websockets.sync.client import connect
+            try:
+                from websockets.sync.client import connect
+            except ImportError:
+                self.last_error = "服务器上缺 websockets 这个包"
+                log.warning("okx stream: the websockets package is missing; positions are read on the regular poll only")
+                return
         wait = FIRST_RETRY_SECONDS
         while not stop.is_set():
             started = self._clock()
@@ -149,9 +170,13 @@ class OkxStream:
                 with connect(self._url, open_timeout=15, close_timeout=5) as socket:
                     log.info("okx stream: connected")
                     self._session(socket, stop)
+            except LoginRefused as exc:
+                self.last_error = str(exc)
+                log.warning("okx stream: %s", exc)
             except Exception as exc:  # the regular poll carries on whatever happens here
+                self.last_error = type(exc).__name__
                 log.warning("okx stream: disconnected (%s)", type(exc).__name__)
-            self.logged_in = False
+            self.logged_in = self.subscribed = False
             if stop.is_set():
                 break
             if self._clock() - started > 60:
@@ -160,15 +185,21 @@ class OkxStream:
             wait = min(wait * 2, MAX_RETRY_SECONDS)
 
     def _session(self, socket, stop: threading.Event) -> None:
+        self._refused = False
         socket.send(login_message(self._api_key, self._secret_key, self._passphrase, self._clock()))
-        subscribed = False
+        sent_at = self._clock()
         while not stop.is_set():
             try:
                 raw = socket.recv(timeout=PING_SECONDS)
             except TimeoutError:
+                if not self.logged_in and self._clock() - sent_at > LOGIN_WAIT_SECONDS:
+                    raise LoginRefused("OKX 没有回应登录")
                 socket.send("ping")
                 continue
             self.handle(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
-            if self.logged_in and not subscribed:
+            if self._refused:
+                raise LoginRefused("OKX 拒绝了登录，可能是 key 或 IP 白名单的问题")
+            if self.logged_in and not self.subscribed:
                 socket.send(subscribe_message())
-                subscribed = True
+                self.subscribed = True
+                self.last_error = ""

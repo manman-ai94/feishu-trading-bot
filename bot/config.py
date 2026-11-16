@@ -140,7 +140,7 @@ class Config:
     alert_leverage: tuple[float, ...] = ()  # positions worth more than this many times the equity; off by default
     risk_per_trade_pct: float = 1.0  # the owner's rule: one trade may cost at most this share of the equity
     alert_stop_risk_pct: float | None = 1.0  # a stop-loss that would cost more than this share; follows the rule above
-    weekend_check: bool = True  # on Friday evening (UTC), say what stands out in markets that close for the weekend
+    weekend_check: bool = True  # on Friday at 16:00 New York time, say what stands out in markets that close for the weekend
     weekend_leverage: float | None = None  # off by default: the owner keeps 100x on the exchange and sizes by risk
     weekend_stop_atr: float = 1.5
     brief_morning: time | None = time(6, 0)

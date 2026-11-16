@@ -481,7 +481,7 @@ def test_what_stands_out_before_a_weekend():
     assert weekend_lines(account(gold(inst_id="BTC-USDT-SWAP")), make_cfg()) == []  # trades through the weekend like any day
 
 
-def test_the_check_is_due_on_friday_evening_utc():
+def test_the_check_is_due_an_hour_before_gold_closes_on_friday():
     cfg = make_cfg(brief_morning=None, brief_evening=None, weekly_review=None)
     la = ZoneInfo("America/Los_Angeles")
     friday = datetime(2026, 11, 20, 13, 5, tzinfo=la)  # 21:05 UTC
@@ -493,6 +493,10 @@ def test_the_check_is_due_on_friday_evening_utc():
     # Where Friday evening UTC is already Saturday morning, it runs then.
     hanoi = datetime(2026, 11, 21, 4, 10, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
     assert due_jobs(make_cfg(brief_morning=None, brief_evening=None, weekly_review=None, timezone="Asia/Ho_Chi_Minh"), hanoi, lambda name: False) == ["weekend"]
+    # In summer spot gold closes an hour earlier in UTC, and the check moves with it: 16:00 New York.
+    june = datetime(2027, 6, 4, 13, 5, tzinfo=la)  # 20:05 UTC, 16:05 in New York
+    assert due_jobs(cfg, june, lambda name: False) == ["weekend"]
+    assert due_jobs(cfg, june.replace(hour=12, minute=55), lambda name: False) == []
 
 
 def reporter_with(*positions, **cfg):

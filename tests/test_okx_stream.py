@@ -108,6 +108,53 @@ def test_a_session_logs_in_subscribes_pings_and_rings():
     assert pokes == ["positions"]
 
 
+def test_a_refused_login_drops_the_connection_and_says_why():
+    stop = threading.Event()
+    sockets = []
+
+    class OneShot(FakeSocket):
+        def recv(self, timeout=None):
+            stop.set()  # one attempt is enough for the test: no reconnecting afterwards
+            return super().recv(timeout)
+
+    def connect(url, **kwargs):
+        socket = OneShot([json.dumps({"event": "login", "code": "60009"}), json.dumps({"arg": {"channel": "positions"}, "data": []})], stop)
+        sockets.append(socket)
+        return socket
+
+    pokes: list[str] = []
+    stream = OkxStream("key", "secret", "pass", LIVE_URL, pokes.append, connect=connect, clock=Clock(1_800_000_000.0))
+    stream.run_forever(stop)
+    assert len(sockets) == 1 and [json.loads(text)["op"] for text in sockets[0].sent] == ["login"]  # never subscribed
+    assert sockets[0].incoming  # it stopped reading after the refusal
+    assert stream.status().startswith("没连上，正在重连（上次断开：OKX 拒绝了登录")
+    assert pokes == []
+
+
+def test_a_login_with_no_answer_is_given_up_on():
+    stop = threading.Event()
+    clock = Clock(1_800_000_000.0)
+
+    class Silent(FakeSocket):
+        def recv(self, timeout=None):
+            clock.advance(25)
+            if clock.now > 1_800_000_040:
+                stop.set()  # past the login wait: no reconnecting afterwards
+            raise TimeoutError
+
+    socket = Silent([], stop)
+    stream = OkxStream("key", "secret", "pass", LIVE_URL, lambda channel: None, connect=lambda url, **kw: socket, clock=clock)
+    stream.run_forever(stop)
+    assert socket.sent[:2] == [socket.sent[0], "ping"] and "OKX 没有回应登录" in stream.last_error
+
+
+def test_the_status_line():
+    stream, _ = make_stream()
+    assert stream.status() == "没连上，正在重连；期间照常定时读账户"
+    stream.logged_in = stream.subscribed = True
+    assert stream.status().startswith("已连上")
+
+
 def test_a_refused_connection_never_raises(monkeypatch):
     stop = threading.Event()
     attempts = []

@@ -690,6 +690,7 @@ class TradeDesk:
         self._sending = threading.Lock()  # one order at a time
         self._pending: _Pending | None = None
         self._account_config: tuple[float, AccountConfig] | None = None
+        self.stream_status: Callable[[], str] | None = None  # set by the app: whether OKX's push stream is up
 
     @property
     def mode(self) -> str:
@@ -1054,6 +1055,8 @@ class TradeDesk:
         else:
             lines.append("**开放的操作**：全部（止盈止损、平仓、撤单、限价挂单、市价开仓）")
         lines.append(f"**允许下单的品种**：{'、'.join(cfg.tradable_instruments)}")
+        if self.stream_status is not None:
+            lines.append(f"**OKX 推送**：{self.stream_status()}")
         if not cfg.group_trading:
             group = "不执行，只在私聊里执行（GROUP_TRADING=false）"
         elif not cfg.group_chat_id:
