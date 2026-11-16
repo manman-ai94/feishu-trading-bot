@@ -12,8 +12,12 @@ from typing import Callable
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateMessageReactionRequest,
+    CreateMessageReactionRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    DeleteMessageReactionRequest,
+    Emoji,
     P2ImMessageReceiveV1,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
@@ -45,17 +49,15 @@ class IncomingMessage:
 
 
 def markdown_card(title: str, markdown: str, template: str = "blue", footer: str | None = None) -> dict:
-    """A card in Feishu's card JSON 2.0 format with one markdown body."""
+    """A card in Feishu's card JSON 2.0 format with one markdown body. Without a title it has no header bar."""
     elements: list[dict] = [{"tag": "markdown", "content": markdown}]
     if footer:
         elements.append({"tag": "hr"})
         elements.append({"tag": "markdown", "content": footer, "text_size": "notation"})
-    return {
-        "schema": "2.0",
-        "config": {},
-        "header": {"template": template, "title": {"tag": "plain_text", "content": title}},
-        "body": {"elements": elements},
-    }
+    card: dict = {"schema": "2.0", "config": {}, "body": {"elements": elements}}
+    if title:
+        card["header"] = {"template": template, "title": {"tag": "plain_text", "content": title}}
+    return card
 
 
 def parse_message(data: P2ImMessageReceiveV1) -> IncomingMessage | None:
@@ -170,6 +172,33 @@ class FeishuClient:
             log.warning("card rejected (%s), replying with plain text instead", exc)
             self.reply_text(message_id, _as_plain_text(title, markdown, footer))
 
+    # ------------------------------------------------------------- reactions
+
+    def add_reaction(self, message_id: str, emoji: str) -> str:
+        """Puts an emoji on a message, the way a person does to say "seen". Returns the id it is taken off by.
+
+        Needs no permission beyond im:message. Feishu may still refuse, for
+        example in a group shared with another organisation.
+        """
+        request = (
+            CreateMessageReactionRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                CreateMessageReactionRequestBody.builder().reaction_type(Emoji.builder().emoji_type(emoji).build()).build()
+            )
+            .build()
+        )
+        response = self._client.im.v1.message_reaction.create(request)
+        if not response.success():
+            raise FeishuError(response.code, response.msg)
+        return getattr(response.data, "reaction_id", None) or ""
+
+    def remove_reaction(self, message_id: str, reaction_id: str) -> None:
+        request = DeleteMessageReactionRequest.builder().message_id(message_id).reaction_id(reaction_id).build()
+        response = self._client.im.v1.message_reaction.delete(request)
+        if not response.success():
+            raise FeishuError(response.code, response.msg)
+
     # ------------------------------------------------------------- bot info
 
     def bot_open_id(self) -> str | None:
@@ -215,7 +244,9 @@ class FeishuClient:
 
 
 def _as_plain_text(title: str, markdown: str, footer: str | None) -> str:
-    text = f"【{title}】\n{markdown.replace('**', '')}"
+    text = markdown.replace("**", "")
+    if title:
+        text = f"【{title}】\n{text}"
     if footer:
         text += f"\n\n{footer}"
     return text

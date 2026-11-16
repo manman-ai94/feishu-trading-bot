@@ -214,6 +214,7 @@ def ask(cfg: Config, question: str) -> int:
     from .app import build_ai, build_okx
     from .journal import Journal
     from .market import build_market_context
+    from .router import split_title
 
     import time
 
@@ -224,7 +225,8 @@ def ask(cfg: Config, question: str) -> int:
     market = "\n\n".join(build_market_context(okx, inst_id).to_text() for inst_id in named)
     started = time.time()
     try:
-        print(analyst.answer(question, market, None, in_group=True))
+        title, body = split_title(analyst.answer(question, market, None, in_group=True))
+        print(f"【{title}】\n{body}" if title else body)
     except AnalystUnavailable as exc:
         _print("[X]", str(exc))
         return 1

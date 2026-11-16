@@ -6,7 +6,19 @@ from bot.journal import Journal
 from bot.monitor import Monitor
 from bot.okx_client import OkxNetworkError
 from bot.reports import DISCLAIMER
-from bot.router import HELP_TEXT, TRADE_OWNER_ONLY_TEXT, Router
+from bot.router import (
+    HELLO_TEXT,
+    HELP_TEXT,
+    SLOW_SECONDS,
+    SLOW_SECONDS_NO_SIGN,
+    SLOW_TEXT,
+    SLOW_TEXT_DEEP,
+    TRADE_OWNER_ONLY_TEXT,
+    WORKING_EMOJI,
+    Router,
+    is_plain,
+    split_title,
+)
 from bot.service import Reporter
 from bot.trading import TradeDesk
 
@@ -19,6 +31,7 @@ class Bench:
         self.cfg = make_cfg(**cfg_overrides)
         self.saved: list[tuple[str, str]] = []
         self.restarts = 0
+        self.timers: list[dict] = []  # what the router asked to be run later
         self.feishu = FakeFeishu()
         self.okx = FakeOkx(make_state() if state == "default" else state)
         self.analyst = FakeAnalyst(enabled=analyst_enabled)
@@ -38,16 +51,24 @@ class Bench:
         self.router = Router(
             self.cfg, self.feishu, self.okx, self.analyst, self.reporter, bot_open_id, self.clock,
             save_setting=lambda name, value: self.saved.append((name, value)), restart=self._restart,
-            knowledge=knowledge, usage=usage, trade=self.desk, journal=journal,
+            knowledge=knowledge, usage=usage, trade=self.desk, journal=journal, later=self._later,
         )  # fmt: skip
 
     def _restart(self):
         self.restarts += 1
 
+    def _later(self, seconds, call):
+        timer = dict(seconds=seconds, call=call, cancelled=False)
+        self.timers.append(timer)
+        return lambda: timer.update(cancelled=True)
+
     def say(self, text, **kwargs):
         before = len(self.feishu.sent)
         self.router.handle(make_message(text, **kwargs))
         return self.feishu.sent[before:]
+
+
+LONG_ANSWER = "**方向**：偏多，4H 收在 2,650 上方。\n- 阻力 2,668（4H 前高）\n- 支撑 2,640（日线 EMA50）\n站稳 2,668 看 2,690，跌破 2,640 这个判断失效。"
 
 
 # ------------------------------------------------------------ who is served
@@ -97,7 +118,7 @@ def test_owner_in_the_group_sees_the_full_account():
 
 def test_owner_question_in_the_group_gives_the_ai_the_account():
     bench = Bench()
-    _, reply = bench.say("我的仓位风险大吗", sender=OWNER, private=False)
+    [reply] = bench.say("我的仓位风险大吗", sender=OWNER, private=False)
     [call] = bench.analyst.named("answer")
     assert call["in_group"] is True and "账户权益 10,000.00 USD" in call["account_text"]
     assert reply.footer == DISCLAIMER
@@ -205,8 +226,8 @@ def test_status_when_flat_and_when_okx_was_never_read():
 
 def test_group_question_gets_market_only_analysis():
     bench = Bench(**OPEN_GROUP)
-    wait, reply = bench.say("现在黄金怎么看", sender=FRIEND, private=False)
-    assert "请稍等" in wait.body
+    bench.analyst.reply = LONG_ANSWER
+    [reply] = bench.say("现在黄金怎么看", sender=FRIEND, private=False)
     [call] = bench.analyst.named("answer")
     assert call["in_group"] is True and call["account_text"] is None and call["deep"] is False
     assert "最新价：2,650.00" in call["market_text"]
@@ -222,7 +243,7 @@ def test_owner_question_in_a_levels_only_group_never_carries_the_account():
 
 def test_owner_private_question_includes_the_account():
     bench = Bench()
-    _, reply = bench.say("我的仓位风险大吗")
+    [reply] = bench.say("我的仓位风险大吗")
     [call] = bench.analyst.named("answer")
     assert call["in_group"] is False and "账户权益 10,000.00 USD" in call["account_text"]
     assert reply.footer is None
@@ -230,7 +251,8 @@ def test_owner_private_question_includes_the_account():
 
 def test_deep_prefix_is_for_the_owner_only():
     bench = Bench()
-    _, reply = bench.say("深度：下周怎么看")
+    bench.analyst.reply = LONG_ANSWER
+    [reply] = bench.say("深度：下周怎么看")
     [call] = bench.analyst.named("answer")
     assert call["deep"] is True and call["question"] == "下周怎么看"
     assert reply.title.startswith("深度分析")
@@ -254,17 +276,18 @@ def test_ai_router_can_send_a_long_question_to_status_or_help():
 def test_group_question_limit_applies_to_everyone_but_the_owner():
     bench = Bench(group_daily_question_limit=2, **OPEN_GROUP)
     for index in range(2):
-        assert len(bench.say(f"问题{index}：金价怎么看", sender=FRIEND, private=False)) == 2
+        assert len(bench.say(f"问题{index}：金价怎么看", sender=FRIEND, private=False)) == 1
     [reply] = bench.say("第三个问题：金价怎么看", sender=FRIEND, private=False)
     assert "次数用完了" in reply.body
     assert len(bench.analyst.named("answer")) == 2
-    assert len(bench.say("我自己问：金价怎么看", sender=OWNER, private=False)) == 2
+    assert bench.say("我自己问：金价怎么看", sender=OWNER, private=False)[0].body == "AI:answer"
     bench.clock.advance(24 * 3600)  # next day the counter starts again
-    assert len(bench.say("新的一天：金价怎么看", sender=FRIEND, private=False)) == 2
+    assert bench.say("新的一天：金价怎么看", sender=FRIEND, private=False)[0].body == "AI:answer"
 
 
 def test_any_instrument_named_in_the_question_is_fetched_first():
     bench = Bench()  # the watch list holds gold only
+    bench.analyst.reply = LONG_ANSWER
     bench.say("比特币现在怎么看")
     bench.say("btc 和 ETH 哪个强")
     bench.say("今天行情如何")
@@ -280,7 +303,7 @@ def test_any_instrument_named_in_the_question_is_fetched_first():
 def test_market_data_outage_is_passed_on_so_the_ai_can_say_so():
     bench = Bench()
     bench.okx.market_error = OkxNetworkError("连不上 OKX")
-    _, reply = bench.say("现在黄金怎么看")
+    [reply] = bench.say("现在黄金怎么看")
     [call] = bench.analyst.named("answer")
     assert "品种：XAU-USDT-SWAP" in call["market_text"] and "OKX 行情暂时取不到" in call["market_text"]
     assert reply.body == "AI:answer"
@@ -294,15 +317,18 @@ def test_follow_up_questions_carry_the_recent_conversation():
     first, second, group = (call["history"] for call in bench.analyst.named("answer"))
     assert first == [] and second == [("BTC 现在怎么看", "AI:answer")] and group == []
 
-    bench.clock.advance(31 * 60)  # half an hour later it is a new conversation
+    bench.clock.advance(31 * 60)  # half an hour later he is still in the same conversation
     bench.say("黄金呢")
+    assert len(bench.analyst.named("answer")[-1]["history"]) == 2
+    bench.clock.advance(2 * 3600 + 1)  # two hours later it is a new one
+    bench.say("那白银呢")
     assert bench.analyst.named("answer")[-1]["history"] == []
 
-    for index in range(5):
+    for index in range(7):
         bench.say(f"第 {index} 个问题：金价怎么看")
     assert [question for question, _ in bench.analyst.named("answer")[-1]["history"]] == [
-        "第 1 个问题：金价怎么看", "第 2 个问题：金价怎么看", "第 3 个问题：金价怎么看",
-    ]  # fmt: skip
+        f"第 {index} 个问题：金价怎么看" for index in range(1, 6)
+    ]  # the last five
 
 
 def test_a_failed_answer_is_not_remembered():
@@ -351,7 +377,7 @@ def test_friend_in_an_open_group_gets_quotes_with_the_disclaimer():
 def test_ai_outage_is_relayed_in_plain_words():
     bench = Bench()
     bench.analyst.error = AnalystUnavailable("连不上 Claude 的接口，请稍后再试。")
-    _, reply = bench.say("现在黄金怎么看")
+    [reply] = bench.say("现在黄金怎么看")
     assert reply.body == "连不上 Claude 的接口，请稍后再试。"
 
 
@@ -596,3 +622,143 @@ def test_the_track_record_is_the_owners_to_ask_for():
     bench = Bench(group_owner_only=False)
     replies = bench.say("成绩单", sender=FRIEND, private=False)
     assert all(reply.title != "成绩单" for reply in replies)
+
+
+# ------------------------------------------ how an answer is shown and waited for
+
+
+def test_a_question_gets_an_emoji_while_the_answer_is_written_and_no_waiting_message():
+    bench = Bench()
+    [reply] = bench.say("现在黄金怎么看", message_id="om_q")  # the answer is the only message
+    assert reply.body == "AI:answer"
+    assert bench.feishu.reactions == [("added", "om_q", WORKING_EMOJI), ("removed", "om_q", "r1")]
+    [timer] = bench.timers
+    assert timer["seconds"] == SLOW_SECONDS and timer["cancelled"]  # answered in time: nothing was said
+
+
+def test_words_come_only_when_the_answer_takes_long():
+    bench = Bench()
+    seen = []
+
+    def slow_answer(*args, **kwargs):
+        bench.timers[-1]["call"]()  # the wait ran past the limit while the AI was still working
+        seen.extend(bench.feishu.sent)
+        return "AI:answer"
+
+    bench.analyst.answer = slow_answer
+    wait, reply = bench.say("现在黄金怎么看", message_id="om_q")
+    assert [item.body for item in seen] == [SLOW_TEXT] and wait.target == "om_q"
+    assert reply.body == "AI:answer"
+
+    bench.analyst.answer = slow_answer
+    wait, _ = bench.say("深度 下周怎么看")
+    assert wait.body == SLOW_TEXT_DEEP
+
+
+def test_without_the_emoji_the_wait_is_acknowledged_sooner():
+    bench = Bench()
+    bench.feishu.reaction_error = RuntimeError("Feishu error 231021: no permission to operate external chats")
+    [reply] = bench.say("现在黄金怎么看")
+    assert reply.body == "AI:answer" and bench.feishu.reactions == []
+    [timer] = bench.timers
+    assert timer["seconds"] == SLOW_SECONDS_NO_SIGN and timer["cancelled"]
+
+
+def test_the_emoji_comes_off_when_the_ai_fails_too():
+    bench = Bench()
+    bench.analyst.error = AnalystUnavailable("连不上 Claude 的接口，请稍后再试。")
+    bench.say("现在黄金怎么看", message_id="om_q")
+    assert bench.feishu.reactions[-1] == ("removed", "om_q", "r1") and bench.timers[0]["cancelled"]
+
+    bench = Bench()
+    bench.analyst.answer = lambda *args, **kwargs: 1 / 0
+    bench.say("现在黄金怎么看", message_id="om_q")
+    assert bench.feishu.reactions[-1] == ("removed", "om_q", "r1") and bench.timers[0]["cancelled"]
+
+
+def test_commands_and_fixed_replies_carry_no_emoji():
+    bench = Bench()
+    for text in ("仓位", "帮助", "XAU 报价", "用量", "你好"):
+        bench.say(text)
+    assert bench.feishu.reactions == [] and bench.timers == []
+
+
+def test_a_few_sentences_are_sent_as_an_ordinary_message():
+    bench = Bench()
+    bench.analyst.reply = "美国 CPI 今晚 21:30 公布，市场预期同比 3.1%。"
+    [reply] = bench.say("今晚有什么数据")
+    assert reply.how == "reply_text" and reply.body == "美国 CPI 今晚 21:30 公布，市场预期同比 3.1%。"
+
+    # In the group the same answer keeps its small print, in a card without a header bar.
+    [reply] = bench.say("今晚有什么数据", private=False)
+    assert reply.how == "reply_markdown" and reply.title == "" and reply.footer == DISCLAIMER
+
+
+def test_a_longer_answer_is_a_card_under_the_title_the_ai_gave_it():
+    bench = Bench()
+    bench.analyst.reply = "标题：黄金：2,650 上方偏多\n\n" + LONG_ANSWER
+    [reply] = bench.say("现在黄金怎么看")
+    assert reply.how == "reply_markdown" and reply.title == "黄金：2,650 上方偏多" and reply.body == LONG_ANSWER
+    assert reply.footer is None
+
+    bench.say("那止损放哪")  # the title is not part of what the AI is shown as its earlier answer
+    assert bench.analyst.named("answer")[-1]["history"] == [("现在黄金怎么看", LONG_ANSWER)]
+
+    bench.analyst.reply = LONG_ANSWER  # no title given: the old one stands in
+    [reply] = bench.say("黄金再看一次")
+    assert reply.title == "行情分析 · XAU-USDT-SWAP"
+
+
+def test_a_title_on_a_short_answer_is_dropped():
+    bench = Bench()
+    bench.analyst.reply = "标题：CPI 时间\n今晚 21:30 公布。"
+    [reply] = bench.say("CPI 几点")
+    assert reply.how == "reply_text" and reply.body == "今晚 21:30 公布。"
+
+
+def test_split_title_reads_only_a_first_line_that_is_a_title():
+    assert split_title("标题：黄金偏多\n\n正文第一行\n第二行") == ("黄金偏多", "正文第一行\n第二行")
+    assert split_title("**标题**: 黄金偏多 \n正文") == ("黄金偏多", "正文")
+    assert split_title("**标题：黄金偏多**\n正文") == ("黄金偏多", "正文")
+    assert split_title("Title: Gold holds 2,650\n正文") == ("Gold holds 2,650", "正文")
+    assert split_title("正文里提到标题：这不是标题\n第二行") == ("", "正文里提到标题：这不是标题\n第二行")
+    assert split_title("标题：只有这一行") == ("", "只有这一行")
+    assert split_title("  普通回答  ") == ("", "普通回答")
+    title, body = split_title("标题：" + "很长" * 30 + "\n正文")
+    assert len(title) == 30 and title.endswith("…") and body == "正文"
+
+
+def test_is_plain_means_short_and_free_of_markdown():
+    assert is_plain("今晚 21:30 公布美国 CPI。\n预期 3.1%，前值 3.0%。")
+    assert is_plain("现在 2,650.5，比 24 小时前高 1.9%。")
+    assert not is_plain("**结论**：偏多。")
+    assert not is_plain("两条：\n- 阻力 2,668\n- 支撑 2,640")
+    assert not is_plain("来源见 [路透](https://example.com/a)")
+    assert not is_plain("一句话。" * 60)
+    assert not is_plain("一\n二\n三\n四\n五")
+
+
+# ----------------------------------------------------------------- greetings
+
+
+def test_a_greeting_gets_one_line_not_the_manual():
+    bench = Bench()
+    for text in ("你好", "谢谢！", "Hi"):
+        [reply] = bench.say(text)
+        assert reply.how == "reply_text" and reply.body == "AI:hello"
+    assert bench.analyst.named("route") == [] and bench.analyst.named("answer") == []
+
+    bench.analyst.intent = "hello"  # a longer one is recognised by the AI router
+    [reply] = bench.say("今天辛苦你了，先这样")
+    assert reply.body == "AI:hello" and bench.analyst.named("small_talk")[-1] == {"text": "今天辛苦你了，先这样"}
+
+
+def test_a_greeting_without_the_ai_gets_a_short_fixed_line():
+    bench = Bench(analyst_enabled=False)
+    [reply] = bench.say("你好")
+    assert reply.body == HELLO_TEXT and bench.analyst.calls == []
+
+    bench = Bench()
+    bench.analyst.error = AnalystUnavailable("额度用完了")
+    [reply] = bench.say("在吗")
+    assert reply.body == HELLO_TEXT

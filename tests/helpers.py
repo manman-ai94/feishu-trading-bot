@@ -92,6 +92,17 @@ class Sent:
 class FakeFeishu:
     def __init__(self):
         self.sent: list[Sent] = []
+        self.reactions: list[tuple[str, str, str]] = []  # (added | removed, message id, emoji or reaction id)
+        self.reaction_error: Exception | None = None
+
+    def add_reaction(self, message_id, emoji):
+        if self.reaction_error:
+            raise self.reaction_error
+        self.reactions.append(("added", message_id, emoji))
+        return f"r{len(self.reactions)}"
+
+    def remove_reaction(self, message_id, reaction_id):
+        self.reactions.append(("removed", message_id, reaction_id))
 
     def send_text(self, receive_id, text, receive_id_type="chat_id"):
         self.sent.append(Sent("send_text", receive_id, text, receive_id_type=receive_id_type))
@@ -173,6 +184,7 @@ class FakeAnalyst:
         self.enabled = enabled
         self.intent = "analysis"
         self.error: AnalystUnavailable | None = None
+        self.reply: str | None = None  # what answer() gives back; "AI:answer" when not set
         self.calls: list[tuple[str, dict]] = []
 
     def _record(self, name: str, **details) -> str:
@@ -189,10 +201,15 @@ class FakeAnalyst:
         return self.intent
 
     def answer(self, question, market_text, account_text, in_group, deep=False, history=None):
-        return self._record(
+        text = self._record(
             "answer", question=question, market_text=market_text, account_text=account_text, in_group=in_group,
             deep=deep, history=list(history or []),
         )  # fmt: skip
+        return text if self.reply is None else self.reply
+
+    def small_talk(self, text):
+        self.calls.append(("small_talk", {"text": text}))
+        return "" if self.error else "AI:hello"
 
     def brief(self, kind, market_text, account_text, journal_text, for_owner, shared_with_group=False):
         return self._record(

@@ -10,6 +10,11 @@ Rules that matter:
   * Private chats from anyone other than the owner are not served.
   * The knowledge base, the usage report, registering a group and restarting
     are the owner's alone.
+
+How an answer looks follows the answer. While the AI works, the question
+carries an emoji and nothing is said; words come only when the wait is long.
+A few sentences are sent as a plain message, the way a person would reply,
+and only a longer answer becomes a card, under the title the AI gave it.
 """
 from __future__ import annotations
 
@@ -54,6 +59,20 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 OWNER_ONLY_TEXT = "我只响应主人的指令。仓位变动和简报我会自动发到群里。"
 TRADE_OWNER_ONLY_TEXT = "下单、平仓、撤单这类指令只有主人能发，而且只在私聊里执行。"
 
+HELLO_TEXT = "在。直接问就行，例如“黄金现在怎么看”；发“帮助”可以看我能做什么。"
+HELLO_WORDS = ("你好", "您好", "hi", "hello", "在吗", "在不在", "谢谢", "多谢", "辛苦了", "早", "早上好", "晚上好")
+
+# While an answer is being written the question carries this emoji (taken off
+# again when the answer is sent), so nothing has to be said about waiting.
+WORKING_EMOJI = "Typing"
+SLOW_SECONDS = 90  # with the emoji showing, words are sent only when an answer takes longer than this
+SLOW_SECONDS_NO_SIGN = 30  # when Feishu would not take the emoji, the wait is acknowledged sooner
+SLOW_TEXT = "这个问题要查的东西多一些，还要一会儿。"
+SLOW_TEXT_DEEP = "深度分析还在做，再等一两分钟。"
+PLAIN_ANSWER_CHARS = 200  # an answer up to this long, without markdown, is sent as an ordinary message
+PLAIN_ANSWER_LINES = 4
+TITLE_CHARS = 30
+
 STATUS_WORDS = ("仓位", "持仓", "账户", "余额", "盈亏", "/status", "status", "position")
 HELP_WORDS = ("/help", "help", "帮助", "你能做什么", "怎么用")
 DEEP_PREFIXES = ("深度", "/deep")
@@ -68,10 +87,13 @@ RECORD_PREFIXES = ("成绩单", "战绩", "/record")
 RECORD_DAYS = 30
 RECORD_MAX_DAYS = 365
 SEEN_LIMIT = 500
-HISTORY_TURNS = 3  # earlier questions of the same chat the AI is shown, for follow-ups
-HISTORY_SECONDS = 30 * 60
+HISTORY_TURNS = 5  # earlier questions of the same chat the AI is shown, for follow-ups
+HISTORY_SECONDS = 2 * 3600
 HISTORY_ANSWER_CHARS = 1500
 NOTE_LIMIT = 20000
+
+_TITLE_LINE = re.compile(r"\A\s*\**\s*(?:标题|title)\s*\**\s*[：:]\s*(.*?)\s*(?:\n+|\Z)", re.IGNORECASE)
+_MARKDOWN = re.compile(r"\*\*|\]\(|`|^\s*(?:[-*+]|\d+[.、]|#+|>)\s", re.MULTILINE)
 
 # What may surround a ticker in a plain request for a price ("BTC 现在的价格").
 _QUOTE_FILLER = re.compile(
@@ -96,13 +118,15 @@ class Router:
         usage: Callable[[float, float], dict] | None = None,
         trade=None,
         journal=None,
+        later: Callable[[float, Callable[[], None]], Callable[[], None]] | None = None,
     ):
         """`save_setting(name, value)` writes one line of .env, so a group the
         owner registers survives a restart. `restart()` ends the process; the
         start script brings the bot back with the configuration read afresh.
         `usage(start, end)` returns the AI use between two moments. `trade` is
         the trade desk (trading.py), which reads the owner's order commands.
-        `journal` holds the track record the owner can ask for."""
+        `journal` holds the track record the owner can ask for. `later(seconds,
+        call)` runs a call after a delay and returns what cancels it."""
         self._cfg = cfg
         self._save_setting = save_setting
         self._restart = restart
@@ -117,6 +141,7 @@ class Router:
         self._usage = usage
         self._trade = trade
         self._journal = journal
+        self._later = later or _call_later
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
@@ -200,6 +225,8 @@ class Router:
         intent = self._intent(text)
         if intent == "help":
             self._feishu.reply_text(message.message_id, HELP_TEXT)
+        elif intent == "hello":
+            self._reply_hello(message, text)
         elif intent == "status":
             self._reply_status(message)
         else:
@@ -366,8 +393,10 @@ class Router:
 
     def _intent(self, text: str) -> str:
         lowered = text.lower()
-        if any(lowered == word or lowered.startswith(word + " ") for word in HELP_WORDS) or lowered in ("你好", "hi", "hello"):
+        if any(lowered == word or lowered.startswith(word + " ") for word in HELP_WORDS):
             return "help"
+        if lowered.strip(" 。.!！~～，,") in HELLO_WORDS:
+            return "hello"
         # Short messages like "仓位" or "我的持仓" are a status request; longer
         # ones ("我的仓位风险大吗") go to the AI router below.
         if len(text) <= 6 and any(word in lowered for word in STATUS_WORDS):
@@ -412,6 +441,11 @@ class Router:
         body = status_markdown(state, self._reporter.day_change(state), private=with_account)
         self._feishu.reply_markdown(message.message_id, "当前持仓", body, "blue", footer=None if message.is_private else DISCLAIMER)
 
+    def _reply_hello(self, message: IncomingMessage, text: str) -> None:
+        """A greeting or a thank-you gets one line back, not the list of everything the bot can do."""
+        reply = self._analyst.small_talk(text) if self._analyst.enabled else ""
+        self._feishu.reply_text(message.message_id, reply.strip() or HELLO_TEXT)
+
     def _reply_analysis(self, message: IncomingMessage, text: str, is_owner: bool) -> None:
         in_group = not message.is_private
         if in_group and not is_owner and not self._allow_group_question():
@@ -426,25 +460,65 @@ class Router:
                 text = text[len(prefix) :].strip(" ：:，,") or "请对当前行情做一次深入分析。"
                 break
 
-        self._try_reply(message, "收到，这次做深度分析，可能要两三分钟。" if deep else "收到，正在查行情和资料，请稍等一两分钟。")
-        named = self._resolver.find_in_text(text, limit=2)
-        market = self._market_text(named)
-
-        account = None
-        if self._shows_account(message):
-            state = self._reporter.current_state()
-            if state is not None:
-                account = account_text(state, self._reporter.day_change(state))
+        started = self._clock()
+        done = self._show_working(message, deep)
         try:
-            answer = self._analyst.answer(
-                text, market, account, in_group=in_group, deep=deep, history=self._recent(message.chat_id)
-            )
-        except AnalystUnavailable as exc:
-            self._feishu.reply_text(message.message_id, str(exc))
+            named = self._resolver.find_in_text(text, limit=2)
+            market = self._market_text(named)
+
+            account = None
+            if self._shows_account(message):
+                state = self._reporter.current_state()
+                if state is not None:
+                    account = account_text(state, self._reporter.day_change(state))
+            try:
+                answer = self._analyst.answer(
+                    text, market, account, in_group=in_group, deep=deep, history=self._recent(message.chat_id)
+                )
+            except AnalystUnavailable as exc:
+                self._feishu.reply_text(message.message_id, str(exc))
+                return
+        finally:
+            done()
+        log.info("answered in %.0f seconds", self._clock() - started)
+        title, body = split_title(answer)
+        self._remember(message.chat_id, text, body)
+        footer = DISCLAIMER if in_group else None
+        if is_plain(body):
+            if in_group:
+                self._feishu.reply_markdown(message.message_id, "", body, "indigo", footer=footer)  # no header bar
+            else:
+                self._feishu.reply_text(message.message_id, body)
             return
-        self._remember(message.chat_id, text, answer)
-        title = ("深度分析" if deep else "行情分析") + (f" · {'、'.join(named)}" if named else "")
-        self._feishu.reply_markdown(message.message_id, title, answer, "indigo", footer=DISCLAIMER if in_group else None)
+        if not title:
+            title = ("深度分析" if deep else "行情分析") + (f" · {'、'.join(named)}" if named else "")
+        self._feishu.reply_markdown(message.message_id, title, body, "indigo", footer=footer)
+
+    def _show_working(self, message: IncomingMessage, deep: bool) -> Callable[[], None]:
+        """Shows that an answer is on its way, and returns what to call when it is there.
+
+        The sign is an emoji on the question. Words follow only when the answer
+        takes long, or sooner when Feishu would not take the emoji.
+        """
+        reaction_id = ""
+        try:
+            reaction_id = self._feishu.add_reaction(message.message_id, WORKING_EMOJI)
+        except Exception as exc:
+            log.info("the working emoji could not be put on the question: %s", exc)
+        cancel = self._later(
+            SLOW_SECONDS if reaction_id else SLOW_SECONDS_NO_SIGN,
+            lambda: self._try_reply(message, SLOW_TEXT_DEEP if deep else SLOW_TEXT),
+        )
+
+        def done() -> None:
+            cancel()
+            if reaction_id:
+                try:
+                    self._feishu.remove_reaction(message.message_id, reaction_id)
+                except Exception as exc:
+                    log.info("the working emoji could not be taken off: %s", exc)
+
+        return done
 
     def _market_text(self, named: list[str]) -> str:
         """Market data fetched before the AI starts, so it need not ask for the obvious.
@@ -514,6 +588,36 @@ class Router:
             self._feishu.reply_text(message.message_id, text)
         except Exception:
             log.warning("could not send a short reply", exc_info=True)
+
+
+def split_title(answer: str) -> tuple[str, str]:
+    """The title the AI put on the first line of an answer ("标题：…"), and the answer without it."""
+    found = _TITLE_LINE.match(answer)
+    if found is None:
+        return "", answer.strip()
+    body = answer[found.end() :].strip()
+    title = found.group(1).strip(" *#")
+    if not body:
+        return "", title or answer.strip()  # a title and nothing else: that line is the answer
+    if len(title) > TITLE_CHARS:
+        title = title[: TITLE_CHARS - 1] + "…"
+    return title, body
+
+
+def is_plain(answer: str) -> bool:
+    """A few sentences without markdown: these read better as an ordinary message than as a card."""
+    return (
+        len(answer) <= PLAIN_ANSWER_CHARS
+        and answer.count("\n") < PLAIN_ANSWER_LINES
+        and _MARKDOWN.search(answer) is None
+    )
+
+
+def _call_later(seconds: float, call: Callable[[], None]) -> Callable[[], None]:
+    timer = threading.Timer(seconds, call)
+    timer.daemon = True
+    timer.start()
+    return timer.cancel
 
 
 def _note_body(text: str) -> str | None:

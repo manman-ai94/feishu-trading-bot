@@ -6,7 +6,16 @@ import anthropic
 import httpx2
 import pytest
 
-from bot.analyst import ANALYST_SYSTEM, FALLBACK_BETA, SEARCHED_ENOUGH_NOTE, Analyst, AnalystUnavailable
+from bot.analyst import (
+    ANALYST_SYSTEM,
+    DEEP_NOTE,
+    FALLBACK_BETA,
+    SEARCHED_ENOUGH_NOTE,
+    SMALL_TALK_SYSTEM,
+    TITLE_NOTE,
+    Analyst,
+    AnalystUnavailable,
+)
 
 from .helpers import make_cfg
 
@@ -491,3 +500,42 @@ def test_the_app_meters_ai_work_and_enforces_the_budget(tmp_path):
 
     text = bot.answer("再问一个", "", None, in_group=False)  # 0.034 spent, the budget is 0.03
     assert "预算上限" in text and client.messages.calls[2]["output_config"] == {"effort": "low"}
+
+
+# ------------------------------------------------- the shape of an answer
+
+
+def test_the_instructions_let_the_answer_follow_the_question():
+    assert "没有固定的格式" in ANALYST_SYSTEM and "篇幅和结构跟着问题走" in ANALYST_SYSTEM
+    for old in ("按这个结构写", "**结论**：", "**多头情景**", "**空头情景**"):
+        assert old not in ANALYST_SYSTEM  # the one template every answer used to be poured into
+    # What the trader asked for from the start still stands.
+    for kept in ("精确数字", "不讲教科书", "用词客观", "手机一屏", "由交易员自己决定", "不要写“现在买入”"):
+        assert kept in ANALYST_SYSTEM
+    assert "结构不变" not in DEEP_NOTE
+
+
+def test_an_answer_is_asked_for_a_title_and_a_brief_is_not():
+    bot, client = analyst(beta=[message(), message()])
+    bot.answer("现在黄金怎么看", "最新价：2,650.00", None, in_group=False)
+    bot.brief("morning", "行情", None, None, for_owner=False)
+    question, brief = (call["messages"][-1]["content"] for call in client.beta.messages.calls)
+    assert TITLE_NOTE in question and question.endswith("问题：现在黄金怎么看")
+    assert "标题：" not in brief and "不要每天一个模样" in brief
+
+
+def test_small_talk_is_one_cheap_line():
+    bot, client = analyst(plain=[message("不客气。")])
+    assert bot.small_talk("谢谢") == "不客气。"
+    [call] = client.messages.calls
+    assert call["model"] == "claude-haiku-5-5" and call["system"] == SMALL_TALK_SYSTEM and "tools" not in call
+    assert call["messages"] == [{"role": "user", "content": "谢谢"}]
+
+    bot, _ = analyst(plain=[api_error(anthropic.RateLimitError, 429)])
+    assert bot.small_talk("谢谢") == ""
+
+
+def test_a_greeting_is_its_own_kind_of_message():
+    bot, _ = analyst(plain=[message("hello"), message("help")])
+    assert bot.route_intent("今天辛苦了") == "hello"
+    assert bot.route_intent("你到底能干什么") == "help"
