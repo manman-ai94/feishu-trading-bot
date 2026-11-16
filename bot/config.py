@@ -171,6 +171,7 @@ class Config:
     trade_margin_mode: str = "cross"  # for a new position; an existing one keeps its own
     trade_confirm_seconds: int = 120
     trade_require_stop: bool = False  # refuse an opening order that carries no stop-loss
+    trade_max_risk_pct: float | None = None  # refuse an opening order whose stop would cost more than this share of the equity
     trade_breaker_stops: int = 2  # circuit breaker: this many losing stop-outs or liquidations stop new positions; 0 is off
     trade_breaker_hours: int = 24  # ... within this many hours
     trade_stop_trigger: str = "last"  # what price fires a stop the bot places: last, mark or index
@@ -345,6 +346,10 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
     if risk_per_trade_pct > 100:
         problems.append(f"RISK_PER_TRADE_PCT 是权益的百分比，不能超过 100，现在是 {risk_per_trade_pct:g}，按 1 算")
         risk_per_trade_pct = 1.0
+    trade_max_risk_pct = _get_float("TRADE_MAX_RISK_PCT", None, problems)
+    if trade_max_risk_pct is not None and not 0 < trade_max_risk_pct <= 100:
+        problems.append(f"TRADE_MAX_RISK_PCT 是权益的百分比，要在 0 到 100 之间，现在是 {trade_max_risk_pct:g}，先不按它拦")
+        trade_max_risk_pct = None
 
     cfg = Config(
         feishu_app_id=secrets["FEISHU_APP_ID"],
@@ -416,6 +421,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         trade_margin_mode=margin_mode,
         trade_confirm_seconds=max(20, _get_int("TRADE_CONFIRM_SECONDS", 120, problems)),
         trade_require_stop=_get_bool("TRADE_REQUIRE_STOP", False),
+        trade_max_risk_pct=trade_max_risk_pct,
         trade_breaker_stops=max(0, _get_int("TRADE_BREAKER_STOPS", 2, problems)),
         trade_breaker_hours=min(168, max(1, _get_int("TRADE_BREAKER_HOURS", 24, problems))),
         trade_stop_trigger=stop_trigger,

@@ -259,6 +259,8 @@ def parser(instruments=(XAU, BTC)) -> CommandParser:
     "text, expected",
     [
         ("做多 XAU 100张", Command("open", XAU, "long", "market", Decimal(100), "contracts")),
+        ("做多 XAU 止损 3816", Command("open", XAU, "long", "market", None, "risk", sl=Decimal(3816))),
+        ("限价做多 XAU 3850 止损 3820", Command("open", XAU, "long", "limit", None, "risk", Decimal(3850), sl=Decimal(3820))),
         ("做空 BTC 0.01个", Command("open", BTC, "short", "market", Decimal("0.01"), "coins")),
         ("做多 XAU 500U", Command("open", XAU, "long", "market", Decimal(500), "usd")),
         ("做多 xau 500 usdt", Command("open", XAU, "long", "market", Decimal(500), "usd")),
@@ -760,6 +762,66 @@ def test_a_stop_can_be_made_compulsory():
     assert "确认" in bench.say("做多 XAU 100张 止损 3860").text
 
 
+def roomy(**cfg):
+    """Room for a 25% risk on the 2,000 USDT test account: a position of about 10 XAU fits."""
+    values = dict(risk_per_trade_pct=25.0, trade_max_order_usd=60000.0, trade_max_position_usd=80000.0)
+    values.update(cfg)
+    return values
+
+
+def test_an_open_with_only_a_stop_is_sized_by_the_owners_risk():
+    bench = Bench(**roomy())
+    preview = bench.say("做多 XAU 止损 3830")
+    assert "数量 10000 张（合 10 XAU），按现价 3,880.0 约 38,800.00 USDT（名义价值）" in preview.text
+    assert "数量按你定的单笔风险算：权益 2,000.00 USD 的 25% 是 500.00 USDT，止损离现价 50，最多开 10000 张（合 10 XAU）" in preview.text
+    assert "触发后大约亏 500.00 USDT，占权益 25.0%，没超过你定的单笔风险 25%" in preview.text
+    bench.say("确认 1111")
+    assert bench.sent[0][1]["sz"] == "10000" and bench.sent[0][1]["sl_trigger_px"] == "3830"
+
+
+def test_a_resting_limit_order_is_sized_from_its_own_price():
+    bench = Bench(**roomy())
+    preview = bench.say("限价做多 XAU 3850 止损 3800")
+    assert "止损离限价 50，最多开 10000 张（合 10 XAU）" in preview.text
+    bench.say("确认 1111")
+    order = bench.sent[0][1]
+    assert (order["ord_type"], order["px"], order["sz"], order["sl_trigger_px"]) == ("limit", "3850", "10000", "3800")
+
+
+def test_a_risk_sized_open_that_breaks_a_limit_says_how_it_was_sized():
+    bench = Bench(**roomy())
+    text = bench.say("做多 XAU 止损 3860").text  # 500 over 20 is 25 XAU, about 97,000 USDT
+    assert "最多开 25000 张（合 25 XAU）" in text
+    assert "超过了单笔上限 60,000" in text and "可以写一个更小的数量，或者把止损放远一点" in text
+    assert "多单的止损要低于现价" in bench.say("做多 XAU 止损 3900").text
+    assert "最小的 1 张也会亏约 0.05 USDT" in Bench(risk_per_trade_pct=0.0001).say("做多 XAU 止损 3830").text
+    assert bench.sent == []
+
+
+def test_a_cap_on_the_stop_refuses_a_bigger_open():
+    bench = Bench(**roomy(trade_max_risk_pct=25.0))
+    assert "TRADE_MAX_RISK_PCT=25），开仓必须带止损" in bench.say("做多 XAU 1个").text
+    text = bench.say("做多 XAU 15个 止损 3830").text  # 750 USDT, 37.5% of 2,000
+    assert "这张单止损触发大约亏 750.00 USDT，占权益 37.5%，超过了你设的单笔上限 25%" in text
+    assert "按这个止损最多开 10000 张（合 10 XAU）" in text
+    assert "确认" in bench.say("做多 XAU 10个 止损 3830").text
+    assert "开仓的止损触发时最多亏权益的 25%" in bench.say("交易设置").text
+    assert "没有设开仓止损的亏损上限" in Bench().say("交易设置").text
+    assert bench.sent == []
+
+
+def test_the_cap_allows_a_little_for_the_price_moving_before_the_code():
+    bench = Bench(**roomy(trade_max_risk_pct=25.0))
+    bench.say("做多 XAU 止损 3830")
+    bench.exchange.last[XAU] = 3883.0  # 530 USDT now, 26.5%: within a tenth over the line
+    assert bench.say("确认 1111").title.startswith("已执行")
+    assert "最多开 9433 张" in bench.say("做多 XAU 止损 3830").text  # sized from 3,883 this time
+    bench.exchange.last[XAU] = 3893.0  # 63 over 9.433 XAU is 594 USDT, 29.7%
+    refusal = bench.say("确认 2222").text
+    assert "价格在你确认前动了，按现价 3,893.0 算" in refusal and "占权益 29.7%，超过了你设的 25%" in refusal
+    assert len(bench.exchange.named("place_order")) == 1
+
+
 def test_stops_on_the_wrong_side_are_refused():
     bench = Bench()
     assert "多单的止损要低于现价 3,880.0，你写的是 3,900.0" in bench.say("做多 XAU 100张 止损 3900").text
@@ -1029,6 +1091,9 @@ def test_the_size_calculator_follows_the_owners_risk_rule_and_sends_nothing():
     assert "按你现在 100 倍的杠杆设置，占用保证金约 7.36 USDT" in reply.text
     assert "你现在的多单 10 XAU，按同样的止损距离要亏约 1,050.00 USDT，占权益 52.5%" in reply.text
     assert "不是开仓建议" in reply.text
+    assert "要按这个数量开，发“限价做多 XAU 3873 止损 3768”" in reply.text
+    assert "发“做多 XAU 止损 3768”" in bench.say("算仓位 XAU 止损 3768").text
+    assert "要按这个数量开" not in bench.say("算仓位 XAU 入场 3900 止损 3768").text  # a limit there would fill at once
     assert "空单，入场 3,880.0（现价）" in bench.say("算仓位 XAU 止损 3990").text
     assert bench.say("算仓位 XAU 3873 止损 3768").text == reply.text  # the entry may be written bare
     assert "单笔风险 2%" in Bench(FakeExchange([gold()]), risk_per_trade_pct=2.0).say("算仓位 XAU 止损 3768").text

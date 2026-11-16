@@ -55,6 +55,7 @@ BREAKER_TOLD_SETTING = "breaker_told_at"  # the newest stop-out the owner has be
 MAX_COMMAND_CHARS = 80
 MAX_WRONG_CODES = 3
 FAR_LIMIT_PCT = Decimal(30)  # a resting limit price further than this from the market is taken for a typo
+CONFIRM_RISK_SLACK = Decimal("1.1")  # TRADE_MAX_RISK_PCT at the confirmation: a tenth over, for the price moving meanwhile
 ACCOUNT_CONFIG_TTL = 600.0
 ORDER_NOT_FOUND_CODES = {"51603"}  # OKX: the order does not exist
 
@@ -136,7 +137,8 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 市价：“做多 XAU 100张”“做空 BTC 0.01个”“做多 XAU 500U”
 - 限价挂单：“限价做多 XAU 100张 3850”“挂单做空 BTC 0.01个 68000”
 - 随单带止损止盈：在后面加“止损 3860 止盈 3950”
-- 数量必须带单位：“张”是合约张数，“个”是币的数量（黄金就是盎司），“U”是仓位的名义价值，不是保证金
+- 数量带单位：“张”是合约张数，“个”是币的数量（黄金就是盎司），“U”是仓位的名义价值，不是保证金
+- 只写止损不写数量：“做多 XAU 止损 3816”“限价做多 XAU 3850 止损 3820”，我按你定的单笔风险算数量，预览里写出怎么算的
 - “加仓 XAU 100张”：按现有仓位的方向再开
 
 **平仓**（都按市价）
@@ -154,7 +156,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 
 **算仓位**（只算数，不下单）
 - “算仓位 XAU 止损 3768”按现价算；“算仓位 XAU 入场 3873 止损 3768”
-- 按你定的单笔风险（RISK_PER_TRADE_PCT，现在默认权益的 1%）算最多开多大
+- 按你定的单笔风险（RISK_PER_TRADE_PCT，“交易设置”里看现在是多少）算最多开多大
 
 **在群里**
 - 你本人在登记过的群里 @我 发这些指令，和私聊一样执行；回确认码也要 @我。群里其他人发的不执行
@@ -188,7 +190,7 @@ class Command:
     direction: str = ""  # open: long | short | same (加仓). close: long | short | "" (whichever there is)
     ord_type: str = ""  # market | limit
     size: Decimal | None = None
-    unit: str = ""  # contracts | coins | usd | fraction
+    unit: str = ""  # contracts | coins | usd | fraction | risk (opening: sized from the stop and RISK_PER_TRADE_PCT)
     px: Decimal | None = None
     sl: Decimal | None = None
     tp: Decimal | None = None
@@ -324,7 +326,10 @@ class CommandParser:
         if not re.search(r"\d", rest):
             # "做多情绪很浓" is talk. "做多 BTC" is an order with the size left out.
             if ids and len(rest) <= 24:
-                raise _Unclear("要写数量和单位，例如：做多 XAU 100张、做多 BTC 0.01个，或 做多 XAU 500U。")
+                raise _Unclear(
+                    "要写数量和单位，例如：做多 XAU 100张、做多 BTC 0.01个，或 做多 XAU 500U。"
+                    "也可以只写止损，例如：做多 XAU 止损 3816，我按你定的单笔风险算数量。"
+                )
             return None
         inst_id = self._single(ids, required=True)
         base = inst_id.split("-")[0]
@@ -354,7 +359,9 @@ class CommandParser:
                 )
             raise _Unclear(f"这部分我没看懂：“{leftover}”。")
         if size is None:
-            raise _Unclear("要写数量和单位，例如：100张、0.01个，或 500U。")
+            if sl is None:
+                raise _Unclear("要写数量和单位，例如：100张、0.01个，或 500U。只写止损不写数量的话，我按你定的单笔风险算数量。")
+            unit = "risk"  # as much as the stop allows under the owner's per-trade risk
         if unit == "fraction":
             raise _Unclear("开仓的数量请用 张、个 或 U，不能用百分比。")
         if px is not None and px <= 0:
@@ -1066,7 +1073,7 @@ class TradeDesk:
         else:
             group = "你本人在登记的群里 @我 发的指令也执行，别人发的不执行"
         lines.append(f"**群里**：{group}")
-        lines.append(f"**单笔风险**：权益的 {cfg.risk_per_trade_pct:g}%（“算仓位”按它算）")
+        lines.append(f"**单笔风险**：权益的 {cfg.risk_per_trade_pct:g}%（“算仓位”和只写止损不写数量的开仓按它算数量）")
         lines.append("**限额**")
         lines.append(f"- 单笔上限 {cfg.trade_max_order_usd:,.0f} USDT（名义价值）")
         lines.append(f"- 单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f} USDT（含没成交的挂单）")
@@ -1080,7 +1087,11 @@ class TradeDesk:
             lines.append("- 没有设每日亏损线")
         lines.append(f"- 限价不能比现价差超过 {cfg.trade_max_deviation_pct:g}%（往会立刻成交的方向）")
         lines.append(f"- 预览后 {cfg.trade_confirm_seconds} 秒内确认；这期间价格动了超过 {cfg.trade_max_drift_pct:g}% 就要重新下指令")
-        lines.append(f"- 新仓位用{'全仓' if cfg.trade_margin_mode == 'cross' else '逐仓'}；开仓{'必须' if cfg.trade_require_stop else '不强制'}带止损")
+        lines.append(f"- 新仓位用{'全仓' if cfg.trade_margin_mode == 'cross' else '逐仓'}；开仓{'必须' if cfg.trade_require_stop or cfg.trade_max_risk_pct is not None else '不强制'}带止损")
+        if cfg.trade_max_risk_pct is not None:
+            lines.append(f"- 开仓的止损触发时最多亏权益的 {cfg.trade_max_risk_pct:g}%，超过就不执行（TRADE_MAX_RISK_PCT）")
+        else:
+            lines.append("- 没有设开仓止损的亏损上限（TRADE_MAX_RISK_PCT）")
         lines.append(f"**OKX key**（{self._account_label()}）")
         try:
             account = self._okx.account_config()
@@ -1206,6 +1217,13 @@ class TradeDesk:
             lines.append(
                 f"你现在的{_side_word(position.direction)}单 {_plain(coins_held)} {base}，按同样的止损距离要亏约 {_amt(cost)} {settle}，"
                 f"占权益 {cost / equity * 100:.1f}%"
+            )
+        resting = cmd.px is None or (cmd.px < last if long else cmd.px > last)  # a limit order there would wait
+        if contracts >= spec.min_sz and contracts > 0 and resting:
+            order = f"{'限价' if cmd.px is not None else ''}做{'多' if long else '空'} {base}"
+            where = f" {_plain(_round_to(cmd.px, spec.tick_sz))}" if cmd.px is not None else ""
+            lines.append(
+                f"要按这个数量开，发“{order}{where} 止损 {_plain(_round_to(cmd.sl, spec.tick_sz))}”，预览里会按当时的价格再算一遍"
             )
         lines.append("这是按你给的价格和你自己的规则算出的数，不是开仓建议。")
         return Reply("\n".join(f"- {line}" for line in lines), title=f"算仓位 · {cmd.inst_id}", template="wathet")
@@ -1371,8 +1389,16 @@ class TradeDesk:
                 )
 
         per_contract = spec.coins_per_contract
+        equity = _dec(state.snapshot.total_eq or 0)
+        entry_name = "限价" if px is not None else "现价"
+        sl = _round_to(cmd.sl, spec.tick_sz) if cmd.sl is not None else None
+        tp = _round_to(cmd.tp, spec.tick_sz) if cmd.tp is not None else None
+        sized = ""  # how a risk-sized order came to its size, for the preview and for a refusal
         if previous is not None:
             contracts = Decimal(previous.data["sz"])
+            sized = previous.data.get("sized", "")
+        elif cmd.unit == "risk":
+            contracts, sized = self._risk_sized(direction, ref, sl, entry_name, equity, spec)
         elif cmd.unit == "contracts":
             contracts = cmd.size
             if contracts % spec.lot_sz != 0:
@@ -1389,9 +1415,11 @@ class TradeDesk:
             )
         value = contracts * per_contract * ref
 
+        smaller = "可以写一个更小的数量，或者把止损放远一点。" if sized else ""
         if value > _dec(cfg.trade_max_order_usd):
             raise Refused(
-                f"这张单约 {_amt(value)} {settle}，超过了单笔上限 {cfg.trade_max_order_usd:,.0f}。"
+                (f"{sized}。" if sized else "")
+                + f"这张单约 {_amt(value)} {settle}，超过了单笔上限 {cfg.trade_max_order_usd:,.0f}。{smaller}"
                 "上限在服务器 .env 的 TRADE_MAX_ORDER_USD，飞书里改不了。"
             )
         side = "buy" if long else "sell"
@@ -1406,9 +1434,10 @@ class TradeDesk:
         total = held_value + queued + value
         if total > _dec(cfg.trade_max_position_usd):
             raise Refused(
-                f"下了这张单，{inst_id} 的{word}单会到约 {_amt(total)} {settle}"
+                (f"{sized}。" if sized else "")
+                + f"下了这张单，{inst_id} 的{word}单会到约 {_amt(total)} {settle}"
                 f"（现有 {_amt(held_value)}，挂单 {_amt(queued)}，这张 {_amt(value)}），"
-                f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。"
+                f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。{smaller}"
                 "上限在服务器 .env 的 TRADE_MAX_POSITION_USD，飞书里改不了。"
             )
         opens = self._journal.count_opens(self._day_start(), self._clock() + 1, self._mode)
@@ -1426,12 +1455,10 @@ class TradeDesk:
                     "平仓、撤单、改止损不受影响。"
                 )
 
-        sl = _round_to(cmd.sl, spec.tick_sz) if cmd.sl is not None else None
-        tp = _round_to(cmd.tp, spec.tick_sz) if cmd.tp is not None else None
         if cfg.trade_require_stop and sl is None:
             raise Refused("按你的设置（TRADE_REQUIRE_STOP=true），开仓必须带止损。请在指令后面加上“止损 价格”。")
-        entry_name = "限价" if px is not None else "现价"
         self._check_stop_sides(direction, ref, sl, tp, entry_name, spec)
+        self._check_max_risk(contracts, ref, sl, entry_name, equity, spec, confirming=previous is not None)
 
         td_mode = (same or held)[0].mgn_mode if held else cfg.trade_margin_mode
         pos_side = direction if account.hedge_mode else None
@@ -1442,6 +1469,8 @@ class TradeDesk:
             log.warning("could not read the leverage of %s: %s", inst_id, exc)
 
         lines = [f"数量 {_contracts_text(contracts, spec)}，按{entry_name} {_px(ref, spec)} 约 {_amt(value)} {settle}（名义价值）"]
+        if sized:
+            lines.append(sized)
         mode_word = "全仓" if td_mode == "cross" else "逐仓"
         if lever:
             margin = value / _dec(lever)
@@ -1482,7 +1511,75 @@ class TradeDesk:
             args["tp_trigger_px"] = _plain(tp)
         title = f"{'限价' if px is not None else '市价'}做{word} {inst_id}"
         data = {"sz": _plain(contracts), "ref": _plain(last), "positions": self._fingerprint(held)}
+        if sized:
+            data["sized"] = sized
         return Plan("open", title, tuple(lines), (Step("place_order", args, "开仓"),), inst_id, data)
+
+    def _risk_sized(
+        self, direction: str, ref: Decimal, sl: Decimal | None, entry_name: str, equity: Decimal, spec: InstrumentSpec
+    ) -> tuple[Decimal, str]:
+        """The size of an opening order given only a stop: as many contracts as the owner's per-trade risk
+        (RISK_PER_TRADE_PCT of the equity) allows if the stop is hit. Returns (contracts, how it was worked out)."""
+        if sl is None:
+            raise Refused("要写数量和单位，或者写止损让我按单笔风险算数量。")
+        if spec.ct_type and spec.ct_type != "linear":
+            raise Refused("按单笔风险算数量目前只算 USDT 本位合约，请写明数量。")
+        if equity <= 0:
+            raise Refused("读不到账户权益，没法按单笔风险算数量。请写明数量。")
+        self._check_stop_sides(direction, ref, sl, None, entry_name, spec)
+        pct = _dec(self._cfg.risk_per_trade_pct)
+        budget = equity * pct / 100
+        gap = abs(ref - sl)
+        settle = spec.settle_ccy or "USDT"
+        contracts = _floor_to(budget / gap / spec.coins_per_contract, spec.lot_sz)
+        how = (
+            f"数量按你定的单笔风险算：权益 {_amt(equity)} USD 的 {float(pct):g}% 是 {_amt(budget)} {settle}，"
+            f"止损离{entry_name} {_plain(gap)}，最多开 {_contracts_text(contracts, spec)}"
+        )
+        if contracts < spec.min_sz or contracts <= 0:
+            least = spec.min_sz * spec.coins_per_contract * gap
+            raise Refused(
+                f"{how}。按这个止损，最小的 {_plain(spec.min_sz)} 张也会亏约 {_amt(least)} {settle}，"
+                f"占权益 {least / equity * 100:.2f}%，超过了 {float(pct):g}%。止损要更近，或者这笔不做。"
+            )
+        return contracts, how
+
+    def _check_max_risk(
+        self, contracts: Decimal, ref: Decimal, sl: Decimal | None, entry_name: str, equity: Decimal,
+        spec: InstrumentSpec, confirming: bool,
+    ) -> None:  # fmt: skip
+        """TRADE_MAX_RISK_PCT: an opening order must carry a stop, and the stop may cost at most that share of
+        the equity. When the owner confirms, a market order is measured again from the price then, with a
+        tenth of the line to spare: the price may move a little between the preview and the confirmation
+        (TRADE_MAX_DRIFT_PCT bounds how much), and an order sized right at the line should not fail for it."""
+        cap = self._cfg.trade_max_risk_pct
+        if cap is None:
+            return
+        if sl is None:
+            raise Refused(
+                f"按你的设置（TRADE_MAX_RISK_PCT={cap:g}），开仓必须带止损，止损触发时最多亏权益的 {cap:g}%。"
+                "请在指令后面加上“止损 价格”；不写数量的话，我按单笔风险算数量。"
+            )
+        if equity <= 0:
+            raise Refused("读不到账户权益，没法核对单笔止损上限，这次不开仓。请稍后再试。")
+        settle = spec.settle_ccy or "USDT"
+        per_contract = spec.coins_per_contract
+        loss = abs(ref - sl) * contracts * per_contract
+        line = equity * _dec(cap) / 100
+        allowed = line * CONFIRM_RISK_SLACK if confirming else line
+        if loss <= allowed:
+            return
+        most = _floor_to(line / abs(ref - sl) / per_contract, spec.lot_sz)
+        if confirming:
+            raise Refused(
+                f"价格在你确认前动了，按{entry_name} {_px(ref, spec)} 算，这张单止损触发要亏约 {_amt(loss)} {settle}，"
+                f"占权益 {loss / equity * 100:.1f}%，超过了你设的 {cap:g}%（TRADE_MAX_RISK_PCT）。请重新发指令，我按新价格再算。"
+            )
+        fits = f"按这个止损最多开 {_contracts_text(most, spec)}" if most >= spec.min_sz else "按这个止损，最小的数量也超了"
+        raise Refused(
+            f"这张单止损触发大约亏 {_amt(loss)} {settle}，占权益 {loss / equity * 100:.1f}%，"
+            f"超过了你设的单笔上限 {cap:g}%（TRADE_MAX_RISK_PCT）。{fits}；只写止损不写数量的话，我按单笔风险算数量。"
+        )
 
     @staticmethod
     def _check_stop_sides(

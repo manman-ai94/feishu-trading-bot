@@ -267,7 +267,18 @@ def test_trading_limits_come_from_the_file(tmp_path):
     assert (cfg.trade_max_order_usd, cfg.trade_max_position_usd, cfg.trade_max_opens_per_day) == (5000.0, 60000.0, 5)
     assert (cfg.trade_daily_loss_limit_usd, cfg.trade_max_deviation_pct, cfg.trade_max_drift_pct) == (300.0, 0.3, 0.2)
     assert (cfg.trade_margin_mode, cfg.trade_confirm_seconds, cfg.trade_require_stop) == ("isolated", 60, True)
+    assert cfg.trade_max_risk_pct is None
     assert not any("TRADE" in item for item in problems)
+
+
+def test_the_cap_on_an_opening_stop(tmp_path):
+    cfg, problems = load_config(write_env(tmp_path, "TRADE_MAX_RISK_PCT=25\n"))
+    assert cfg.trade_max_risk_pct == 25.0 and not any("TRADE" in item for item in problems)
+
+
+def test_a_cap_over_the_whole_equity_is_not_used(tmp_path):
+    cfg, problems = load_config(write_env(tmp_path, "TRADE_MAX_RISK_PCT=150\n"))
+    assert cfg.trade_max_risk_pct is None and any("TRADE_MAX_RISK_PCT" in item for item in problems)
 
 
 def test_mistakes_in_the_trading_limits_fall_back_to_the_cautious_defaults(tmp_path):

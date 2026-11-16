@@ -162,8 +162,12 @@ class SelfTest:
         return spec, _dec(self._okx.ticker(inst_id).last)
 
     def _opening(self, spec: InstrumentSpec, last: Decimal) -> Command:
-        stop = self._below(last, STOP_PCT) if self._cfg.trade_require_stop else None
+        stop = self._below(last, STOP_PCT) if self._stop_needed() else None
         return Command("open", inst_id=self._inst_id, direction="long", ord_type="market", size=spec.min_sz * LOTS, unit="contracts", sl=stop)
+
+    def _stop_needed(self) -> bool:
+        """The settings refuse an opening order without a stop (TRADE_REQUIRE_STOP, TRADE_MAX_RISK_PCT)."""
+        return self._cfg.trade_require_stop or self._cfg.trade_max_risk_pct is not None
 
     # -------------------------------------------------------------------- run
 
@@ -226,7 +230,7 @@ class SelfTest:
             "取消止盈", Command("stop", inst_id=inst_id, clear_tp=True),
             lambda view: self._stops_are(view, size - one, moved, None),
         )  # fmt: skip
-        limit_stop = self._below(resting, STOP_PCT) if self._cfg.trade_require_stop else None
+        limit_stop = self._below(resting, STOP_PCT) if self._stop_needed() else None
         found: list[tuple[OrderInfo | None, str, str]] = []
         self._step(
             "限价挂单",

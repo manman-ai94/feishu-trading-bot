@@ -189,8 +189,9 @@ def test_another_instrument_can_be_named():
     assert last_run(bench)["inst_id"] == BTC
 
 
-def test_with_stops_required_the_orders_carry_one():
-    bench = Bench(Demo(), trade_require_stop=True)
+@pytest.mark.parametrize("setting", [{"trade_require_stop": True}, {"trade_max_risk_pct": 25.0}])
+def test_with_stops_required_the_orders_carry_one(setting):
+    bench = Bench(Demo(), **setting)
     reply = bench.run("模拟盘自测")
     assert reply.title == "模拟盘自测 · 通过", reply.text
     opened, _, resting = bench.exchange.named("place_order")
