@@ -329,6 +329,12 @@ class OrderInfo:
     reduce_only: bool = False
     cl_ord_id: str = ""
     c_time: int = 0
+    pnl: float | None = None  # what a closing order made or lost, before fees; in the settlement currency
+    fee: float | None = None  # negative when a fee was charged
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.sz - self.filled_sz)
 
     @classmethod
     def from_okx(cls, row: dict) -> "OrderInfo":
@@ -346,4 +352,6 @@ class OrderInfo:
             reduce_only=str(row.get("reduceOnly", "")).lower() == "true",
             cl_ord_id=str(row.get("clOrdId", "")),
             c_time=int(to_float(row.get("cTime")) or 0),
+            pnl=to_float(row.get("pnl")),
+            fee=to_float(row.get("fee")),
         )

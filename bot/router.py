@@ -40,15 +40,17 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 发 /whoami，查看你的飞书 ID
 
 主人专用：
+- 下单、平仓、撤单、设止盈止损：只在私聊里，每条指令我先回预览，你回复确认码才执行。发“交易帮助”看写法
 - 问题前面加“深度”，我会多查几轮、分析得更细
 - 发“记住：……”，把交易规则、心得或资料存进资料库，以后回答时我会参考。发“资料”看资料库里有什么
 - 发“用量”，看今天和本月 AI 大约花了多少钱
 - 在群里 @我 发“登记本群”，简报和提醒就会发到那个群
 - 私聊我发“重启”，我会重新启动并读取新的配置
 
-我每天定时发盘前简报和收盘小结，仓位有变动时会自动提醒。我只做分析和提醒，不替任何人做买卖决定。"""
+我每天定时发盘前简报和收盘小结，仓位有变动时会自动提醒。我只做分析、提醒和执行主人确认过的指令，不替任何人做买卖决定。"""
 
 OWNER_ONLY_TEXT = "我只响应主人的指令。仓位变动和简报我会自动发到群里。"
+TRADE_OWNER_ONLY_TEXT = "下单、平仓、撤单这类指令只有主人能发，而且只在私聊里执行。"
 
 STATUS_WORDS = ("仓位", "持仓", "账户", "余额", "盈亏", "/status", "status", "position")
 HELP_WORDS = ("/help", "help", "帮助", "你能做什么", "怎么用")
@@ -87,11 +89,13 @@ class Router:
         resolver: InstrumentResolver | None = None,
         knowledge: KnowledgeBase | None = None,
         usage: Callable[[float, float], dict] | None = None,
+        trade=None,
     ):
         """`save_setting(name, value)` writes one line of .env, so a group the
         owner registers survives a restart. `restart()` ends the process; the
         start script brings the bot back with the configuration read afresh.
-        `usage(start, end)` returns the AI use between two moments."""
+        `usage(start, end)` returns the AI use between two moments. `trade` is
+        the trade desk (trading.py), which reads the owner's order commands."""
         self._cfg = cfg
         self._save_setting = save_setting
         self._restart = restart
@@ -104,6 +108,7 @@ class Router:
         self._resolver = resolver or InstrumentResolver(okx, clock)
         self._knowledge = knowledge
         self._usage = usage
+        self._trade = trade
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
@@ -170,6 +175,10 @@ class Router:
             if message.is_private:
                 self._feishu.reply_text(message.message_id, "这个机器人只在群里回答问题，请到群里 @我。")
                 return
+            # An order from anyone but the owner is turned away here, before the AI ever sees it.
+            if self._trade is not None and self._trade.is_command(text):
+                self._feishu.reply_text(message.message_id, TRADE_OWNER_ONLY_TEXT)
+                return
 
         if not message.is_text or not text:
             self._feishu.reply_text(message.message_id, "我目前只看得懂文字消息。发“帮助”可以看我能做什么。")
@@ -208,8 +217,21 @@ class Router:
         else:
             note = _note_body(text)
             if note is None:
-                return False
+                return self._trade_command(message, text)
             self._learn(message, note)
+        return True
+
+    def _trade_command(self, message: IncomingMessage, text: str) -> bool:
+        """Order commands: the trade desk reads them by fixed patterns, never the AI."""
+        if self._trade is None:
+            return False
+        reply = self._trade.handle(text, private=message.is_private)
+        if reply is None:
+            return False
+        if reply.title:
+            self._feishu.reply_markdown(message.message_id, reply.title, reply.text, reply.template)
+        else:
+            self._feishu.reply_text(message.message_id, reply.text)
         return True
 
     def _bind_group(self, message: IncomingMessage) -> None:

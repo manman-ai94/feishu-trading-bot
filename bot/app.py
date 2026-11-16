@@ -19,10 +19,12 @@ from .journal import Journal
 from .knowledge import KnowledgeBase
 from .monitor import Monitor
 from .okx_client import OkxClient
+from .okx_trade import OkxTradeClient
 from .router import Router
 from .scheduler import Scheduler
 from .service import Reporter
 from .tools import Toolbox
+from .trading import TradeDesk
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +43,35 @@ def setup_logging(cfg: Config) -> None:
 
 def build_okx(cfg: Config) -> OkxClient:
     return OkxClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, cfg.okx_demo)
+
+
+def build_trader(cfg: Config) -> OkxTradeClient | None:
+    """The client that can place orders. None unless the owner switched trading on in .env.
+
+    TRADING=demo sends orders to OKX demo trading: with the demo keys when they
+    are filled in, otherwise with the main keys (which are demo keys when
+    OKX_DEMO=true). TRADING=live uses the main keys on the real account.
+    """
+    if cfg.trading == "live":
+        return OkxTradeClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, demo=False)
+    if cfg.trading == "demo":
+        if cfg.has_okx_demo_keys:
+            return OkxTradeClient(
+                cfg.okx_demo_api_key, cfg.okx_demo_secret_key, cfg.okx_demo_passphrase, cfg.okx_base_url, demo=True
+            )
+        return OkxTradeClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, demo=True)
+    return None
+
+
+def build_trade_desk(cfg: Config, journal: Journal, okx: OkxClient, resolver: InstrumentResolver, reporter=None) -> TradeDesk:
+    """The trade desk is always there, so the owner can ask how trading is set up; it only gets a
+    client that can place orders when trading is switched on."""
+
+    def day_change() -> float | None:
+        state = reporter.current_state() if reporter is not None else None
+        return reporter.day_change(state) if state is not None else None
+
+    return TradeDesk(cfg, journal, okx, build_trader(cfg), resolver, day_change=day_change)
 
 
 def build_ai(cfg: Config, okx: OkxClient, journal: Journal) -> tuple[Analyst, InstrumentResolver, KnowledgeBase]:
@@ -91,10 +122,14 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     def restart() -> None:
         threading.Timer(RESTART_DELAY_SECONDS, _exit_for_restart).start()
 
+    desk = build_trade_desk(cfg, journal, okx, resolver, reporter)
     router = Router(
         cfg, feishu, okx, analyst, reporter, bot_open_id, save_setting=save_setting, restart=restart,
-        resolver=resolver, knowledge=knowledge, usage=journal.usage_between,
+        resolver=resolver, knowledge=knowledge, usage=journal.usage_between, trade=desk,
     )  # fmt: skip
+    log.info("trading: %s (instruments: %s)", desk.mode, ", ".join(cfg.tradable_instruments))
+    if cfg.trading_blocked:
+        log.warning("trading stays off: the TRADING setting in .env cannot be honoured")
     log.info(
         "AI: questions on %s (%s), deep on %s (%s), web search %s, %d knowledge file(s)",
         cfg.model_daily, cfg.effort_daily, cfg.model_deep, cfg.effort_deep,

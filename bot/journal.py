@@ -40,6 +40,21 @@ CREATE TABLE IF NOT EXISTS ai_usage (
     cost_usd REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ai_usage_ts ON ai_usage (ts);
+CREATE TABLE IF NOT EXISTS orders (
+    ts INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    action TEXT NOT NULL,
+    inst_id TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL,
+    request TEXT NOT NULL DEFAULT '{}',
+    result TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders (ts);
+CREATE TABLE IF NOT EXISTS settings (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -140,6 +155,67 @@ class Journal:
                 (int(start), int(end)),
             ).fetchone()
         return {"jobs": row["jobs"], "web_searches": row["web_searches"], "cost_usd": row["cost_usd"]}
+
+    # ---------------------------------------------------------------- orders
+
+    def record_order(
+        self,
+        mode: str,
+        action: str,
+        summary: str,
+        result: str,
+        inst_id: str = "",
+        request: dict | list | None = None,
+        detail: str = "",
+        ts: float | None = None,
+    ) -> None:
+        """One row per instruction the bot sent to OKX on the owner's confirmation.
+
+        `mode` is "demo" or "live"; `action` is open | close | cancel | stop;
+        `result` is ok | rejected | unknown (the request may or may not have arrived).
+        """
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO orders (ts, mode, action, inst_id, summary, request, result, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(ts or time.time()), mode, action, inst_id, summary,
+                 json.dumps(request or {}, ensure_ascii=False), result, detail),
+            )  # fmt: skip
+            self._db.commit()
+
+    def orders_between(self, start: float, end: float, mode: str | None = None) -> list[dict]:
+        query = "SELECT ts, mode, action, inst_id, summary, result, detail FROM orders WHERE ts >= ? AND ts < ?"
+        values: list = [int(start), int(end)]
+        if mode:
+            query += " AND mode = ?"
+            values.append(mode)
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY ts ASC", values).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_opens(self, start: float, end: float, mode: str) -> int:
+        """Opening orders sent in [start, end), counting the ones whose outcome is unknown."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM orders WHERE action = 'open' AND result IN ('ok', 'unknown')"
+                " AND mode = ? AND ts >= ? AND ts < ?",
+                (mode, int(start), int(end)),
+            ).fetchone()
+        return int(row["n"])
+
+    # -------------------------------------------------------------- settings
+
+    def get_setting(self, name: str, default: str = "") -> str:
+        with self._lock:
+            row = self._db.execute("SELECT value FROM settings WHERE name = ?", (name,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, name: str, value: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO settings (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                (name, value),
+            )
+            self._db.commit()
 
     def close(self) -> None:
         with self._lock:

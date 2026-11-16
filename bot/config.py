@@ -24,6 +24,8 @@ FEISHU_DOMAINS = {
 WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 OFF_WORDS = ("off", "none", "关")  # how the owner switches a feature off in .env
 EFFORTS = ("low", "medium", "high", "xhigh", "max")  # how hard the AI thinks; higher costs more and takes longer
+TRADING_MODES = ("off", "demo", "live")
+MARGIN_MODES = ("cross", "isolated")
 
 
 def _get(name: str, default: str = "") -> str:
@@ -131,6 +133,23 @@ class Config:
     db_path: Path = Path("data/bot.db")
     log_dir: Path = Path("logs")
 
+    # Placing orders. Off unless the owner switches it on in .env; none of this can be changed from a chat.
+    trading: str = "off"  # "off", "demo" (OKX demo trading) or "live" (the real account)
+    trading_blocked: str = ""  # why the mode asked for in .env could not be honoured
+    okx_demo_api_key: str = field(default="", repr=False)
+    okx_demo_secret_key: str = field(default="", repr=False)
+    okx_demo_passphrase: str = field(default="", repr=False)
+    trade_instruments: tuple[str, ...] = ()  # the only instruments an order may name; empty means the watch list
+    trade_max_order_usd: float = 1000.0  # value of one order
+    trade_max_position_usd: float = 3000.0  # value of the position in one instrument, open orders included
+    trade_max_opens_per_day: int = 20
+    trade_daily_loss_limit_usd: float | None = None  # no new positions once the day is down this much
+    trade_max_deviation_pct: float = 1.0  # a limit price may not be further than this on the wrong side of the market
+    trade_max_drift_pct: float = 0.5  # how far the price may move between the preview and the confirmation
+    trade_margin_mode: str = "cross"  # for a new position; an existing one keeps its own
+    trade_confirm_seconds: int = 120
+    trade_require_stop: bool = False  # refuse an opening order that carries no stop-loss
+
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
@@ -138,6 +157,18 @@ class Config:
     @property
     def has_okx_keys(self) -> bool:
         return bool(self.okx_api_key and self.okx_secret_key and self.okx_passphrase)
+
+    @property
+    def has_okx_demo_keys(self) -> bool:
+        return bool(self.okx_demo_api_key and self.okx_demo_secret_key and self.okx_demo_passphrase)
+
+    @property
+    def trading_on(self) -> bool:
+        return self.trading in ("demo", "live")
+
+    @property
+    def tradable_instruments(self) -> tuple[str, ...]:
+        return self.trade_instruments or self.watch_instruments
 
     def register_group(self, chat_id: str) -> None:
         """The one setting that changes while the bot runs: the owner registers
@@ -210,6 +241,38 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
             secrets[finding.name] = ""
             problems.append(f"{finding.name} 填错位置了（{finding.note}），机器人当它没填。请重新填这一项")
 
+    okx_demo = _get_bool("OKX_DEMO", False)
+    has_main_keys = all(secrets[name] for name in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"))
+    has_demo_keys = all(secrets[name] for name in ("OKX_DEMO_API_KEY", "OKX_DEMO_SECRET_KEY", "OKX_DEMO_PASSPHRASE"))
+    trading = _get("TRADING", "off").lower()
+    trading_blocked = ""
+    if trading in OFF_WORDS or trading in ("false", "0", "no"):
+        trading = "off"
+    elif trading not in TRADING_MODES:
+        trading_blocked = f"TRADING 只能填 off、demo 或 live，现在是 {trading!r}"
+    elif trading == "demo" and not has_demo_keys and not (okx_demo and has_main_keys):
+        trading_blocked = "TRADING=demo 需要模拟盘的三项 key：OKX_DEMO_API_KEY、OKX_DEMO_SECRET_KEY、OKX_DEMO_PASSPHRASE"
+    elif trading == "live" and okx_demo:
+        trading_blocked = "TRADING=live 是在实盘下单，但 OKX_DEMO=true 说明填的是模拟盘的 key。要在模拟盘下单请填 TRADING=demo"
+    elif trading == "live" and not has_main_keys:
+        trading_blocked = "TRADING=live 需要先填好 OKX 的三项 key"
+    if trading_blocked:
+        problems.append(trading_blocked + "。下单功能保持关闭")
+        trading = "off"
+
+    margin_mode = _get("TRADE_MARGIN_MODE", "cross").lower()
+    if margin_mode not in MARGIN_MODES:
+        problems.append(f"TRADE_MARGIN_MODE 只能填 cross（全仓）或 isolated（逐仓），现在是 {margin_mode!r}")
+        margin_mode = "cross"
+
+    def _positive(name: str, default: float) -> float:
+        value = _get_float(name, default, problems)
+        if value is None or value <= 0:
+            if _get(name):
+                problems.append(f"{name} 要填一个大于 0 的数，现在按默认值 {default:g} 算")
+            return default
+        return value
+
     cfg = Config(
         feishu_app_id=secrets["FEISHU_APP_ID"],
         feishu_app_secret=secrets["FEISHU_APP_SECRET"],
@@ -219,7 +282,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         okx_api_key=secrets["OKX_API_KEY"],
         okx_secret_key=secrets["OKX_SECRET_KEY"],
         okx_passphrase=secrets["OKX_PASSPHRASE"],
-        okx_demo=_get_bool("OKX_DEMO", False),
+        okx_demo=okx_demo,
         okx_base_url=_get("OKX_BASE_URL", "https://www.okx.com").rstrip("/"),
         watch_instruments=instruments or ("XAU-USDT-SWAP",),
         anthropic_api_key=secrets["ANTHROPIC_API_KEY"],
@@ -246,6 +309,23 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         group_daily_question_limit=max(0, _get_int("GROUP_DAILY_QUESTION_LIMIT", 30, problems)),
         db_path=Path(_get("DB_PATH", "data/bot.db")),
         log_dir=Path(_get("LOG_DIR", "logs")),
+        trading=trading,
+        trading_blocked=trading_blocked,
+        okx_demo_api_key=secrets["OKX_DEMO_API_KEY"],
+        okx_demo_secret_key=secrets["OKX_DEMO_SECRET_KEY"],
+        okx_demo_passphrase=secrets["OKX_DEMO_PASSPHRASE"],
+        trade_instruments=tuple(
+            item.strip().upper() for item in _get("TRADE_INSTRUMENTS").split(",") if item.strip()
+        ),
+        trade_max_order_usd=_positive("TRADE_MAX_ORDER_USD", 1000.0),
+        trade_max_position_usd=_positive("TRADE_MAX_POSITION_USD", 3000.0),
+        trade_max_opens_per_day=max(0, _get_int("TRADE_MAX_OPENS_PER_DAY", 20, problems)),
+        trade_daily_loss_limit_usd=_get_float("TRADE_DAILY_LOSS_LIMIT_USD", None, problems),
+        trade_max_deviation_pct=_positive("TRADE_MAX_DEVIATION_PCT", 1.0),
+        trade_max_drift_pct=_positive("TRADE_MAX_DRIFT_PCT", 0.5),
+        trade_margin_mode=margin_mode,
+        trade_confirm_seconds=max(20, _get_int("TRADE_CONFIRM_SECONDS", 120, problems)),
+        trade_require_stop=_get_bool("TRADE_REQUIRE_STOP", False),
     )
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:

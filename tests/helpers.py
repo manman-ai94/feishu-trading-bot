@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from bot.analyst import AnalystUnavailable
 from bot.config import Config
 from bot.feishu_client import IncomingMessage
-from bot.models import AccountSnapshot, AccountState, Candle, OpenInterest, Position, StopOrder, Ticker
+from bot.models import AccountConfig, AccountSnapshot, AccountState, Candle, OpenInterest, Position, StopOrder, Ticker
 
 OWNER = "ou_owner"
 FRIEND = "ou_friend"
@@ -123,6 +123,14 @@ class FakeOkx:
         if self.error:
             raise self.error
         return self.state
+
+    def account_config(self) -> AccountConfig:
+        if self.error:
+            raise self.error
+        return AccountConfig("net_mode", ("read_only", "trade"), "203.0.113.7", "2")
+
+    def pending_orders(self, inst_id: str | None = None) -> list:
+        return []
 
     def ticker(self, inst_id: str) -> Ticker:
         if self.market_error:

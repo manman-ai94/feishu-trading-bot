@@ -11,6 +11,7 @@ from dotenv import dotenv_values
 from bot.__main__ import main
 from bot.config import load_config
 from bot.envfile import (
+    OPTIONAL_SECRET_NAMES,
     SECRET_NAMES,
     check_secret_shapes,
     parse_assignments,
@@ -164,11 +165,19 @@ OKX_KEY = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 OKX_SECRET = "0123456789ABCDEF0123456789ABCDEF"
 PASSPHRASE = "My-Pass#2026"
 CLAUDE_KEY = "sk-ant-api03-AbC_dEf-123"
-ALL_RIGHT = dict(zip(SECRET_NAMES, (APP_ID, FEISHU_SECRET, OKX_KEY, OKX_SECRET, PASSPHRASE, CLAUDE_KEY)))
+MAIN_NAMES = tuple(name for name in SECRET_NAMES if name not in OPTIONAL_SECRET_NAMES)
+ALL_RIGHT = dict(zip(MAIN_NAMES, (APP_ID, FEISHU_SECRET, OKX_KEY, OKX_SECRET, PASSPHRASE, CLAUDE_KEY)))
+DEMO_KEY = "9f8e7d6c-5b4a-4c3d-9e2f-1a0b9c8d7e6f"
+DEMO_SECRET = "FEDCBA9876543210FEDCBA9876543210"
 
 
-def statuses(values: dict[str, str]) -> dict[str, str]:
-    return {finding.name: finding.status for finding in check_secret_shapes(values)}
+def statuses(values: dict[str, str], optional: bool = False) -> dict[str, str]:
+    """The finding for each key. The demo-trading keys are left out unless asked for."""
+    return {
+        finding.name: finding.status
+        for finding in check_secret_shapes(values)
+        if optional or finding.name not in OPTIONAL_SECRET_NAMES
+    }
 
 
 def write_keys(tmp_path, values: dict[str, str]) -> Path:
@@ -201,7 +210,7 @@ def test_nothing_filled_in_is_empty_not_wrong():
 
 
 def test_two_feishu_values_pasted_into_every_line():
-    values = dict(zip(SECRET_NAMES, (APP_ID, FEISHU_SECRET) * 3))
+    values = dict(zip(MAIN_NAMES, (APP_ID, FEISHU_SECRET) * 3))
     assert statuses(values) == {
         "FEISHU_APP_ID": "ok",
         "FEISHU_APP_SECRET": "ok",
@@ -213,7 +222,7 @@ def test_two_feishu_values_pasted_into_every_line():
 
 
 def test_two_okx_values_pasted_into_every_line():
-    values = dict(zip(SECRET_NAMES, (OKX_KEY, OKX_SECRET) * 3))
+    values = dict(zip(MAIN_NAMES, (OKX_KEY, OKX_SECRET) * 3))
     assert statuses(values) == {
         "FEISHU_APP_ID": "wrong",
         "FEISHU_APP_SECRET": "wrong",
@@ -222,6 +231,20 @@ def test_two_okx_values_pasted_into_every_line():
         "OKX_PASSPHRASE": "wrong",
         "ANTHROPIC_API_KEY": "wrong",
     }
+
+
+def test_demo_trading_keys_are_checked_like_the_live_ones():
+    demo = {"OKX_DEMO_API_KEY": DEMO_KEY, "OKX_DEMO_SECRET_KEY": DEMO_SECRET, "OKX_DEMO_PASSPHRASE": PASSPHRASE}
+    # One passphrase for the live and the demo key is fine: it is the owner's own word for both.
+    assert set(statuses({**ALL_RIGHT, **demo}, optional=True).values()) == {"ok", "unsure"} - {"unsure"} | {"ok"}
+    found = statuses({**ALL_RIGHT, **demo}, optional=True)
+    assert found["OKX_PASSPHRASE"] == "ok" and found["OKX_DEMO_PASSPHRASE"] == "ok"
+    # Left empty they are simply empty, and a Claude key in the demo line is caught.
+    assert statuses(ALL_RIGHT, optional=True)["OKX_DEMO_API_KEY"] == "empty"
+    assert statuses({**ALL_RIGHT, "OKX_DEMO_API_KEY": CLAUDE_KEY}, optional=True)["OKX_DEMO_API_KEY"] == "wrong"
+    # The demo secret pasted into the Feishu line is still a mistake there.
+    swapped = statuses({**ALL_RIGHT, **demo, "FEISHU_APP_SECRET": DEMO_SECRET}, optional=True)
+    assert swapped["FEISHU_APP_SECRET"] == "wrong" and swapped["OKX_DEMO_SECRET_KEY"] == "ok"
 
 
 def test_the_same_made_up_value_in_two_lines_is_wrong_in_both():
@@ -289,7 +312,7 @@ def test_load_config_keeps_keys_of_an_unfamiliar_shape(tmp_path):
 
 
 def test_checkenv_command_names_the_misplaced_keys_without_showing_them(tmp_path, capsys):
-    values = dict(zip(SECRET_NAMES, (APP_ID, FEISHU_SECRET) * 3))
+    values = dict(zip(MAIN_NAMES, (APP_ID, FEISHU_SECRET) * 3))
     values["OKX_PASSPHRASE"] = ""
     path = write_keys(tmp_path, values)
     clear_key_environment()

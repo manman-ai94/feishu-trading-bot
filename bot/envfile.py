@@ -96,7 +96,12 @@ SECRET_NAMES = (
     "OKX_SECRET_KEY",
     "OKX_PASSPHRASE",
     "ANTHROPIC_API_KEY",
+    "OKX_DEMO_API_KEY",
+    "OKX_DEMO_SECRET_KEY",
+    "OKX_DEMO_PASSPHRASE",
 )
+# Only needed for placing orders on OKX demo trading (TRADING=demo); empty is fine otherwise.
+OPTIONAL_SECRET_NAMES = frozenset({"OKX_DEMO_API_KEY", "OKX_DEMO_SECRET_KEY", "OKX_DEMO_PASSPHRASE"})
 
 _KIND_PATTERNS = (
     ("feishu_app_id", re.compile(r"cli_[0-9A-Za-z_]+")),
@@ -119,6 +124,9 @@ _EXPECTED_KIND = {
     "OKX_SECRET_KEY": "okx_secret",
     "OKX_PASSPHRASE": "other",  # the owner makes this one up, so it has no fixed shape
     "ANTHROPIC_API_KEY": "anthropic_key",
+    "OKX_DEMO_API_KEY": "okx_api_key",
+    "OKX_DEMO_SECRET_KEY": "okx_secret",
+    "OKX_DEMO_PASSPHRASE": "other",
 }
 # Shapes that cannot be mistaken for anything else: seeing one in another line is a sure sign.
 _DISTINCTIVE_KINDS = frozenset({"feishu_app_id", "anthropic_key", "okx_api_key"})
@@ -168,7 +176,9 @@ def check_secret_shapes(values: Mapping[str, str]) -> list[ShapeFinding]:
         expected = _EXPECTED_KIND[name]
         label = KIND_LABELS.get(kind)
         looks_like = f"看起来像{label}" if label else ""
-        twins = [other for other in same_value[value] if other != name]
+        # The live and the demo key of OKX are the same kind of thing: one passphrase used
+        # for both is not a mistake.
+        twins = [other for other in same_value[value] if other != name and _EXPECTED_KIND[other] != expected]
         if twins:
             # One value in several lines: it can belong to one of them at most.
             if kind == expected and kind != "other":

@@ -47,6 +47,13 @@ def _size(position: Position) -> str:
 
 def currency_lines(state: AccountState) -> list[str]:
     """One line per currency that holds something: equity, what is free, and the open PnL."""
+    # The balance and the positions are two requests a moment apart, and the price moves in
+    # between. Where the positions say what a currency's open PnL is, their sum is shown, so
+    # the card never carries two different figures for the same thing.
+    from_positions: dict[str, float | None] = {}
+    for position in state.positions:
+        known = from_positions.get(position.pnl_ccy, 0.0)
+        from_positions[position.pnl_ccy] = None if known is None or position.upl is None else known + position.upl
     lines = []
     for item in state.snapshot.currencies[:4]:
         if item.eq is None or abs(item.eq_usd if item.eq_usd is not None else item.eq) < 1:
@@ -54,8 +61,11 @@ def currency_lines(state: AccountState) -> list[str]:
         parts = [f"权益 {item.eq:,.2f}"]
         if item.avail_eq is not None:
             parts.append(f"可用保证金 {item.avail_eq:,.2f}")
-        if item.upl:
-            parts.append(f"浮动盈亏 {item.upl:+,.2f}")
+        upl = from_positions.get(item.ccy)
+        if upl is None:
+            upl = item.upl
+        if upl:
+            parts.append(f"浮动盈亏 {upl:+,.2f}")
         lines.append(f"{item.ccy}：" + "，".join(parts))
     return lines
 

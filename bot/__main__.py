@@ -9,6 +9,7 @@
     python -m bot setenv        write NAME=value lines from standard input into .env
     python -m bot checkenv      say whether each key sits in the right line (shows no values)
     python -m bot clearenv NAME empty the given lines of .env
+    python -m bot trading       print how placing orders is set up: mode, limits, what the key may do
 """
 from __future__ import annotations
 
@@ -73,6 +74,13 @@ def selfcheck(cfg: Config, problems: list[str]) -> int:
             _print("[OK]", f"账户读取成功，当前 {len(state.positions)} 个持仓")
             if cfg.okx_demo:
                 _print("[!]", "现在连的是模拟盘 (OKX_DEMO=true)")
+            account = okx.account_config()
+            rights = "读取" + ("、交易" if account.can_trade else "")
+            _print("[OK]", f"这把 key 的权限：{rights}；{'已绑定 IP' if account.ip else '没有绑定 IP'}")
+            if account.can_withdraw:
+                _print("[!]", "这把 key 开了提现权限。机器人用不到，建议在 OKX 里关掉")
+            if not account.ip:
+                _print("[!]", "建议在 OKX 里把这把 key 绑定到这台服务器的 IP")
         except (OkxError, OkxNetworkError) as exc:
             failures += 1
             _print("[X]", f"账户读取失败：{exc}")
@@ -115,11 +123,34 @@ def selfcheck(cfg: Config, problems: list[str]) -> int:
             _print("[X]", f"飞书连接失败：{exc}")
             _print("   ", "常见原因：App ID 或 App Secret 填错、应用还没发布、没有开通机器人能力和消息权限")
 
+    print("\n== 6. 下单功能 ==")
+    if cfg.trading_blocked:
+        _print("[!]", f"{cfg.trading_blocked}。下单功能保持关闭")
+    elif not cfg.trading_on:
+        _print("[OK]", "关闭（TRADING=off）。机器人只读取账户，不会下单")
+    else:
+        where = "模拟盘" if cfg.trading == "demo" else "实盘"
+        _print("[!]", f"已打开，{where}。每条指令都要主人在飞书私聊里回复确认码才执行。详情运行：python -m bot trading")
+
     print()
     if failures:
         print(f"有 {failures} 项没通过，请按上面的提示处理后再运行一次。")
         return 1
     print("全部通过，可以运行：python -m bot run")
+    return 0
+
+
+def print_trading(cfg: Config) -> int:
+    """How placing orders is set up. Reads OKX, changes nothing, and costs nothing."""
+    from .app import build_okx, build_trade_desk
+    from .instruments import InstrumentResolver
+    from .journal import Journal
+
+    okx = build_okx(cfg)
+    # The journal holds the "paused" switch and today's count. Where there is none yet, none is created.
+    journal = Journal(cfg.db_path if cfg.db_path.exists() else ":memory:")
+    desk = build_trade_desk(cfg, journal, okx, InstrumentResolver(okx))
+    print("\n".join(desk.status_lines()).replace("**", ""))
     return 0
 
 
@@ -256,14 +287,15 @@ def _warn_about_misplaced_keys(env_file: str) -> None:
 def check_env(env_file: str) -> int:
     """Says whether each key looks like it belongs in its line. Shows names only."""
     from .config import read_secret_values
-    from .envfile import check_secret_shapes
+    from .envfile import OPTIONAL_SECRET_NAMES, check_secret_shapes
 
     wrong = 0
     for finding in check_secret_shapes(read_secret_values(env_file)):
         if finding.status == "ok":
             _print("[OK]", f"{finding.name} 格式对")
         elif finding.status == "empty":
-            _print("[--]", f"{finding.name} 还空着")
+            optional = "（只有在模拟盘下单才需要）" if finding.name in OPTIONAL_SECRET_NAMES else ""
+            _print("[--]", f"{finding.name} 还空着{optional}")
         elif finding.status == "unsure":
             _print("[??]", f"{finding.name} 拿不准：{finding.note}。会照常使用")
         else:
@@ -315,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("checkenv", help="检查每个密钥是不是填在了对的位置（只显示名字，不显示值）")
     clear = commands.add_parser("clearenv", help="把 .env 里指定的几项清空")
     clear.add_argument("names", nargs="+", metavar="NAME")
+    commands.add_parser("trading", help="打印下单功能的设置：模式、限额、这把 key 的权限（只读取，不下单）")
     args = parser.parse_args(argv)
 
     if args.command == "setenv":
@@ -336,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         return print_quotes(cfg, args.names)
     if args.command == "ask":
         return ask(cfg, args.question)
+    if args.command == "trading":
+        return print_trading(cfg)
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:
         print("还没填飞书的 FEISHU_APP_ID 和 FEISHU_APP_SECRET，机器人无法启动。先运行：python -m bot selfcheck")

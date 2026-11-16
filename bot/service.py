@@ -103,6 +103,9 @@ class Reporter:
             body = "机器人已启动，但还没读到 OKX 账户。稍后如果连续失败，我会再提醒你。"
         else:
             body = "机器人已启动，开始监控。\n\n" + status_markdown(state, self.day_change(state), private=True)
+        if self._cfg.trading_on:
+            where = "模拟盘" if self._cfg.trading == "demo" else "实盘"
+            body += f"\n\n下单功能已打开（{where}）。每条指令都要你回复确认码才执行，发“停止交易”可以随时叫停。"
         self.to_owner("交易助手已上线", body, "green")
 
     # ----------------------------------------------------------------- briefs

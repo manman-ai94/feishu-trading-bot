@@ -6,14 +6,16 @@ from bot.journal import Journal
 from bot.monitor import Monitor
 from bot.okx_client import OkxNetworkError
 from bot.reports import DISCLAIMER
-from bot.router import HELP_TEXT, Router
+from bot.router import HELP_TEXT, TRADE_OWNER_ONLY_TEXT, Router
 from bot.service import Reporter
+from bot.trading import TradeDesk
 
 from .helpers import BOT, FRIEND, GROUP, OPEN_GROUP, OWNER, Clock, FakeAnalyst, FakeFeishu, FakeOkx, make_cfg, make_message, make_state
+from .test_trading import XAU, FakeExchange, FakeResolver
 
 
 class Bench:
-    def __init__(self, state="default", bot_open_id=BOT, analyst_enabled=True, knowledge=None, usage=None, **cfg_overrides):
+    def __init__(self, state="default", bot_open_id=BOT, analyst_enabled=True, knowledge=None, usage=None, exchange=None, **cfg_overrides):
         self.cfg = make_cfg(**cfg_overrides)
         self.saved: list[tuple[str, str]] = []
         self.restarts = 0
@@ -26,10 +28,17 @@ class Bench:
         self.reporter.monitor = Monitor(self.okx, self.cfg, journal, lambda event: None, self.clock)
         if self.okx.state is not None:
             self.reporter.monitor.poll_once()
+        self.exchange = exchange  # with one, trading is on and orders go to it
+        self.desk = None
+        if exchange is not None or cfg_overrides.get("trading") == "off":
+            self.desk = TradeDesk(
+                self.cfg, journal, self.okx, exchange, FakeResolver(), self.clock, sleep=lambda seconds: None,
+                new_code=lambda: "4821", new_id=lambda: "ftb0001",
+            )  # fmt: skip
         self.router = Router(
             self.cfg, self.feishu, self.okx, self.analyst, self.reporter, bot_open_id, self.clock,
             save_setting=lambda name, value: self.saved.append((name, value)), restart=self._restart,
-            knowledge=knowledge, usage=usage,
+            knowledge=knowledge, usage=usage, trade=self.desk,
         )  # fmt: skip
 
     def _restart(self):
@@ -487,3 +496,66 @@ def test_message_text_stays_out_of_the_log(caplog):
         bench.say("BTC 现在怎么看，我想全仓")
     assert "hunter2" not in caplog.text and "全仓" not in caplog.text
     assert "message from ou_owner in private chat oc_private" in caplog.text
+
+
+# ------------------------------------------------------------------ placing orders
+
+TRADING = dict(trading="demo", trade_instruments=(XAU,))
+
+
+def test_the_owner_places_an_order_from_the_private_chat():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    preview = bench.say("做多 XAU 100张 止损 3860")[0]
+    assert preview.how == "reply_markdown" and preview.title == "下单预览 · 模拟盘" and preview.template == "orange"
+    assert "确认 4821" in preview.body and bench.exchange.changes == []
+
+    done = bench.say("确认 4821")[0]
+    assert done.title == "已执行 · 模拟盘" and "已成交 100 张" in done.body
+    assert [name for name, _ in bench.exchange.changes] == ["place_order"]
+    assert bench.analyst.calls == []  # the AI never sees an order, let alone decides one
+
+
+def test_orders_are_not_taken_in_the_group_even_from_the_owner():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    reply = bench.say("做多 XAU 100张", private=False)[0]
+    assert "私聊" in reply.body and bench.exchange.changes == []
+    assert "私聊" in bench.say("确认 4821", private=False)[0].body
+
+
+def test_nobody_but_the_owner_can_place_an_order():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    assert bench.say("做多 XAU 100张", sender=FRIEND, private=False)[0].body == "我只响应主人的指令。仓位变动和简报我会自动发到群里。"
+    assert bench.say("做多 XAU 100张", sender=FRIEND)[0].body != ""  # a stranger's private chat is turned away as always
+
+    open_group = Bench(exchange=FakeExchange(), **TRADING, **OPEN_GROUP)
+    for text in ("做多 XAU 100张", "全部平仓", "确认 4821", "停止交易"):
+        assert open_group.say(text, sender=FRIEND, private=False)[0].body == TRADE_OWNER_ONLY_TEXT
+    assert open_group.exchange.changes == [] and open_group.analyst.calls == []
+    # Ordinary questions from the group still reach the AI.
+    assert open_group.say("黄金现在怎么看", sender=FRIEND, private=False)[-1].body == "AI:answer"
+
+
+def test_with_trading_off_an_order_is_refused_and_explained():
+    bench = Bench(trading="off")
+    reply = bench.say("做多 XAU 100张")[0]
+    assert reply.how == "reply_text" and "关着" in reply.body
+    assert bench.analyst.calls == []
+    assert "下单功能**：已关闭" in bench.say("交易设置")[0].body
+
+
+def test_a_note_about_trading_is_still_a_note(tmp_path):
+    from bot.knowledge import KnowledgeBase
+
+    bench = Bench(exchange=FakeExchange(), knowledge=KnowledgeBase(tmp_path / "kb"), **TRADING)
+    assert "记住了" in bench.say("记住：做多 XAU 100张 之前先看美元指数")[0].body
+    assert bench.exchange.changes == []
+
+
+def test_questions_about_trading_go_to_the_ai_as_before():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    assert bench.say("做多 XAU 100张 怎么样")[-1].body == "AI:answer"
+    assert bench.exchange.changes == []
+
+
+def test_help_mentions_trading():
+    assert "交易帮助" in HELP_TEXT and "确认码" in HELP_TEXT

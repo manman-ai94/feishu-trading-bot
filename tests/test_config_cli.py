@@ -10,7 +10,7 @@ from bot.__main__ import main
 from bot.config import load_config, parse_weekly
 from bot.okx_client import OkxNetworkError
 
-PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_")
+PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING")
 NAMES = (
     "OWNER_OPEN_ID", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
     "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR",
@@ -211,3 +211,113 @@ def test_ask_command_without_a_claude_key_explains_itself(tmp_path, monkeypatch,
 def test_run_refuses_to_start_without_feishu_credentials(tmp_path, capsys):
     assert main(["--env", str(tmp_path / "missing.env"), "run"]) == 1
     assert "selfcheck" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ placing orders
+
+LIVE_KEYS = "OKX_API_KEY=k\nOKX_SECRET_KEY=s\nOKX_PASSPHRASE=p\n"
+DEMO_KEYS = "OKX_DEMO_API_KEY=dk\nOKX_DEMO_SECRET_KEY=ds\nOKX_DEMO_PASSPHRASE=dp\n"
+
+
+def test_trading_is_off_unless_the_owner_switches_it_on(tmp_path):
+    cfg, _ = load_config(write_env(tmp_path, LIVE_KEYS + DEMO_KEYS))
+    assert cfg.trading == "off" and not cfg.trading_on and cfg.trading_blocked == ""
+    assert cfg.tradable_instruments == ("XAU-USDT-SWAP",)  # the watch list, until the owner names others
+    assert (cfg.trade_max_order_usd, cfg.trade_max_position_usd, cfg.trade_max_opens_per_day) == (1000.0, 3000.0, 20)
+    assert cfg.trade_daily_loss_limit_usd is None and cfg.trade_margin_mode == "cross"
+    assert (cfg.trade_max_deviation_pct, cfg.trade_max_drift_pct, cfg.trade_confirm_seconds) == (1.0, 0.5, 120)
+    assert not cfg.trade_require_stop
+
+
+@pytest.mark.parametrize(
+    "text, mode, blocked",
+    [
+        ("TRADING=off\n" + LIVE_KEYS, "off", ""),
+        ("TRADING=\n" + LIVE_KEYS, "off", ""),
+        ("TRADING=false\n" + LIVE_KEYS, "off", ""),
+        ("TRADING=demo\n" + LIVE_KEYS + DEMO_KEYS, "demo", ""),
+        ("TRADING=DEMO\n" + DEMO_KEYS, "demo", ""),
+        ("TRADING=demo\nOKX_DEMO=true\n" + LIVE_KEYS, "demo", ""),  # the main keys are demo keys
+        ("TRADING=demo\n" + LIVE_KEYS, "off", "需要模拟盘的三项 key"),
+        ("TRADING=demo\n" + LIVE_KEYS + "OKX_DEMO_API_KEY=dk\nOKX_DEMO_PASSPHRASE=dp\n", "off", "需要模拟盘的三项 key"),
+        ("TRADING=live\n" + LIVE_KEYS, "live", ""),
+        ("TRADING=live\n", "off", "需要先填好 OKX 的三项 key"),
+        ("TRADING=live\nOKX_DEMO=true\n" + LIVE_KEYS, "off", "OKX_DEMO=true"),
+        ("TRADING=yes\n" + LIVE_KEYS, "off", "只能填 off、demo 或 live"),
+        ("TRADING=real\n" + LIVE_KEYS, "off", "只能填 off、demo 或 live"),
+    ],
+)
+def test_a_trading_mode_that_cannot_be_honoured_stays_off_and_says_why(tmp_path, text, mode, blocked):
+    cfg, problems = load_config(write_env(tmp_path, text))
+    assert cfg.trading == mode
+    assert blocked in cfg.trading_blocked
+    assert bool(cfg.trading_blocked) == any("下单功能保持关闭" in item for item in problems)
+
+
+def test_trading_limits_come_from_the_file(tmp_path):
+    cfg, problems = load_config(
+        write_env(
+            tmp_path,
+            "TRADE_INSTRUMENTS=xau-usdt-swap, BTC-USDT-SWAP\nTRADE_MAX_ORDER_USD=5000\nTRADE_MAX_POSITION_USD=60000\n"
+            "TRADE_MAX_OPENS_PER_DAY=5\nTRADE_DAILY_LOSS_LIMIT_USD=300\nTRADE_MAX_DEVIATION_PCT=0.3\nTRADE_MAX_DRIFT_PCT=0.2\n"
+            "TRADE_MARGIN_MODE=isolated\nTRADE_CONFIRM_SECONDS=60\nTRADE_REQUIRE_STOP=true\n",
+        )
+    )
+    assert cfg.tradable_instruments == ("XAU-USDT-SWAP", "BTC-USDT-SWAP")
+    assert (cfg.trade_max_order_usd, cfg.trade_max_position_usd, cfg.trade_max_opens_per_day) == (5000.0, 60000.0, 5)
+    assert (cfg.trade_daily_loss_limit_usd, cfg.trade_max_deviation_pct, cfg.trade_max_drift_pct) == (300.0, 0.3, 0.2)
+    assert (cfg.trade_margin_mode, cfg.trade_confirm_seconds, cfg.trade_require_stop) == ("isolated", 60, True)
+    assert not any("TRADE" in item for item in problems)
+
+
+def test_mistakes_in_the_trading_limits_fall_back_to_the_cautious_defaults(tmp_path):
+    cfg, problems = load_config(
+        write_env(tmp_path, "TRADE_MAX_ORDER_USD=lots\nTRADE_MAX_POSITION_USD=-5\nTRADE_MARGIN_MODE=both\nTRADE_CONFIRM_SECONDS=1\n")
+    )
+    assert (cfg.trade_max_order_usd, cfg.trade_max_position_usd, cfg.trade_margin_mode) == (1000.0, 3000.0, "cross")
+    assert cfg.trade_confirm_seconds == 20  # never so short that a code cannot be typed
+    for name in ("TRADE_MAX_ORDER_USD", "TRADE_MAX_POSITION_USD", "TRADE_MARGIN_MODE"):
+        assert any(name in item for item in problems)
+
+
+def test_the_demo_keys_stay_out_of_the_config_repr(tmp_path):
+    cfg, _ = load_config(write_env(tmp_path, "OKX_DEMO_API_KEY=demo-key\nOKX_DEMO_SECRET_KEY=demo-secret\nOKX_DEMO_PASSPHRASE=demo-pass\n"))
+    assert cfg.has_okx_demo_keys
+    for secret in ("demo-key", "demo-secret", "demo-pass"):
+        assert secret not in repr(cfg)
+
+
+def test_the_order_client_exists_only_when_trading_is_on(tmp_path):
+    from bot.app import build_okx, build_trader
+    from bot.okx_trade import OkxTradeClient
+
+    off, _ = load_config(write_env(tmp_path, LIVE_KEYS + DEMO_KEYS))
+    assert build_trader(off) is None
+    assert not isinstance(build_okx(off), OkxTradeClient)  # the client the rest of the bot uses cannot place orders
+
+    for name in list(os.environ):
+        if name.startswith(PREFIXES):
+            del os.environ[name]
+    demo, _ = load_config(write_env(tmp_path, "TRADING=demo\n" + LIVE_KEYS + DEMO_KEYS))
+    trader = build_trader(demo)
+    assert isinstance(trader, OkxTradeClient)
+    assert trader._demo and trader._api_key == "dk"  # demo orders never carry the live key
+    assert not build_okx(demo)._demo and build_okx(demo)._api_key == "k"  # the monitor keeps watching the real account
+
+    for name in list(os.environ):
+        if name.startswith(PREFIXES):
+            del os.environ[name]
+    live, _ = load_config(write_env(tmp_path, "TRADING=live\n" + LIVE_KEYS + DEMO_KEYS))
+    trader = build_trader(live)
+    assert not trader._demo and trader._api_key == "k"
+
+
+def test_trading_command_prints_the_setup_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("bot.app.build_okx", lambda cfg: OnlineOkx())
+    monkeypatch.chdir(tmp_path)
+    assert main(["--env", str(write_env(tmp_path, LIVE_KEYS)), "trading"]) == 0
+    output = capsys.readouterr().out
+    for expected in ("下单功能：已关闭", "允许下单的品种：XAU-USDT-SWAP", "单笔上限 1,000 USDT", "交易权限：有", "提现权限：没有", "已绑定 IP"):
+        assert expected in output
+    assert "203.0.113.7" not in output and "**" not in output
+    assert not (tmp_path / "data").exists()
