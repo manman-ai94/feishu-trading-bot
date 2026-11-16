@@ -550,6 +550,7 @@ def test_the_instructions_keep_answers_off_a_template():
     assert "没有每次都要写的栏目" in ANALYST_SYSTEM and "不要在回答里复述或解释它们" in ANALYST_SYSTEM
     assert "不要在开头声明你的做法" in ANALYST_SYSTEM and "不要主动推荐这些写法" in ANALYST_SYSTEM
     assert "在群里 @交易助手 就是 @你" in ANALYST_SYSTEM and "程序自动回复的卡片" in ANALYST_SYSTEM
+    assert "决定留给他" in ANALYST_SYSTEM and "前面已经指出过的风险" in ANALYST_SYSTEM
     assert "有没有必要平仓" in ROUTER_SYSTEM and "这个我去跟 Claude 商量" in ROUTER_SYSTEM
     assert "表了个态" in SMALL_TALK_SYSTEM
     assert "不要为了写它而在正文里加情景" in LEVELS_NOTE
