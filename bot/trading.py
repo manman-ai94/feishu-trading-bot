@@ -753,7 +753,8 @@ class TradeDesk:
         where = "OKX 的模拟交易里" if self._mode == "demo" else "OKX 里"
         return (
             f"这个{self._account_label()}账户在 OKX 里是“现货模式”，这个模式下 OKX 不接受合约订单，所以开不了仓。"
-            f"请在 {where}打开交易页的设置，把“账户模式”改成“现货和合约模式”（第一次只能在网页或 App 里改），改完重发指令就行。"
+            f"请在 {where}进合约的交易页，点右上角的“···”，进“交易设置”里的“交易模式”，把账户模式改成“合约模式”"
+            "（以前叫“现货和合约模式”；第一次只能在网页或 App 里改），改完重发指令就行。"
         )
 
     def _funds_lines(self) -> list[str]:

@@ -242,7 +242,8 @@ class AccountState:
     positions: list[Position] = field(default_factory=list)
 
 
-ACCOUNT_LEVELS = {"1": "现货模式", "2": "现货和合约模式", "3": "跨币种保证金模式", "4": "组合保证金模式"}
+# OKX renamed level 2 from "现货和合约模式" to "合约模式" (its help centre, November 2026).
+ACCOUNT_LEVELS = {"1": "现货模式", "2": "合约模式", "3": "跨币种保证金模式", "4": "组合保证金模式"}
 
 
 @dataclass(frozen=True)
