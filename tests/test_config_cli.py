@@ -10,7 +10,7 @@ from bot.__main__ import main
 from bot.config import load_config, parse_weekly
 from bot.okx_client import OkxNetworkError
 
-PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING")
+PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING", "TRACK_")
 NAMES = (
     "OWNER_OPEN_ID", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
     "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR",
@@ -321,3 +321,58 @@ def test_trading_command_prints_the_setup_and_writes_nothing(tmp_path, monkeypat
         assert expected in output
     assert "203.0.113.7" not in output and "**" not in output
     assert not (tmp_path / "data").exists()
+
+
+# --------------------------------------------------------------- track record
+
+
+def test_track_record_settings(tmp_path):
+    cfg, problems = load_config(write_env(tmp_path, ""))
+    assert cfg.track_record is True and cfg.track_window_hours == 72 and not any("TRACK" in problem for problem in problems)
+    for name in list(os.environ):
+        if name.startswith(PREFIXES):
+            del os.environ[name]
+    cfg, _ = load_config(write_env(tmp_path, "TRACK_RECORD=false\nTRACK_WINDOW_HOURS=500\n"))
+    assert cfg.track_record is False and cfg.track_window_hours == 72  # OKX's candles reach back 75 hours
+    for name in list(os.environ):
+        if name.startswith(PREFIXES):
+            del os.environ[name]
+    cfg, _ = load_config(write_env(tmp_path, "TRACK_WINDOW_HOURS=1\n"))
+    assert cfg.track_window_hours == 4
+
+
+def test_levels_are_kept_with_the_price_of_that_moment(tmp_path):
+    from bot.app import build_ai
+    from bot.journal import Journal
+    from bot.okx_client import OkxError
+    from bot.track import Levels, Scenario
+
+    cfg, _ = load_config(write_env(tmp_path, ""))
+    journal = Journal(":memory:")
+    okx = OnlineOkx()
+    analyst, _, _ = build_ai(cfg, okx, journal)
+    levels = Levels("XAU-USDT-SWAP", "long", (Scenario("long", 2700.0, 2750.0, 2660.0),))
+    analyst._on_levels("question", "黄金怎么看" * 100, levels)
+    [analysis] = journal.unscored_analyses()
+    assert analysis["purpose"] == "question" and analysis["bias"] == "long" and analysis["ref_px"] == okx.ticker("XAU-USDT-SWAP").last
+    assert len(analysis["question"]) == 120
+    [call] = journal.open_calls()
+    assert (call["side"], call["trigger_px"], call["target_px"], call["invalid_px"]) == ("long", 2700.0, 2750.0, 2660.0)
+
+    okx.market_error = OkxError("51001", "Instrument ID does not exist")
+    analyst._on_levels("question", "", Levels("NOPE-USDT-SWAP", "long", ()))
+    assert len(journal.unscored_analyses()) == 1  # an instrument OKX cannot price is not kept
+
+
+def test_record_command_prints_the_card_and_creates_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    env = write_env(tmp_path, "")
+    assert main(["--env", str(env), "record"]) == 0
+    assert "还没有运行过" in capsys.readouterr().out and not (tmp_path / "data").exists()
+
+    from bot.journal import Journal
+
+    Journal(tmp_path / "data" / "bot.db").record_analysis("question", "XAU-USDT-SWAP", "long", 3880.0, [])
+    assert main(["--env", str(env), "record", "7"]) == 0
+    output = capsys.readouterr().out
+    assert "最近 7 天" in output and "记录了 1 次带点位的分析" in output and "**" not in output

@@ -10,6 +10,7 @@
     python -m bot checkenv      say whether each key sits in the right line (shows no values)
     python -m bot clearenv NAME empty the given lines of .env
     python -m bot trading       print how placing orders is set up: mode, limits, what the key may do
+    python -m bot record        print the track record: the AI's levels against what the market did
 """
 from __future__ import annotations
 
@@ -151,6 +152,20 @@ def print_trading(cfg: Config) -> int:
     journal = Journal(cfg.db_path if cfg.db_path.exists() else ":memory:")
     desk = build_trade_desk(cfg, journal, okx, InstrumentResolver(okx))
     print("\n".join(desk.status_lines()).replace("**", ""))
+    return 0
+
+
+def print_record(cfg: Config, days: int) -> int:
+    """The track record as the owner sees it in Feishu. Reads the journal only; costs nothing."""
+    import time
+
+    from .journal import Journal
+    from .track import scorecard_markdown
+
+    if not cfg.db_path.exists():
+        print("还没有记录：机器人还没有运行过。")
+        return 0
+    print(scorecard_markdown(Journal(cfg.db_path), time.time(), cfg.tz, days, None, cfg.track_window_hours).replace("**", ""))
     return 0
 
 
@@ -348,6 +363,8 @@ def main(argv: list[str] | None = None) -> int:
     clear = commands.add_parser("clearenv", help="把 .env 里指定的几项清空")
     clear.add_argument("names", nargs="+", metavar="NAME")
     commands.add_parser("trading", help="打印下单功能的设置：模式、限额、这把 key 的权限（只读取，不下单）")
+    record = commands.add_parser("record", help="打印成绩单：AI 给过的点位和事后的行情对照（只读取记录，不花钱）")
+    record.add_argument("days", nargs="?", type=int, default=30)
     args = parser.parse_args(argv)
 
     if args.command == "setenv":
@@ -371,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
         return ask(cfg, args.question)
     if args.command == "trading":
         return print_trading(cfg)
+    if args.command == "record":
+        return print_record(cfg, max(1, min(365, args.days)))
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:
         print("还没填飞书的 FEISHU_APP_ID 和 FEISHU_APP_SECRET，机器人无法启动。先运行：python -m bot selfcheck")

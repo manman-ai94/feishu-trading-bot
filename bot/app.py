@@ -18,12 +18,13 @@ from .instruments import InstrumentResolver
 from .journal import Journal
 from .knowledge import KnowledgeBase
 from .monitor import Monitor
-from .okx_client import OkxClient
+from .okx_client import OkxClient, OkxError, OkxNetworkError
 from .okx_trade import OkxTradeClient
 from .router import Router
 from .scheduler import Scheduler
 from .service import Reporter
 from .tools import Toolbox
+from .track import Levels, Scorer
 from .trading import TradeDesk
 
 log = logging.getLogger(__name__)
@@ -86,7 +87,20 @@ def build_ai(cfg: Config, okx: OkxClient, journal: Journal) -> tuple[Analyst, In
         month_start = datetime.now(cfg.tz).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         return journal.usage_between(month_start.timestamp(), time.time() + 1)["cost_usd"]
 
-    analyst = Analyst(cfg, toolbox=Toolbox(okx, resolver, knowledge, cfg.tz), on_usage=record, month_spend=month_spend)
+    def keep_levels(purpose: str, question: str, levels: Levels) -> None:
+        """For the track record: the levels of an analysis, with the price at that moment."""
+        try:
+            ref_px = okx.ticker(levels.inst_id).last
+        except (OkxError, OkxNetworkError) as exc:
+            # No price means the instrument does not exist on OKX or cannot be read: nothing to score against.
+            log.info("track record: %s not kept, no price (%s)", levels.inst_id, exc)
+            return
+        scenarios = [{"side": s.side, "trigger": s.trigger, "target": s.target, "invalid": s.invalid} for s in levels.scenarios]
+        journal.record_analysis(purpose, levels.inst_id, levels.bias, ref_px, scenarios, question[:120])
+
+    analyst = Analyst(
+        cfg, toolbox=Toolbox(okx, resolver, knowledge, cfg.tz), on_usage=record, month_spend=month_spend, on_levels=keep_levels
+    )
     return analyst, resolver, knowledge
 
 
@@ -125,7 +139,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     desk = build_trade_desk(cfg, journal, okx, resolver, reporter)
     router = Router(
         cfg, feishu, okx, analyst, reporter, bot_open_id, save_setting=save_setting, restart=restart,
-        resolver=resolver, knowledge=knowledge, usage=journal.usage_between, trade=desk,
+        resolver=resolver, knowledge=knowledge, usage=journal.usage_between, trade=desk, journal=journal,
     )  # fmt: skip
     log.info("trading: %s (instruments: %s)", desk.mode, ", ".join(cfg.tradable_instruments))
     if cfg.trading_blocked:
@@ -153,6 +167,9 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         },
     )
     threading.Thread(target=scheduler.run_forever, args=(stop,), name="scheduler", daemon=True).start()
+    if cfg.track_record:
+        scorer = Scorer(journal, okx, cfg.track_window_hours)
+        threading.Thread(target=scorer.run_forever, args=(stop,), name="track", daemon=True).start()
 
     try:
         reporter.send_startup()

@@ -23,6 +23,7 @@ import anthropic
 
 from .config import Config
 from .tools import WEB_SEARCHES, WEB_SEARCHES_DEEP, WEB_TOOL_SETS, Toolbox
+from .track import LEVELS_NOTE, Levels, extract_levels
 
 log = logging.getLogger(__name__)
 
@@ -167,15 +168,19 @@ class Analyst:
         on_usage: Callable[[str, Usage], None] | None = None,
         month_spend: Callable[[], float] | None = None,
         clock: Callable[[], float] = time.time,
+        on_levels: Callable[[str, str, Levels], None] | None = None,
     ):
         """`on_usage(purpose, usage)` is called after every piece of work.
-        `month_spend()` returns this month's estimated cost in USD, for the budget."""
+        `month_spend()` returns this month's estimated cost in USD, for the budget.
+        `on_levels(purpose, question, levels)` receives the levels of an analysis
+        that gave scenarios, for the track record (track.py)."""
         self._cfg = cfg
         self._client = client  # created on first use, so a missing key never breaks start-up
         self._toolbox = toolbox
         self._on_usage = on_usage
         self._month_spend = month_spend
         self._clock = clock
+        self._on_levels = on_levels if cfg.track_record else None
         # Which set of web tools to offer; steps down when the API turns one away.
         self._web_level = 0 if cfg.web_search else len(WEB_TOOL_SETS) - 1
         self._tiers = {
@@ -210,6 +215,22 @@ class Analyst:
             return False
 
     def _ask(self, tier_name: str, system: str, user: str, purpose: str = "", history=None) -> str:
+        return self._ask_with_levels(tier_name, system, user, purpose, history)[0]
+
+    def _analyse(self, tier_name: str, user: str, purpose: str, question: str = "", history=None, record: bool = True) -> str:
+        """An analysis in the analyst's voice. When the track record is kept, the AI adds
+        its levels in a block for the program, which is cut off here and passed on."""
+        keep = record and self._on_levels is not None
+        system = ANALYST_SYSTEM + LEVELS_NOTE if keep else ANALYST_SYSTEM
+        text, levels = self._ask_with_levels(tier_name, system, user, purpose, history)
+        if keep and levels is not None:
+            try:
+                self._on_levels(purpose, question, levels)
+            except Exception:
+                log.exception("could not keep the levels of this analysis")
+        return text
+
+    def _ask_with_levels(self, tier_name: str, system: str, user: str, purpose: str = "", history=None) -> tuple[str, Levels | None]:
         if not self.enabled:
             raise AnalystUnavailable("还没有配置 Claude 的 API key，AI 分析暂时用不了。")
         tier = self._tiers[tier_name]
@@ -244,7 +265,7 @@ class Analyst:
 
         if message.stop_reason == "refusal":
             raise AnalystUnavailable("这个问题 AI 没有回答，换个问法试试。")
-        text = _final_text(message)
+        text, levels = extract_levels(_final_text(message))  # the block for the program is never shown
         if not text:
             raise AnalystUnavailable("AI 这次没有给出内容，请再试一次。")
         if message.stop_reason == "max_tokens":
@@ -253,7 +274,7 @@ class Analyst:
             text += "\n\n（这把 Claude API key 所在的组织没有开通联网搜索，这次没有查新闻。在 Claude Console 的设置里打开 Web search 后重启机器人即可。）"
         if saving:
             text += f"\n\n（本月 AI 用量已到预算上限 {self._cfg.ai_monthly_budget_usd:g} 美元，这条回答用的是省钱档。）"
-        return text
+        return text, levels
 
     def _report(self, purpose: str, usage: Usage) -> None:
         if usage.requests == 0:
@@ -409,7 +430,7 @@ class Analyst:
             parts.append(DEEP_NOTE)
         parts.append(f"问题：{question}")
         tier = "deep" if deep else "daily"
-        return self._ask(tier, ANALYST_SYSTEM, "\n\n".join(parts), purpose="deep question" if deep else "question", history=history)
+        return self._analyse(tier, "\n\n".join(parts), "deep question" if deep else "question", question, history)
 
     def brief(
         self,
@@ -450,7 +471,8 @@ class Analyst:
         if note:
             parts.append(note)
         parts.append(task)
-        return self._ask("daily", ANALYST_SYSTEM, "\n\n".join(parts), purpose=f"{kind} brief")
+        # Two versions of one brief may be written (owner and group): only the owner's is kept, so it counts once.
+        return self._analyse("daily", "\n\n".join(parts), f"{kind} brief", record=for_owner)
 
     def weekly_review(self, market_text: str, journal_text: str, equity_text: str, shared_with_group: bool = False) -> str:
         task = (

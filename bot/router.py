@@ -29,6 +29,7 @@ from .market import build_market_context, quote_line
 from .okx_client import OkxError, OkxNetworkError
 from .reports import DISCLAIMER, account_text, status_markdown
 from .service import Reporter
+from .track import scorecard_markdown
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 问题前面加“深度”，我会多查几轮、分析得更细
 - 发“记住：……”，把交易规则、心得或资料存进资料库，以后回答时我会参考。发“资料”看资料库里有什么
 - 发“用量”，看今天和本月 AI 大约花了多少钱
+- 发“成绩单”，看我给过的点位事后对了多少（可以加品种和天数，例如“成绩单 XAU 90天”）
 - 在群里 @我 发“登记本群”，简报和提醒就会发到那个群
 - 私聊我发“重启”，我会重新启动并读取新的配置
 
@@ -62,6 +64,9 @@ KNOWLEDGE_WORDS = ("资料", "资料库", "知识库", "/kb")
 FORGET_WORDS = ("删除上一条", "删除上一条笔记", "撤销上一条", "/forget")
 USAGE_WORDS = ("用量", "费用", "花费", "/usage")
 QUOTE_WORDS = ("报价", "现价", "价格", "多少钱", "/price")
+RECORD_PREFIXES = ("成绩单", "战绩", "/record")
+RECORD_DAYS = 30
+RECORD_MAX_DAYS = 365
 SEEN_LIMIT = 500
 HISTORY_TURNS = 3  # earlier questions of the same chat the AI is shown, for follow-ups
 HISTORY_SECONDS = 30 * 60
@@ -90,12 +95,14 @@ class Router:
         knowledge: KnowledgeBase | None = None,
         usage: Callable[[float, float], dict] | None = None,
         trade=None,
+        journal=None,
     ):
         """`save_setting(name, value)` writes one line of .env, so a group the
         owner registers survives a restart. `restart()` ends the process; the
         start script brings the bot back with the configuration read afresh.
         `usage(start, end)` returns the AI use between two moments. `trade` is
-        the trade desk (trading.py), which reads the owner's order commands."""
+        the trade desk (trading.py), which reads the owner's order commands.
+        `journal` holds the track record the owner can ask for."""
         self._cfg = cfg
         self._save_setting = save_setting
         self._restart = restart
@@ -109,6 +116,7 @@ class Router:
         self._knowledge = knowledge
         self._usage = usage
         self._trade = trade
+        self._journal = journal
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
@@ -214,6 +222,8 @@ class Router:
             self._forget_note(message)
         elif lowered in USAGE_WORDS:
             self._reply_usage(message)
+        elif lowered.startswith(RECORD_PREFIXES) and self._record_request(text) is not None:
+            self._reply_record(message, *self._record_request(text))
         else:
             note = _note_body(text)
             if note is None:
@@ -324,6 +334,33 @@ class Router:
         lines.append(f"当前设置：平时用 {cfg.model_daily} 的 {cfg.effort_daily} 档，“深度”用 {cfg.model_deep} 的 {cfg.effort_deep} 档。")
         lines.append("金额按公开价格估算，实际以 Claude Console 的账单为准。")
         self._feishu.reply_markdown(message.message_id, "AI 用量", "\n".join(lines), "grey")
+
+    def _record_request(self, text: str) -> tuple[int, str | None] | None:
+        """Reads "成绩单", "成绩单 XAU", "成绩单 90天". None when the rest is something else, e.g. a question."""
+        rest = text
+        for prefix in RECORD_PREFIXES:
+            if rest.lower().startswith(prefix):
+                rest = rest[len(prefix) :]
+                break
+        days = RECORD_DAYS
+        inst_id = None
+        for word in rest.replace("，", " ").replace(",", " ").split():
+            number = re.fullmatch(r"(\d{1,3})\s*(天|日|d)?", word.lower())
+            if number:
+                days = max(1, min(RECORD_MAX_DAYS, int(number.group(1))))
+                continue
+            found = self._resolver.find_in_text(word, limit=1)
+            if not found:
+                return None
+            inst_id = found[0]
+        return days, inst_id
+
+    def _reply_record(self, message: IncomingMessage, days: int, inst_id: str | None) -> None:
+        if self._journal is None or not self._cfg.track_record:
+            self._feishu.reply_text(message.message_id, "成绩单没有打开。在服务器的 .env 里把 TRACK_RECORD 设成 true 再重启。")
+            return
+        body = scorecard_markdown(self._journal, self._clock(), self._cfg.tz, days, inst_id, self._cfg.track_window_hours)
+        self._feishu.reply_markdown(message.message_id, "成绩单", body, "green")
 
     # ---------------------------------------------------------------- intents
 

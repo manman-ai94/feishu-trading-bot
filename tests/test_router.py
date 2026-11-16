@@ -23,7 +23,7 @@ class Bench:
         self.okx = FakeOkx(make_state() if state == "default" else state)
         self.analyst = FakeAnalyst(enabled=analyst_enabled)
         self.clock = Clock(1_800_000_000.0)
-        journal = Journal(":memory:")
+        journal = self.journal = Journal(":memory:")
         self.reporter = Reporter(self.cfg, self.feishu, self.okx, self.analyst, journal, self.clock)
         self.reporter.monitor = Monitor(self.okx, self.cfg, journal, lambda event: None, self.clock)
         if self.okx.state is not None:
@@ -38,7 +38,7 @@ class Bench:
         self.router = Router(
             self.cfg, self.feishu, self.okx, self.analyst, self.reporter, bot_open_id, self.clock,
             save_setting=lambda name, value: self.saved.append((name, value)), restart=self._restart,
-            knowledge=knowledge, usage=usage, trade=self.desk,
+            knowledge=knowledge, usage=usage, trade=self.desk, journal=journal,
         )  # fmt: skip
 
     def _restart(self):
@@ -559,3 +559,40 @@ def test_questions_about_trading_go_to_the_ai_as_before():
 
 def test_help_mentions_trading():
     assert "交易帮助" in HELP_TEXT and "确认码" in HELP_TEXT
+
+
+# --------------------------------------------------------------- track record
+
+
+def test_the_owner_can_ask_for_the_track_record():
+    bench = Bench()
+    now = bench.clock.now
+    bench.journal.record_analysis(
+        "question", "XAU-USDT-SWAP", "long", 3880.0, [{"side": "long", "trigger": 3900, "target": 3950, "invalid": 3860}], ts=now - 3 * 86400
+    )
+    bench.journal.record_analysis("question", "BTC-USDT-SWAP", "short", 65000.0, [], ts=now - 50 * 86400)
+    [reply] = bench.say("成绩单")
+    assert reply.title == "成绩单" and reply.template == "green"
+    assert "最近 30 天" in reply.body and "记录了 1 次带点位的分析，共 1 个情景" in reply.body
+    [reply] = bench.say("成绩单 90天")
+    assert "最近 90 天" in reply.body and "记录了 2 次带点位的分析" in reply.body
+    [reply] = bench.say("成绩单 BTC 90")
+    assert "最近 90 天 · BTC-USDT-SWAP" in reply.body and "记录了 1 次带点位的分析，共 0 个情景" in reply.body
+    assert bench.analyst.calls == []  # read from the journal; the AI is not asked
+
+
+def test_a_question_about_the_track_record_goes_to_the_ai():
+    bench = Bench()
+    bench.say("成绩单怎么看")
+    assert bench.analyst.named("answer")[0]["question"] == "成绩单怎么看"
+
+
+def test_the_track_record_can_be_switched_off():
+    [reply] = Bench(track_record=False).say("成绩单")
+    assert "TRACK_RECORD" in reply.body
+
+
+def test_the_track_record_is_the_owners_to_ask_for():
+    bench = Bench(group_owner_only=False)
+    replies = bench.say("成绩单", sender=FRIEND, private=False)
+    assert all(reply.title != "成绩单" for reply in replies)

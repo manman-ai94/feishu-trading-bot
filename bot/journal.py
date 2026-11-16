@@ -55,6 +55,36 @@ CREATE TABLE IF NOT EXISTS settings (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    inst_id TEXT NOT NULL,
+    bias TEXT NOT NULL DEFAULT '',
+    ref_px REAL,
+    question TEXT NOT NULL DEFAULT '',
+    px_24h REAL,
+    px_72h REAL,
+    scored INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_analyses_ts ON analyses (ts);
+CREATE TABLE IF NOT EXISTS calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    inst_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    trigger_px REAL NOT NULL,
+    target_px REAL NOT NULL,
+    invalid_px REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    triggered_ts INTEGER,
+    closed_ts INTEGER,
+    checked_ts INTEGER,
+    result_r REAL
+);
+CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls (ts);
+CREATE INDEX IF NOT EXISTS idx_calls_status ON calls (status);
 """
 
 
@@ -201,6 +231,93 @@ class Journal:
                 (mode, int(start), int(end)),
             ).fetchone()
         return int(row["n"])
+
+    # ---------------------------------------------------------- track record
+
+    def record_analysis(
+        self,
+        purpose: str,
+        inst_id: str,
+        bias: str,
+        ref_px: float | None,
+        scenarios: list[dict],
+        question: str = "",
+        ts: float | None = None,
+    ) -> int:
+        """One analysis the AI gave levels in, with its scenarios (side, trigger, target, invalid).
+
+        Scored later by track.Scorer. Returns the id of the analysis.
+        """
+        when = int(ts or time.time())
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO analyses (ts, purpose, inst_id, bias, ref_px, question) VALUES (?, ?, ?, ?, ?, ?)",
+                (when, purpose, inst_id, bias, ref_px, question),
+            )
+            analysis_id = int(cursor.lastrowid)
+            self._db.executemany(
+                "INSERT INTO calls (analysis_id, ts, inst_id, side, trigger_px, target_px, invalid_px) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(analysis_id, when, inst_id, s["side"], s["trigger"], s["target"], s["invalid"]) for s in scenarios],
+            )
+            self._db.commit()
+        return analysis_id
+
+    def open_calls(self) -> list[dict]:
+        """Scenarios that have no final result yet, oldest first."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM calls WHERE status = 'open' ORDER BY ts ASC, id ASC").fetchall()
+        return [dict(row) for row in rows]
+
+    def update_call(self, call_id: int, **fields) -> None:
+        """Writes the progress or the result of one scenario: status, triggered_ts, closed_ts, checked_ts, result_r."""
+        allowed = {"status", "triggered_ts", "closed_ts", "checked_ts", "result_r"}
+        names = [name for name in fields if name in allowed]
+        if not names:
+            return
+        with self._lock:
+            self._db.execute(
+                f"UPDATE calls SET {', '.join(name + ' = ?' for name in names)} WHERE id = ?",
+                [fields[name] for name in names] + [call_id],
+            )
+            self._db.commit()
+
+    def unscored_analyses(self) -> list[dict]:
+        """Analyses whose direction has not been compared with the later price yet."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM analyses WHERE scored = 0 ORDER BY ts ASC, id ASC").fetchall()
+        return [dict(row) for row in rows]
+
+    def update_analysis(self, analysis_id: int, **fields) -> None:
+        allowed = {"px_24h", "px_72h", "scored"}
+        names = [name for name in fields if name in allowed]
+        if not names:
+            return
+        with self._lock:
+            self._db.execute(
+                f"UPDATE analyses SET {', '.join(name + ' = ?' for name in names)} WHERE id = ?",
+                [fields[name] for name in names] + [analysis_id],
+            )
+            self._db.commit()
+
+    def analyses_between(self, start: float, end: float, inst_id: str | None = None) -> list[dict]:
+        query = "SELECT * FROM analyses WHERE ts >= ? AND ts < ?"
+        values: list = [int(start), int(end)]
+        if inst_id:
+            query += " AND inst_id = ?"
+            values.append(inst_id)
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY ts ASC, id ASC", values).fetchall()
+        return [dict(row) for row in rows]
+
+    def calls_between(self, start: float, end: float, inst_id: str | None = None) -> list[dict]:
+        query = "SELECT * FROM calls WHERE ts >= ? AND ts < ?"
+        values: list = [int(start), int(end)]
+        if inst_id:
+            query += " AND inst_id = ?"
+            values.append(inst_id)
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY ts ASC, id ASC", values).fetchall()
+        return [dict(row) for row in rows]
 
     # -------------------------------------------------------------- settings
 

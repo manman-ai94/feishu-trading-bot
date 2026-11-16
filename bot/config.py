@@ -115,6 +115,8 @@ class Config:
     web_search: bool = True  # the AI may search the web for news and economic data
     ai_monthly_budget_usd: float | None = 180.0  # above this the AI switches to its cheapest setting
     knowledge_dir: Path = Path("knowledge")
+    track_record: bool = True  # keep the levels the AI gives and score them against the market later
+    track_window_hours: int = 72  # how long a scenario is watched
 
     # Behaviour
     timezone: str = "America/Los_Angeles"
@@ -294,6 +296,8 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         web_search=_get_bool("WEB_SEARCH", True),
         ai_monthly_budget_usd=_get_float("AI_MONTHLY_BUDGET_USD", 180.0, problems),
         knowledge_dir=Path(_get("KNOWLEDGE_DIR", "knowledge")),
+        track_record=_get_bool("TRACK_RECORD", True),
+        track_window_hours=min(72, max(4, _get_int("TRACK_WINDOW_HOURS", 72, problems))),
         timezone=timezone,
         poll_seconds=max(5, _get_int("POLL_SECONDS", 30, problems)),
         snapshot_minutes=max(1, _get_int("SNAPSHOT_MINUTES", 15, problems)),
