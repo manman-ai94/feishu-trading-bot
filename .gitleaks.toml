@@ -1,0 +1,11 @@
+# gitleaks: the default rules, minus the made-up keys the tests use and the blank template.
+# A real key belongs only in the server's .env, which is never committed.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "test fixtures and the .env template"
+paths = [
+  '''^tests/''',
+  '''^\.env\.example$''',
+]

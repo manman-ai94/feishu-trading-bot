@@ -35,9 +35,33 @@ from .upkeep import Upkeep
 log = logging.getLogger(__name__)
 
 
+class MaskingFormatter(logging.Formatter):
+    """Writes "***" wherever a key, secret or passphrase from .env would appear in a log line, tracebacks
+    included. The bot never logs them on purpose; this catches a library or an error message that does."""
+
+    def __init__(self, fmt: str, secrets: list[str]):
+        super().__init__(fmt)
+        # Longest first, so a secret that contains another is masked whole. Short values are not secrets.
+        self._secrets = sorted({s for s in secrets if s and len(s) >= 8}, key=len, reverse=True)
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        for secret in self._secrets:
+            text = text.replace(secret, "***")
+        return text
+
+
+def secret_values(cfg: Config) -> list[str]:
+    """Every value in the configuration that must never be written anywhere."""
+    return [
+        cfg.feishu_app_secret, cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.anthropic_api_key,
+        cfg.okx_demo_api_key, cfg.okx_demo_secret_key, cfg.okx_demo_passphrase, cfg.heartbeat_url,
+    ]  # fmt: skip
+
+
 def setup_logging(cfg: Config) -> None:
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    formatter = MaskingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s", secret_values(cfg))
     file_handler = RotatingFileHandler(cfg.log_dir / "bot.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(formatter)
     console = logging.StreamHandler()
