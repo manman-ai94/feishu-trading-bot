@@ -15,7 +15,7 @@ from .config import Config
 from .journal import Journal
 from .models import AccountState, Position
 from .okx_client import OkxClient, OkxError, OkxNetworkError
-from .risk import LEVEL_WORDS, AccountRisk, liq_line, readings, stop_line
+from .risk import LEVEL_WORDS, AccountRisk, PositionRisk, liq_line, readings, stop_line
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +28,9 @@ CLOSE_RECORD_MARGIN_SECONDS = 10
 CLOSE_RECORD_WAIT_SECONDS = 2.0  # OKX may write the record a moment after the position goes
 NO_STOP_SETTING = "no_stop_alert:"  # in the journal: when each position was last pointed out, so a restart does not repeat it
 RISK_LEVELS_SETTING = "risk_levels"  # in the journal: the level each risk reading was last reported at
+NEAR_SETTING = "near_alerts"  # in the journal: the stops and take-profits the price was last reported close to
+NEAR_ATR = 0.25  # "close to the stop / take-profit": within this share of a normal day's range
+NEAR_RELEASE_ATR = 0.5  # told again only after the price has been this far away in between
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,23 @@ def _stops_line(position: Position) -> str:
     return f"止损 {_px_or_none(position.stop_loss)}，止盈 {_px_or_none(position.take_profit)}"
 
 
+def position_brief(position: Position) -> str:
+    """The position in one line, to open an alert with: what it is and how it stands right now."""
+    size = f"{position.coins:,.8g} {position.coin_ccy}" if position.coins is not None and position.coin_ccy else f"{_qty(position.qty)} 张"
+    return (
+        f"{position.inst_id} {_side(position)}单 {size}，均价 {_px(position.avg_px)}，标记价 {_px(position.mark_px)}，"
+        f"浮动盈亏 {_money(position.upl, position.pnl_ccy)}，{_stops_line(position)}"
+    )
+
+
+def pnl_at(position: Position, price: float) -> float | None:
+    """What the whole position makes or loses against its average price if it closes at `price`."""
+    if position.coins is None or not position.avg_px:
+        return None
+    move = price - position.avg_px if position.direction == "long" else position.avg_px - price
+    return move * abs(position.coins)
+
+
 def check_risk(state: AccountState, cfg: Config, day_start_equity: float | None) -> list[Event]:
     """Rule-based risk warnings. They only ever go to the owner."""
     events: list[Event] = []
@@ -165,7 +185,7 @@ def check_risk(state: AccountState, cfg: Config, day_start_equity: float | None)
                     title="保证金率偏低",
                     private_lines=(
                         f"账户保证金率 {snapshot.mgn_ratio * 100:.0f}%，你设的提醒线是 {threshold * 100:.0f}%",
-                        "保证金率到 100% 会开始强平。要不要减仓由你决定。",
+                        "保证金率到 100% 会开始强平。",
                     ),
                     warning=True,
                 )
@@ -235,6 +255,7 @@ class Monitor:
         self._clock = clock
         self._gauge = gauge  # risk.RiskGauge, or None: then positions are not measured against the market's range
         self._risk_levels: dict[str, int] | None = None  # read from the journal when first needed
+        self._near: set[str] | None = None  # likewise: see _near_events
         self._lock = threading.Lock()
         self._state: AccountState | None = None
         self._positions: dict[tuple, Position] | None = None
@@ -297,8 +318,10 @@ class Monitor:
             if self._cooled_down(event, now):
                 events.append(event)
         risk = self._measure(state)
+        events = [self._with_stop_cost(event, risk) for event in events]
         events.extend(self._without_stops(state, now, risk))
         events.extend(self._risk_events(risk, now))
+        events.extend(self._near_events(risk, state))
 
         for event in events:
             self._journal.record_event(event.kind, event.title + "；" + "；".join(event.private_lines), event.inst_id, ts=now)
@@ -392,23 +415,29 @@ class Monitor:
         known = self._risk_levels
         before = dict(known)
         found = readings(risk, self._cfg)
-        current = {reading.key: reading.level for reading in found}
+        held = {reading.key: reading.held for reading in found}
         for key in list(known):
-            if current.get(key, 0) < known[key]:  # better, closed, or no longer measurable
-                known[key] = current.get(key, 0)
+            if held.get(key, 0) < known[key]:  # well clear of the line, closed, or no longer measurable
+                known[key] = held.get(key, 0)
         raised = [reading for reading in found if reading.level > known.get(reading.key, 0)]
         events: list[Event] = []
         if raised:
-            worst = max(reading.level for reading in found)
+            standing = [reading for reading in found if reading.level > 0]
+            worst = max(reading.level for reading in standing)
+            about = {inst_id for reading in standing for inst_id in reading.inst_ids}
+            if any(not reading.inst_ids for reading in standing):  # an account-wide reading: every position
+                about = {measured.position.inst_id for measured in risk.positions}
+            briefs = [position_brief(measured.position) for measured in risk.positions if measured.position.inst_id in about]
+            subjects = "，".join(dict.fromkeys(reading.subject for reading in standing if reading.subject))
             event = Event(
                 kind="risk_level",
-                title=f"仓位风险{LEVEL_WORDS[worst]}",
+                title=f"仓位风险{LEVEL_WORDS[worst]}" + (f"：{subjects}" if subjects else ""),
                 private_lines=tuple(
                     line
                     for line in (
-                        *(reading.line for reading in found if reading.level > 0),
-                        "这些是按你设的线量出来的读数。要不要减仓、止损放在哪里，由你决定。",
-                        self._how_to_act([measured.position.inst_id for measured in risk.positions]),
+                        *briefs,
+                        *(reading.line for reading in standing),
+                        self._how_to_act(sorted(about)),
                     )
                     if line
                 ),
@@ -423,6 +452,109 @@ class Monitor:
         if known != before:
             self._journal.set_setting(RISK_LEVELS_SETTING, json.dumps(known, ensure_ascii=False))
         return events
+
+    def _with_stop_cost(self, event: Event, risk: AccountRisk | None) -> Event:
+        """A stop placed or moved, or a position opened or added to: what the stop would cost from here,
+        and whether that is more than the owner's rule. Told once, with the change, rather than every
+        time the price drifts."""
+        if event.kind not in ("opened", "increased", "stop_changed") or risk is None:
+            return event
+        measured = next((item for item in risk.positions if item.position.inst_id == event.inst_id), None)
+        if measured is None or measured.position.stop_loss is None:
+            return event
+        line = stop_line(measured)
+        if not line:
+            return event
+        rule = self._cfg.alert_stop_risk_pct
+        if rule is not None and measured.stop_cost_pct is not None and measured.stop_cost_pct > rule:
+            line += f"。超过了你定的单笔风险：权益的 {rule:g}%"
+        loss = pnl_at(measured.position, measured.position.stop_loss)
+        if loss is not None:
+            line += f"。按开仓均价算，这一单在止损处{'赚' if loss >= 0 else '亏'}约 {abs(loss):,.2f} {measured.position.pnl_ccy}"
+        return replace(event, private_lines=(*event.private_lines, line))
+
+    def _near_events(self, risk: AccountRisk | None, state: AccountState) -> list[Event]:
+        """The price has come close to a stop-loss or a take-profit: what is happening to the position.
+        Each is told once; again only after the price has moved well away in between, or the order moved."""
+        if risk is None:
+            return []
+        known: set[str] = self._near_known()
+        before = set(known)
+        current: dict[str, float] = {}  # key -> distance in days of normal range
+        events: list[Event] = []
+        for measured in risk.positions:
+            if not measured.atr_day or not state.stops_known:
+                continue
+            for which, price, gap in self._near_targets(measured):
+                key = f"{which}:{'|'.join(measured.position.key)}:{price:g}"
+                current[key] = gap / measured.atr_day
+                if current[key] < NEAR_ATR and key not in known:
+                    known.add(key)
+                    events.append(self._near_event(measured, which, price, gap, risk.equity))
+        for key in list(known):
+            if key not in current or current[key] > NEAR_RELEASE_ATR:
+                known.discard(key)
+        if known != before:
+            self._journal.set_setting(NEAR_SETTING, json.dumps(sorted(known)))
+        return events
+
+    def _near_known(self) -> set[str]:
+        if self._near is None:
+            try:
+                self._near = set(json.loads(self._journal.get_setting(NEAR_SETTING) or "[]"))
+            except (ValueError, TypeError):
+                self._near = set()
+        return self._near
+
+    @staticmethod
+    def _near_targets(measured: PositionRisk):
+        position = measured.position
+        mark = position.mark_px
+        if not mark:
+            return
+        long = position.direction == "long"
+        if position.stop_loss is not None and measured.stop_gap:  # 0: the stop is already past the price
+            yield "sl", position.stop_loss, measured.stop_gap
+        tp = position.take_profit
+        if tp is not None:
+            gap = tp - mark if long else mark - tp
+            if gap > 0:
+                yield "tp", tp, gap
+
+    def _near_event(self, measured: PositionRisk, which: str, price: float, gap: float, equity: float | None) -> Event:
+        position = measured.position
+        name = f"{position.inst_id} {_side(position)}单"
+        ccy = position.pnl_ccy
+        days = gap / measured.atr_day
+        made = pnl_at(position, price)
+        share = f"（占权益 {abs(made) / equity * 100:.1f}%）" if made is not None and equity and equity > 0 else ""
+        if which == "sl":
+            where = f"标记价 {_px(position.mark_px)}，离止损 {_px(price)} 只剩 {gap:,.2f}（{days:.2f} 天的正常波幅）"
+            lines = [where]
+            if made is not None:
+                lines.append(
+                    f"打到止损的话，按开仓均价 {_px(position.avg_px)} 算这一单{'赚' if made >= 0 else '亏'}约 {abs(made):,.2f} {ccy}{share}，"
+                    f"现在的浮动盈亏是 {_money(position.upl, ccy)}"
+                )
+            how = self._how_to_act([position.inst_id])
+            title = f"离止损很近：{name}"
+        else:
+            where = f"标记价 {_px(position.mark_px)}，离止盈 {_px(price)} 还有 {gap:,.2f}（{days:.2f} 天的正常波幅）"
+            lines = [where]
+            if made is not None:
+                lines.append(f"到止盈的话，按开仓均价 {_px(position.avg_px)} 算这一单赚约 {made:,.2f} {ccy}{share}")
+            how = ""
+            title = f"快到止盈：{name}"
+        if how:
+            lines.append(how)
+        return Event(
+            kind="near_stop" if which == "sl" else "near_tp",
+            title=title,
+            inst_id=position.inst_id,
+            private_lines=tuple(lines),
+            public_lines=(where,),
+            to_group=True,
+        )
 
     def _without_stops(self, state: AccountState, now: float, risk: AccountRisk | None = None) -> list[Event]:
         """Positions that have gone without a stop-loss for longer than the owner allows.
@@ -471,7 +603,7 @@ class Monitor:
             lines.append(stop_line(measured))
         elif position.liq_px and position.liq_distance_pct is not None:
             lines.append(f"预估强平价 {_px(position.liq_px)}，离现在的标记价 {position.liq_distance_pct:.2f}%")
-        lines.append(f"这个仓位已经 {minutes:g} 分钟以上没有止损单。设不设、设在哪由你决定。")
+        lines.append(f"这个仓位已经 {minutes:g} 分钟以上没有止损单。")
         how = self._how_to_act([position.inst_id], close=False)
         if how:
             lines.append(how)
@@ -501,7 +633,7 @@ class Monitor:
         if not commands:
             return ""
         where = "私聊或在群里 @我" if cfg.group_trading and cfg.group_chat_id and cfg.group_show_pnl else "私聊"
-        return f"要动手的话，{where}发{'或'.join(commands)}，我先回预览，你回确认码才执行。"
+        return f"要调的话，{where}发{'或'.join(commands)}，回确认码才执行。"
 
     def _cooled_down(self, event: Event, now: float) -> bool:
         key = (event.kind, event.inst_id)

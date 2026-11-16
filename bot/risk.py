@@ -41,6 +41,10 @@ ATR_PERIOD = 14
 RANGE_TTL_SECONDS = 3600.0
 FUNDING_TTL_SECONDS = 600.0
 LEVEL_WORDS = {1: "提醒", 2: "警告", 3: "紧急"}
+# A reading reported at one of the owner's lines is only told again after it has been this much clear
+# of that line (20% further from liquidation, or 20% less leverage), so a price wobbling on a line does
+# not send the same card every half hour.
+RELEASE_FACTOR = 1.2
 # Markets whose underlying closes for the weekend while the perpetual keeps trading, thinly.
 WEEKEND_CLOSED = ("XAU", "XAG", "XPT", "XPD")
 
@@ -119,6 +123,13 @@ class Reading:
     key: str  # what was measured, e.g. "leverage" or "liq:XAU-USDT-SWAP|cross|long"
     level: int  # 0 inside every threshold, then 1 notice, 2 warning, 3 urgent
     line: str  # the measurement in words
+    release: int | None = None  # the level it counts as once reported: the lines eased by RELEASE_FACTOR
+    subject: str = ""  # a few words for the card's title
+    inst_ids: tuple[str, ...] = ()  # the positions it is about; empty for the whole account
+
+    @property
+    def held(self) -> int:
+        return self.level if self.release is None else max(self.level, self.release)
 
 
 def _notional(position: Position) -> float | None:
@@ -270,7 +281,10 @@ def stop_line(risk: PositionRisk) -> str:
 
 
 def funding_line(risk: PositionRisk) -> str:
+    """ "" also when the funding comes to nothing worth a line (a rate of 0)."""
     if risk.funding_rate is None or risk.funding_cost is None or not risk.funding_hours:
+        return ""
+    if abs(risk.funding_cost) < 0.005:
         return ""
     ccy = risk.position.pnl_ccy
     per_day = risk.funding_cost * 24.0 / risk.funding_hours
@@ -302,25 +316,47 @@ def _list(thresholds: tuple[float, ...]) -> str:
     return "、".join(f"{value:g}" for value in thresholds)
 
 
+def stop_protects(risk: PositionRisk) -> bool:
+    """Whether the stop-loss goes off before the price can reach the liquidation price. Then how far
+    liquidation is does not matter: the position is out first."""
+    position = risk.position
+    stop = position.stop_loss
+    if stop is None:
+        return False
+    if not position.liq_px:
+        return True
+    return stop > position.liq_px if position.direction == "long" else stop < position.liq_px
+
+
 def readings(account: AccountRisk, cfg) -> list[Reading]:
-    """Every measurement that has a threshold, with its level. Levels of 0 are included."""
+    """Every measurement that has a threshold, with its level. Levels of 0 are included.
+
+    What a stop-loss would cost is not among them: the owner chooses that when he sets the stop, and
+    it is told with the stop's change (monitor.py), not again each time the price drifts."""
     found: list[Reading] = []
     many = len(account.positions) > 1
     if cfg.alert_leverage and account.leverage is not None:
         level = _above(account.leverage, cfg.alert_leverage)
+        release = _above(account.leverage, tuple(line / RELEASE_FACTOR for line in cfg.alert_leverage))
         move = f"价格每逆向走 1%，权益变动约 {account.leverage:.0f}%" if account.leverage >= 1 else ""
         line = "。".join(part for part in (leverage_line(account), move, f"你设的线：超过 {_list(cfg.alert_leverage)} 倍") if part)
-        found.append(Reading("leverage", level, line))
+        subject = f"实际杠杆 {account.leverage:.0f} 倍"
+        found.append(Reading("leverage", level, line, release, subject))
     for risk in account.positions:
         position = risk.position
-        name = f"{position.inst_id} {'多' if position.direction == 'long' else '空'}单：" if many else ""
+        side = f"{'多' if position.direction == 'long' else '空'}单"
+        name = f"{position.inst_id} {side}：" if many else ""
         tag = "|".join(position.key)
-        if cfg.alert_liq_atr and risk.liq_atr is not None:
+        if cfg.alert_liq_atr and risk.liq_atr is not None and not stop_protects(risk):
             level = _below(risk.liq_atr, cfg.alert_liq_atr)
-            found.append(Reading(f"liq:{tag}", level, f"{name}{liq_line(risk)}。你设的线：不到 {_list(cfg.alert_liq_atr)} 天"))
-        if cfg.alert_stop_risk_pct is not None and risk.stop_cost_pct is not None and position.stop_loss is not None:
-            level = 1 if risk.stop_cost_pct > cfg.alert_stop_risk_pct else 0
-            found.append(Reading(f"stop:{tag}", level, f"{name}{stop_line(risk)}。你定的单笔风险上限：权益的 {cfg.alert_stop_risk_pct:g}%"))
+            release = _below(risk.liq_atr, tuple(line * RELEASE_FACTOR for line in cfg.alert_liq_atr))
+            if position.stop_loss is None:
+                why = "没有止损"
+            else:
+                why = f"止损 {_num(position.stop_loss)} 在强平价外面，价格先到强平价"
+            line = f"{name}{why}，{liq_line(risk)}。你设的线：不到 {_list(cfg.alert_liq_atr)} 天"
+            subject = f"{position.inst_id.split('-')[0]} {side}{'没有止损' if position.stop_loss is None else '止损在强平价外'}"
+            found.append(Reading(f"liq:{tag}", level, line, release, subject, (position.inst_id,)))
     return found
 
 

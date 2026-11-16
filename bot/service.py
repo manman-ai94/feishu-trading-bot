@@ -13,7 +13,7 @@ from .feishu_client import FeishuClient
 from .journal import Journal
 from .market import build_market_context
 from .models import AccountState
-from .monitor import Event, Monitor
+from .monitor import Event, Monitor, position_brief
 from .okx_client import OkxClient
 from .reports import DISCLAIMER, account_text, equity_text, event_markdown, journal_text, status_markdown
 from .risk import AccountRisk, weekend_lines
@@ -23,6 +23,8 @@ from .upkeep import downtime_text
 log = logging.getLogger(__name__)
 
 EVENT_COLOURS = {
+    "near_stop": "orange",
+    "near_tp": "green",
     "opened": "blue",
     "increased": "blue",
     "reduced": "wathet",
@@ -31,6 +33,10 @@ EVENT_COLOURS = {
     "okx_recovered": "green",
 }
 RISK_KINDS = ("margin_warning", "liq_warning", "daily_loss", "no_stop", "risk_level")
+
+
+def _usd(value: float | None) -> str:
+    return "未知" if value is None else f"{value:,.2f} USD"
 
 
 class Reporter:
@@ -134,12 +140,19 @@ class Reporter:
         if state is None:
             body = "机器人已启动，但还没读到 OKX 账户。稍后如果连续失败，我会再提醒你。"
         else:
-            body = "机器人已启动，开始监控。\n\n" + status_markdown(state, self.day_change(state), private=True, risk=self.risk(state))
+            # Short: a restart is not news. The positions in one line each; the full card is one word away.
+            lines = ["机器人已启动，开始监控。", "", f"**账户权益** {_usd(state.snapshot.total_eq)}"]
+            lines.extend(f"- {position_brief(position)}" for position in state.positions)
+            if not state.positions:
+                lines.append("- 当前没有持仓")
+            lines.append("")
+            lines.append("完整的账户和风险读数发“仓位”。")
+            body = "\n".join(lines)
         if downtime is not None:
             body = downtime_text(downtime, self._cfg.tz) + "\n\n" + body
         if self._cfg.trading_on:
             where = "模拟盘" if self._cfg.trading == "demo" else "实盘"
-            body += f"\n\n下单功能已打开（{where}）。每条指令都要你回复确认码才执行，发“停止交易”可以随时叫停。"
+            body += f"\n下单功能开着（{where}），每条指令回确认码才执行，发“停止交易”随时叫停。"
         self.to_owner("交易助手已上线", body, "orange" if downtime is not None else "green")
 
     # ----------------------------------------------------------------- briefs

@@ -233,7 +233,7 @@ def test_a_position_left_without_a_stop_is_pointed_out_once_and_again_a_day_late
     text = "\n".join(event.private_lines)
     assert "数量 2 张，均价 2,650.00，标记价 2,660.00，浮动盈亏 +20.00 USDT" in text
     assert "预估强平价 2,400.00，离现在的标记价 9.77%" in text
-    assert "设不设、设在哪由你决定" in text and "每 24 小时提醒一次" in text
+    assert "分钟以上没有止损单。" in text and "每 24 小时提醒一次" in text
 
     clock.advance(23 * 3600)
     monitor.poll_once()
@@ -350,9 +350,9 @@ def test_the_reminder_says_how_to_set_one_only_when_that_would_reach_this_accoun
         return "\n".join(events[0].private_lines)
 
     hint = "发“止损 XAU 价格”"
-    assert "私聊或在群里 @我发“止损 XAU 价格”，我先回预览，你回确认码才执行" in text(trading="live")
-    assert "要动手的话，私聊发“止损 XAU 价格”" in text(trading="live", group_trading=False)
-    assert "要动手的话，私聊发“止损 XAU 价格”" in text(trading="live", group_show_pnl=False)
+    assert "私聊或在群里 @我发“止损 XAU 价格”，回确认码才执行" in text(trading="live")
+    assert "要调的话，私聊发“止损 XAU 价格”" in text(trading="live", group_trading=False)
+    assert "要调的话，私聊发“止损 XAU 价格”" in text(trading="live", group_show_pnl=False)
     assert "平仓" not in text(trading="live")  # for a missing stop, the stop is the answer
     assert hint not in text(trading="live", trade_actions=("close",))
     assert hint not in text(trading="demo")  # an order would go to the demo account, not to this position

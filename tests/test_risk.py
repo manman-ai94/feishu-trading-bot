@@ -206,27 +206,43 @@ def levels(risk: AccountRisk, **cfg) -> dict[str, int]:
 
 def test_each_reading_is_set_against_the_owners_lines():
     # The owner keeps 100x on the exchange and sizes by risk, so leverage has no line unless he sets one.
-    assert levels(account(gold())) == {"liq": 2}  # 1.8 days from liquidation; no stop to price
-    assert levels(account(with_stop(3768.0))) == {"liq": 2, "stop": 1}  # his rule: one trade risks 1% of the equity
+    assert levels(account(gold())) == {"liq": 2}  # 1.8 days from liquidation, and no stop
     assert levels(account(gold(mark_px=3780.0))) == {"liq": 3}  # 75 away: under one day
     small = gold(qty=400.0, coins=0.4, liq_px=None, stops=(StopOrder("a1", sl_trigger_px=3827.0),))
-    assert levels(account(small)) == {"stop": 0}  # a stop that costs just under 1%
+    assert levels(account(small)) == {}  # no liquidation price to measure, and what a stop costs is told elsewhere
     assert levels(account(gold()), alert_leverage=(5.0, 10.0)) == {"leverage": 2, "liq": 2}  # 20.9 times
-    assert levels(account(small), alert_leverage=(5.0, 10.0)) == {"leverage": 0, "stop": 0}  # 0.84 times
+    assert levels(account(small), alert_leverage=(5.0, 10.0)) == {"leverage": 0}  # 0.84 times
+
+
+def test_liquidation_does_not_matter_while_a_stop_goes_off_first():
+    assert levels(account(with_stop(3768.0))) == {}  # the stop is between the price and liquidation
+    assert levels(account(with_stop(3768.0, mark_px=3780.0))) == {}
+    assert levels(account(with_stop(3700.0))) == {"liq": 2}  # a stop beyond liquidation protects nothing
+    short = gold(direction="short", pos_side="net", liq_px=4040.0, stops=(StopOrder("a1", sl_trigger_px=3990.0),))
+    assert levels(account(short)) == {}
+
+
+def test_a_reading_is_held_until_it_is_well_clear_of_the_line():
+    [reading] = readings(account(gold(mark_px=3900.0)), make_cfg())  # 195 away: 2.06 days, just over the 2-day line
+    assert (reading.level, reading.held) == (1, 2)  # counted at 2 until it is 2.4 days away
+    [reading] = readings(account(gold(mark_px=3940.0)), make_cfg())  # 2.48 days
+    assert (reading.level, reading.held) == (1, 1)
 
 
 def test_the_lines_can_be_moved_or_switched_off():
-    risk = account(with_stop(3768.0))
-    assert levels(risk, alert_leverage=(25.0,), alert_liq_atr=(1.5,), alert_stop_risk_pct=60.0) == {"leverage": 0, "liq": 0, "stop": 0}
-    assert levels(risk, alert_leverage=(), alert_liq_atr=(), alert_stop_risk_pct=None) == {}
+    risk = account(gold())
+    assert levels(risk, alert_leverage=(25.0,), alert_liq_atr=(1.5,)) == {"leverage": 0, "liq": 0}
+    assert levels(risk, alert_leverage=(), alert_liq_atr=()) == {}
 
 
 def test_a_reading_names_its_position_when_there_are_several():
     both = account(gold(), gold(inst_id="XAG-USDT-SWAP"))
-    lines = [reading.line for reading in readings(both, make_cfg(alert_leverage=(5.0, 10.0)))]
-    assert lines[1].startswith("XAU-USDT-SWAP 多单：预估强平价") and lines[2].startswith("XAG-USDT-SWAP 多单：")
-    assert readings(account(gold()), make_cfg())[0].line.startswith("预估强平价")
-    assert "你定的单笔风险上限：权益的 1%" in readings(account(with_stop(3768.0)), make_cfg())[1].line
+    found = readings(both, make_cfg(alert_leverage=(5.0, 10.0)))
+    lines = [reading.line for reading in found]
+    assert lines[1].startswith("XAU-USDT-SWAP 多单：没有止损，预估强平价") and lines[2].startswith("XAG-USDT-SWAP 多单：")
+    assert [reading.subject for reading in found] == ["实际杠杆 42 倍", "XAU 多单没有止损", "XAG 多单没有止损"]
+    assert readings(account(gold()), make_cfg())[0].line.startswith("没有止损，预估强平价")
+    assert readings(account(with_stop(3700.0)), make_cfg())[0].line.startswith("止损 3,700.00 在强平价外面")
     assert "你设的线：不到 3、2、1 天" in lines[1] and "你设的线：超过 5、10 倍" in lines[0]
 
 
@@ -354,18 +370,20 @@ def test_by_default_the_card_leaves_leverage_alone():
     monitor, _, events, _, _, _ = watch(gold())
     monitor.poll_once()
     [card] = risk_cards(events)
-    assert card.private_lines[0].startswith("预估强平价 3,705.00") and not any("实际杠杆" in line for line in card.private_lines)
+    assert card.title == "仓位风险警告：XAU 多单没有止损"
+    assert card.private_lines[0].startswith("XAU-USDT-SWAP 多单 10 XAU，均价 3,845.00，标记价 3,873.00，浮动盈亏 +280.00 USDT，止损 无")
+    assert card.private_lines[1].startswith("没有止损，预估强平价 3,705.00") and not any("实际杠杆" in line for line in card.private_lines)
 
 
 def test_one_card_says_everything_that_stands_out_and_is_not_repeated():
     monitor, _, events, clock, _, _ = watch(gold(), alert_leverage=(5.0, 10.0))
     monitor.poll_once()
     [card] = risk_cards(events)
-    assert card.title == "仓位风险警告" and card.warning and not card.to_group
-    assert len(card.private_lines) == 3
-    assert card.private_lines[0].startswith("实际杠杆 20.9 倍") and "价格每逆向走 1%，权益变动约 21%" in card.private_lines[0]
-    assert card.private_lines[1].startswith("预估强平价 3,705.00")
-    assert "由你决定" in card.private_lines[2]
+    assert card.title == "仓位风险警告：实际杠杆 21 倍，XAU 多单没有止损" and card.warning and not card.to_group
+    assert len(card.private_lines) == 3  # the position first, then what stands out; nothing to send with trading off
+    assert card.private_lines[0].startswith("XAU-USDT-SWAP 多单 10 XAU")
+    assert card.private_lines[1].startswith("实际杠杆 20.9 倍") and "价格每逆向走 1%，权益变动约 21%" in card.private_lines[1]
+    assert card.private_lines[2].startswith("没有止损，预估强平价 3,705.00")
     for _ in range(5):
         clock.advance(3600)
         monitor.poll_once()
@@ -376,13 +394,13 @@ def test_the_card_offers_the_commands_that_are_open_with_the_price_left_to_him()
     monitor, _, events, _, _, _ = watch(gold(), trading="live", trade_instruments=("XAU-USDT-SWAP",), trade_actions=("stops", "close", "cancel"))
     monitor.poll_once()
     [card] = risk_cards(events)
-    assert card.private_lines[-1] == "要动手的话，私聊或在群里 @我发“止损 XAU 价格”或“平仓 XAU 一半”，我先回预览，你回确认码才执行。"
+    assert card.private_lines[-1] == "要调的话，私聊或在群里 @我发“止损 XAU 价格”或“平仓 XAU 一半”，回确认码才执行。"
     monitor, _, events, _, _, _ = watch(gold(), trading="live", trade_instruments=("XAU-USDT-SWAP",), trade_actions=("stops",))
     monitor.poll_once()
     assert "“平仓 XAU 一半”" not in risk_cards(events)[0].private_lines[-1]
     monitor, _, events, _, _, _ = watch(gold())  # trading off: nothing to send
     monitor.poll_once()
-    assert "由你决定" in risk_cards(events)[0].private_lines[-1]
+    assert not any("要调的话" in line for line in risk_cards(events)[0].private_lines)
 
 
 def test_a_reading_that_gets_worse_is_reported_again():
@@ -394,7 +412,7 @@ def test_a_reading_that_gets_worse_is_reported_again():
     assert len(risk_cards(events)) == 1  # two cards within half an hour would be noise
     clock.advance(1800)
     monitor.poll_once()
-    assert [card.title for card in risk_cards(events)] == ["仓位风险警告", "仓位风险紧急"]
+    assert [card.title for card in risk_cards(events)] == ["仓位风险警告：XAU 多单没有止损", "仓位风险紧急：XAU 多单没有止损"]
 
 
 def test_better_and_then_worse_again_is_news():
@@ -535,6 +553,131 @@ def test_no_weekend_card_when_nothing_stands_out():
 
 def test_risk_cards_reach_the_group_only_when_the_account_is_shared():
     reporter, feishu = reporter_with(gold(), alert_leverage=(5.0, 10.0), alert_liq_atr=(3.0, 2.0, 1.0))
-    assert [(sent.target, sent.title) for sent in feishu.sent] == [(OWNER, "仓位风险警告"), (GROUP, "仓位风险警告")]
+    title = "仓位风险警告：实际杠杆 21 倍，XAU 多单没有止损"
+    assert [(sent.target, sent.title) for sent in feishu.sent] == [(OWNER, title), (GROUP, title)]
     reporter, feishu = reporter_with(gold(), alert_leverage=(5.0, 10.0), group_show_pnl=False)
     assert [sent.target for sent in feishu.sent] == [OWNER]
+
+
+# ------------------------------------------------- what is happening to the position
+
+
+def bracket(mark: float, sl: float = 3816.0, tp: float = 3938.0, **overrides):
+    """The owner's real set-up: 10 XAU long from 3,845 with a stop and a take-profit."""
+    upl = (mark - 3845.0) * 10
+    return gold(mark_px=mark, upl=upl, stops=(StopOrder("a1", sl_trigger_px=sl, tp_trigger_px=tp),), **overrides)
+
+
+def kinds(events, *wanted):
+    return [event for event in events if event.kind in wanted]
+
+
+def test_a_stop_in_front_of_liquidation_raises_no_risk_card():
+    monitor, okx, events, clock, _, _ = watch(bracket(3873.0))
+    for mark in (3873.0, 3869.0, 3880.0, 3871.0):  # the night peng saw three identical warnings
+        okx.state = make_state([bracket(mark)], total_eq=1850.0)
+        clock.advance(1900)
+        monitor.poll_once()
+    assert risk_cards(events) == []
+
+
+def test_a_price_wobbling_on_a_line_is_told_once():
+    monitor, okx, events, clock, _, _ = watch(gold(mark_px=3880.0))  # 1.85 days: under the 2-day line
+    monitor.poll_once()
+    for mark in (3900.0, 3880.0, 3905.0, 3878.0):  # 2.06, 1.85, 2.12, 1.83 days
+        okx.state = make_state([gold(mark_px=mark)], total_eq=1850.0)
+        clock.advance(3600)
+        monitor.poll_once()
+    assert len(risk_cards(events)) == 1
+    okx.state = make_state([gold(mark_px=3950.0)], total_eq=1850.0)  # 2.59 days: well clear
+    clock.advance(3600)
+    monitor.poll_once()
+    okx.state = make_state([gold(mark_px=3880.0)], total_eq=1850.0)
+    clock.advance(3600)
+    monitor.poll_once()
+    assert len(risk_cards(events)) == 2
+
+
+def test_coming_close_to_the_stop_says_what_it_would_mean():
+    monitor, okx, events, clock, journal, _ = watch(bracket(3873.0), trading="live", trade_instruments=("XAU-USDT-SWAP",))
+    monitor.poll_once()
+    assert kinds(events, "near_stop", "near_tp") == []
+    okx.state = make_state([bracket(3830.0)], total_eq=1850.0)  # 14 from the stop: 0.15 days
+    clock.advance(60)
+    monitor.poll_once()
+    [near] = kinds(events, "near_stop")
+    assert near.title == "离止损很近：XAU-USDT-SWAP 多单" and near.to_group and not near.warning
+    assert near.private_lines[0] == "标记价 3,830.00，离止损 3,816.00 只剩 14.00（0.15 天的正常波幅）"
+    assert near.private_lines[1] == (
+        "打到止损的话，按开仓均价 3,845.00 算这一单亏约 290.00 USDT（占权益 15.7%），现在的浮动盈亏是 -150.00 USDT"
+    )
+    assert near.private_lines[2].startswith("要调的话")
+    assert near.public_lines == (near.private_lines[0],)  # prices only for a group that does not see the account
+
+    okx.state = make_state([bracket(3825.0)], total_eq=1850.0)  # still close: not told again
+    clock.advance(60)
+    monitor.poll_once()
+    again, _, later, _, _, _ = watch(bracket(3825.0), journal=journal)  # nor after a restart
+    again.poll_once()
+    assert len(kinds(events, "near_stop")) == 1 and kinds(later, "near_stop") == []
+
+    okx.state = make_state([bracket(3870.0)], total_eq=1850.0)  # 54 away: well clear
+    clock.advance(60)
+    monitor.poll_once()
+    okx.state = make_state([bracket(3828.0)], total_eq=1850.0)
+    clock.advance(60)
+    monitor.poll_once()
+    assert len(kinds(events, "near_stop")) == 2
+
+    okx.state = make_state([bracket(3828.0, sl=3826.0)], total_eq=1850.0)  # he moved the stop up: a new stop
+    clock.advance(60)
+    monitor.poll_once()
+    assert len(kinds(events, "near_stop")) == 3
+
+
+def test_coming_close_to_the_take_profit_says_what_it_would_make():
+    monitor, okx, events, clock, _, _ = watch(bracket(3900.0))
+    monitor.poll_once()
+    okx.state = make_state([bracket(3925.0)], total_eq=1850.0)
+    clock.advance(60)
+    monitor.poll_once()
+    [near] = kinds(events, "near_tp")
+    assert near.title == "快到止盈：XAU-USDT-SWAP 多单"
+    assert near.private_lines == (
+        "标记价 3,925.00，离止盈 3,938.00 还有 13.00（0.14 天的正常波幅）",
+        "到止盈的话，按开仓均价 3,845.00 算这一单赚约 930.00 USDT（占权益 50.3%）",
+    )
+
+
+def test_a_stop_set_or_moved_is_priced_once_with_the_change():
+    monitor, okx, events, clock, _, _ = watch(bracket(3873.0), alert_stop_risk_pct=25.0)
+    monitor.poll_once()
+    okx.state = make_state([bracket(3873.0, sl=3800.0)], total_eq=1850.0)
+    clock.advance(60)
+    monitor.poll_once()
+    [change] = kinds(events, "stop_changed")
+    assert change.private_lines[-1] == (
+        "止损 3,800.00 触发时比现在少约 730.00 USDT，占权益 39.5%；止损离标记价 0.8 天的正常波幅。"
+        "超过了你定的单笔风险：权益的 25%。按开仓均价算，这一单在止损处亏约 450.00 USDT"
+    )
+    assert change.public_lines == ("止损 3,816.00 变为 3,800.00",)  # amounts stay out of the group
+    okx.state = make_state([bracket(3873.0, sl=3850.0)], total_eq=1850.0)  # moved into profit
+    clock.advance(60)
+    monitor.poll_once()
+    assert kinds(events, "stop_changed")[1].private_lines[-1].endswith("这一单在止损处赚约 50.00 USDT")
+    assert "超过了" not in kinds(events, "stop_changed")[1].private_lines[-1]
+
+
+def test_a_funding_of_nothing_is_not_a_line():
+    assert funding_line(account(gold(), funding=(0.0, 8.0)).positions[0]) == ""
+    assert funding_line(account(gold()).positions[0]).startswith("资金费 (funding) 本期 +0.0070%")
+
+
+def test_the_startup_card_is_short():
+    from .test_service_reports import build
+
+    reporter, feishu, *_ = build()
+    reporter.send_startup()
+    [sent] = feishu.sent
+    assert "保证金率" not in sent.body and "资金费" not in sent.body
+    assert "- XAU-USDT-SWAP 多单 " in sent.body and "完整的账户和风险读数发“仓位”" in sent.body
