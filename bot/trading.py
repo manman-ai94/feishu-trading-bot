@@ -89,6 +89,7 @@ RESUME_WORDS = ("恢复交易", "恢复下单", "/resumetrading")
 SETTINGS_WORDS = ("交易设置", "交易状态", "下单设置", "下单状态", "/trading")
 HELP_WORDS = ("交易帮助", "下单帮助", "怎么下单", "下单指令", "/tradehelp")
 ORDERS_WORDS = ("查挂单", "当前挂单", "当前委托", "挂单", "委托", "/orders")
+SELFTEST_WORDS = ("模拟盘自测", "模拟自测", "下单自测", "自测下单", "/selftest")
 
 _TYPE_PREFIXES = (("市价", "market"), ("限价", "limit"), ("挂单", "limit"))
 _OPEN_VERBS = (
@@ -129,6 +130,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 每条指令我先回一张预览，你回复“确认 四位数”才执行，回复“取消”作废，过期也作废
 - “停止交易”：立刻不再接受开仓（平仓、撤单、改止损照常）。“恢复交易”解除
 - “交易设置”：看当前是模拟盘还是实盘、各项限额、这把 key 的权限
+- “模拟盘自测”：只在模拟盘。我用最小的数量把开仓、止盈止损、减仓、挂单、撤单、平仓各跑一遍，告诉你 OKX 每一步收没收
 - 限额和品种名单只能在服务器的 .env 里改，飞书里改不了。杠杆倍数请在 OKX 里设"""
 
 
@@ -139,7 +141,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 class Command:
     """What the owner asked for, as far as the words alone say it."""
 
-    kind: str  # open | close | cancel | stop | orders | pause | resume | settings | help | confirm | abort | unclear
+    kind: str  # open | close | cancel | stop | orders | pause | resume | settings | help | selftest | confirm | abort | unclear
     inst_id: str = ""
     direction: str = ""  # open: long | short | same (加仓). close: long | short | "" (whichever there is)
     ord_type: str = ""  # market | limit
@@ -217,10 +219,15 @@ class CommandParser:
             return Command("confirm", code=confirm.group(1) or "")
         for words, kind in (
             (ABORT_WORDS, "abort"), (PAUSE_WORDS, "pause"), (RESUME_WORDS, "resume"),
-            (SETTINGS_WORDS, "settings"), (HELP_WORDS, "help"),
+            (SETTINGS_WORDS, "settings"), (HELP_WORDS, "help"), (SELFTEST_WORDS, "selftest"),
         ):  # fmt: skip
             if lowered in words:
                 return Command(kind)
+        for word in SELFTEST_WORDS:
+            if lowered.startswith(word + " "):
+                rest, ids = self._without_instruments(text[len(word) :])
+                if len(ids) == 1 and not rest.strip():
+                    return Command("selftest", inst_id=ids[0])
         for word in ORDERS_WORDS:
             if lowered == word:
                 return Command("orders")
@@ -605,6 +612,13 @@ class TradeDesk:
     def is_command(self, text: str) -> bool:
         return self._parser.parse(text) is not None
 
+    def takes_long(self, text: str) -> bool:
+        """Whether answering this message takes a while: the confirmation that starts the demo rehearsal."""
+        command = self._parser.parse(text)
+        with self._lock:
+            pending = self._pending
+        return command is not None and command.kind == "confirm" and pending is not None and pending.command.kind == "selftest"
+
     # ------------------------------------------------------------------ entry
 
     def handle(self, text: str, private: bool = True) -> Reply | None:
@@ -643,6 +657,9 @@ class TradeDesk:
             return Reply(self._off_text())
         if kind == "unclear":
             return Reply(f"{command.note}\n没有执行任何操作。发“交易帮助”可以看全部写法。")
+        if kind == "selftest":
+            plan = self._selftest(command.inst_id).plan()
+            return self._ask_to_confirm(command, plan, "模拟盘自测 · 预览", "回复 **确认 {code}** 开始，回复“取消”作废。{seconds} 秒内有效。")
         action = _action(command)
         if action not in self._cfg.trade_actions:
             raise Refused(
@@ -650,14 +667,19 @@ class TradeDesk:
                 "要开放它，需要在服务器的 .env 里改 TRADE_ACTIONS，飞书里改不了。"
             )
         plan = self._plan(command)
+        return self._ask_to_confirm(
+            command, plan, f"下单预览 · {MODE_LABELS[self._mode]}",
+            "回复 **确认 {code}** 执行，回复“取消”作废。{seconds} 秒内有效，过期要重新发指令。",
+        )  # fmt: skip
+
+    def _ask_to_confirm(self, command: Command, plan: Plan, title: str, ending: str) -> Reply:
+        """Shows the owner what would be done and holds it until the code comes back."""
         code = self._new_code()
         seconds = self._cfg.trade_confirm_seconds
         with self._lock:
             self._pending = _Pending(code, self._clock() + seconds, command, plan)
-        body = [f"**{plan.title}**", *(f"- {line}" for line in plan.lines), ""]
-        body.append(f"回复 **确认 {code}** 执行，回复“取消”作废。{seconds} 秒内有效，过期要重新发指令。")
-        live = self._mode == "live"
-        return Reply("\n".join(body), title=f"下单预览 · {MODE_LABELS[self._mode]}", template="red" if live else "orange")
+        body = [f"**{plan.title}**", *(f"- {line}" for line in plan.lines), "", ending.format(code=code, seconds=seconds)]
+        return Reply("\n".join(body), title=title, template="red" if self._mode == "live" else "orange")
 
     # ----------------------------------------------------------- confirmation
 
@@ -679,11 +701,21 @@ class TradeDesk:
                 return Reply("确认码不对，没有执行。请核对预览卡片上的四位数。")
             self._pending = None  # a code works once
         with self._sending:
+            if pending.command.kind == "selftest":
+                try:
+                    return self._selftest(pending.command.inst_id).run()
+                except Refused as exc:
+                    return Reply(f"没有执行。{exc}")
             try:
                 plan = self._plan(pending.command, previous=pending.plan)
             except Refused as exc:
                 return Reply(f"没有执行。{exc}")
             return self._execute(plan)
+
+    def _selftest(self, inst_id: str = ""):
+        from .selftest import SelfTest  # imported here because that module is built on this one
+
+        return SelfTest(self, inst_id)
 
     def _abort(self) -> Reply:
         with self._lock:
@@ -784,6 +816,7 @@ class TradeDesk:
                 lines.append(f"- 账户模式：{account.level_name}")
         if self._mode != "off":
             lines.extend(self._funds_lines())
+        lines.append(f"**模拟盘自测**：{self._selftest().last_text()}")
         lines.append("限额、品种名单和开放哪些操作只能在服务器的 .env 里改，飞书里改不了。")
         return lines
 
@@ -1338,6 +1371,13 @@ class TradeDesk:
 
     def _execute(self, plan: Plan) -> Reply:
         """Sends the steps of a confirmed plan and reports, truthfully, what happened."""
+        _, heading, template, lines = self._carry_out(plan)
+        body = "\n".join([f"**{plan.title}**", *(f"- {line}" for line in lines)])
+        return Reply(body, title=f"{heading} · {MODE_LABELS[self._mode]}", template=template)
+
+    def _carry_out(self, plan: Plan, in_diary: bool = True) -> tuple[str, str, str, list[str]]:
+        """Sends the steps and keeps the record. Returns (ok | rejected | partial | unknown, heading, colour, lines).
+        Every plan goes into the order record; `in_diary` says whether it is also a line of the day's events."""
         lines: list[str] = []
         done = failed = 0
         unknown = False
@@ -1367,17 +1407,16 @@ class TradeDesk:
             lines.append("**注意：原来的止盈止损已经撤掉，新的没有挂上。现在这个仓位没有止盈止损，请马上重新设一次。**")
         if result in ("unknown", "partial"):
             lines.append("请发“仓位”和“挂单”核对实际情况。我不会自动重试。")
-        mode = MODE_LABELS[self._mode]
         now = self._clock()
         self._journal.record_order(
             self._mode, plan.action, plan.title, result, plan.inst_id,
             request=[{"call": step.call, **step.args} for step in plan.steps], detail="\n".join(lines), ts=now,
         )  # fmt: skip
-        tag = "[模拟盘] " if self._mode == "demo" else ""
-        self._journal.record_event("trade", f"{tag}{plan.title}：{heading}", plan.inst_id, ts=now)
+        if in_diary:
+            tag = "[模拟盘] " if self._mode == "demo" else ""
+            self._journal.record_event("trade", f"{tag}{plan.title}：{heading}", plan.inst_id, ts=now)
         log.info("order (%s) %s %s: %s", self._mode, plan.action, plan.inst_id or "-", result)
-        body = "\n".join([f"**{plan.title}**", *(f"- {line}" for line in lines)])
-        return Reply(body, title=f"{heading} · {mode}", template=template)
+        return result, heading, template, lines
 
     def _run(self, step: Step) -> list[str]:
         args = dict(step.args)

@@ -541,6 +541,24 @@ def test_the_owner_places_an_order_from_the_private_chat():
     assert bench.analyst.calls == []  # the AI never sees an order, let alone decides one
 
 
+def test_the_demo_rehearsal_shows_that_it_is_running():
+    from .test_selftest import Demo
+
+    bench = Bench(exchange=Demo(), **TRADING)
+    preview = bench.say("模拟盘自测")[0]
+    assert preview.title == "模拟盘自测 · 预览" and bench.feishu.reactions == []  # a preview is quick: no sign
+    done = bench.say("确认 4821")[0]
+    assert done.title == "模拟盘自测 · 通过"
+    assert [(what, mark) for what, _, mark in bench.feishu.reactions] == [("added", "Typing"), ("removed", "r1")]
+    assert bench.timers[-1]["cancelled"] is True  # the "still running" line was never needed
+    assert bench.analyst.calls == []
+
+    # An ordinary order gets no sign: it is answered before one could be seen.
+    bench.say("做多 XAU 100张")
+    bench.say("确认 4821")
+    assert len(bench.feishu.reactions) == 2
+
+
 def test_orders_are_not_taken_in_the_group_even_from_the_owner():
     bench = Bench(exchange=FakeExchange(), **TRADING)
     reply = bench.say("做多 XAU 100张", private=False)[0]

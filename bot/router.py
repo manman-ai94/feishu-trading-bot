@@ -69,6 +69,7 @@ SLOW_SECONDS = 90  # with the emoji showing, words are sent only when an answer 
 SLOW_SECONDS_NO_SIGN = 30  # when Feishu would not take the emoji, the wait is acknowledged sooner
 SLOW_TEXT = "这个问题要查的东西多一些，还要一会儿。"
 SLOW_TEXT_DEEP = "深度分析还在做，再等一两分钟。"
+SLOW_TEXT_SELFTEST = "自测还在跑，每一步都要等 OKX 回话，再等一会儿。"
 PLAIN_ANSWER_CHARS = 200  # an answer up to this long, without markdown, is sent as an ordinary message
 PLAIN_ANSWER_LINES = 4
 TITLE_CHARS = 30
@@ -262,7 +263,13 @@ class Router:
         """Order commands: the trade desk reads them by fixed patterns, never the AI."""
         if self._trade is None:
             return False
-        reply = self._trade.handle(text, private=message.is_private)
+        # An order answers in a second or two. Only the rehearsal on the demo account takes long enough for a sign.
+        done = self._show_working(message, slow_text=SLOW_TEXT_SELFTEST) if message.is_private and self._trade.takes_long(text) else None
+        try:
+            reply = self._trade.handle(text, private=message.is_private)
+        finally:
+            if done is not None:
+                done()
         if reply is None:
             return False
         if reply.title:
@@ -494,7 +501,7 @@ class Router:
             title = ("深度分析" if deep else "行情分析") + (f" · {'、'.join(named)}" if named else "")
         self._feishu.reply_markdown(message.message_id, title, body, "indigo", footer=footer)
 
-    def _show_working(self, message: IncomingMessage, deep: bool) -> Callable[[], None]:
+    def _show_working(self, message: IncomingMessage, deep: bool = False, slow_text: str = "") -> Callable[[], None]:
         """Shows that an answer is on its way, and returns what to call when it is there.
 
         The sign is an emoji on the question. Words follow only when the answer
@@ -507,7 +514,7 @@ class Router:
             log.info("the working emoji could not be put on the question: %s", exc)
         cancel = self._later(
             SLOW_SECONDS if reaction_id else SLOW_SECONDS_NO_SIGN,
-            lambda: self._try_reply(message, SLOW_TEXT_DEEP if deep else SLOW_TEXT),
+            lambda: self._try_reply(message, slow_text or (SLOW_TEXT_DEEP if deep else SLOW_TEXT)),
         )
 
         def done() -> None:
