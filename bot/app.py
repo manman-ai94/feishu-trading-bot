@@ -13,6 +13,7 @@ from pathlib import Path
 from .analyst import Analyst, Usage
 from .config import Config
 from .crowd import Crowd
+from .risk import RiskGauge
 from .envfile import write_env_values
 from .feishu_client import FeishuClient, IncomingMessage
 from .instruments import InstrumentResolver
@@ -134,8 +135,9 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     crowd = build_crowd(cfg, okx)
     analyst, resolver, knowledge = build_ai(cfg, okx, journal, crowd)
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
-    reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd)
-    monitor = Monitor(okx, cfg, journal, reporter.notify_event)
+    gauge = RiskGauge(okx)
+    reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, gauge=gauge)
+    monitor = Monitor(okx, cfg, journal, reporter.notify_event, gauge=gauge)
     reporter.monitor = monitor
 
     bot_open_id = None
@@ -178,6 +180,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
             "morning": lambda: reporter.send_brief("morning"),
             "evening": lambda: reporter.send_brief("evening"),
             "weekly": reporter.send_weekly_review,
+            "weekend": reporter.send_weekend_check,
         },
     )
     threading.Thread(target=scheduler.run_forever, args=(stop,), name="scheduler", daemon=True).start()

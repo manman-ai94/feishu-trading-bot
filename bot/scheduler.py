@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from .config import Config
@@ -15,6 +15,7 @@ from .journal import Journal
 log = logging.getLogger(__name__)
 
 GRACE = timedelta(minutes=90)  # a job missed by more than this is skipped, not sent late
+WEEKEND_CHECK_UTC = (4, 21)  # Friday 21:00 UTC: an hour before spot gold closes for the weekend
 
 
 def scheduled_jobs(cfg: Config, now_local: datetime) -> list[tuple[str, datetime]]:
@@ -30,6 +31,10 @@ def scheduled_jobs(cfg: Config, now_local: datetime) -> list[tuple[str, datetime
         jobs.append(("evening", at(cfg.brief_evening)))
     if cfg.weekly_review is not None and now_local.weekday() == cfg.weekly_review[0]:
         jobs.append(("weekly", at(cfg.weekly_review[1])))
+    now_utc = now_local.astimezone(timezone.utc)
+    if cfg.weekend_check and now_utc.weekday() == WEEKEND_CHECK_UTC[0]:
+        friday = now_utc.replace(hour=WEEKEND_CHECK_UTC[1], minute=0, second=0, microsecond=0)
+        jobs.append(("weekend", friday.astimezone(now_local.tzinfo)))
     return jobs
 
 

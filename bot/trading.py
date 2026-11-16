@@ -63,14 +63,23 @@ _CONFIRM = re.compile(r"(?:/confirm|确认|确定)\s*(\d{1,8})?")
 _POLITE = re.compile(r"^(?:请|麻烦|帮我|给我|帮忙)+\s*")
 _LATIN = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[-/][A-Za-z0-9]+){0,2}")
 _NOT_INSTRUMENTS = {"u", "usdt", "usdc", "usd", "sl", "tp", "oz", "all"}
-_JOIN = r"(?:价格|价|设在|设为|设到|改到|改为|改成|移到|在|到|为|:|=)?"
+_JOIN = (
+    r"(?:价格|价|设置在|设置为|设置到|设在|设为|设到|修改为|修改到|修改成|改到|改为|改成|调整到|调整为|调整成|调到|调为|调成"
+    r"|上移到|下移到|上移|下移|移动到|移到|移至|挪到|放到|放在|挂在|挂到|在|到|为|:|=)?"
+)
 _SL = re.compile(rf"(?:止损|(?<![a-z0-9])sl)\s*{_JOIN}\s*({NUM})", re.I)
 _TP = re.compile(rf"(?:止盈|(?<![a-z0-9])tp)\s*{_JOIN}\s*({NUM})", re.I)
 _PX = re.compile(rf"(?:限价|价格|价位|挂在|挂到|挂|在|@)\s*[:=]?\s*({NUM})")
 _BARE_NUMBER = re.compile(NUM)
 _THOUSANDS = re.compile(r"\d,\d{3}(?!\d)")
 _FILLER = re.compile(r"的仓位|仓位|的单子|单子|开仓|数量|现价|永续|合约|的|仓|单")
-_STOP_START = re.compile(r"^(?:设置|设|修改|改|移动|调整)?\s*(?=止损|止盈)|^/(?=sl|tp)", re.I)
+_STOP_VERB = r"(?:设置|修改|移动|调整|设|改|移|调|挪)(?:一下)?"
+_STOP_START = re.compile(rf"^(?:{_STOP_VERB})?\s*(?=止损|止盈)|^/(?=sl|tp)", re.I)
+_STOP_VERB_START = re.compile(rf"^{_STOP_VERB}\s*")
+# "把我的止损调到 3800": the words people put in front of a stop-loss when they talk.
+_STOP_LEAD = re.compile(r"^(?:(?:请|麻烦|帮我|给我|帮忙|把|将|我的)\s*)+")
+_BA = re.compile(r"(?:^|\s)(?:把|将)")  # "把止损……" is a request; "我的止损被扫了" is not
+_REMOVE_WORDS = ("撤掉", "撤销", "撤了", "取消", "去掉", "删掉", "删除")
 _FRACTION_WORDS = (("一半", Decimal("0.5")), ("半仓", Decimal("0.5")), ("三分之一", Decimal(1) / 3), ("四分之一", Decimal("0.25")))
 _EVERYTHING_WORDS = ("全部", "所有", "全平")
 
@@ -90,6 +99,9 @@ SETTINGS_WORDS = ("交易设置", "交易状态", "下单设置", "下单状态"
 HELP_WORDS = ("交易帮助", "下单帮助", "怎么下单", "下单指令", "/tradehelp")
 ORDERS_WORDS = ("查挂单", "当前挂单", "当前委托", "挂单", "委托", "/orders")
 SELFTEST_WORDS = ("模拟盘自测", "模拟自测", "下单自测", "自测下单", "/selftest")
+SIZE_WORDS = ("算仓位", "仓位计算", "计算仓位", "算手数", "/size")
+_ENTRY = re.compile(rf"(?:入场价|入场|进场价|进场|开仓价|开在|价格)\s*{_JOIN}\s*({NUM})")
+SIZE_HELP = "算仓位要写品种和止损价，入场价不写就按现价：算仓位 XAU 止损 3768，或 算仓位 XAU 入场 3873 止损 3768。"
 
 _TYPE_PREFIXES = (("市价", "market"), ("限价", "limit"), ("挂单", "limit"))
 _OPEN_VERBS = (
@@ -106,6 +118,8 @@ _CLEAR_STOP_VERBS = (
     ("取消止盈止损", True, True), ("取消止损止盈", True, True), ("撤销止盈止损", True, True), ("撤销止损止盈", True, True),
     ("取消止损", True, False), ("撤销止损", True, False), ("取消止盈", False, True), ("撤销止盈", False, True),
 )  # fmt: skip
+
+STOP_PRICE_MISSING = "要写价格，例如：止损 XAU 3860、把止损调到 3860，或 止损 XAU 3860 止盈 3950。"
 
 HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 市价：“做多 XAU 100张”“做空 BTC 0.01个”“做多 XAU 500U”
@@ -124,7 +138,15 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 
 **止盈止损**（对整个仓位）
 - “止损 XAU 3860”“止盈 XAU 3950”“止损 XAU 3860 止盈 3950”
-- “取消止损 XAU”“取消止盈 XAU”“取消止盈止损 XAU”
+- 也可以像平时说话：“把止损调到 3860”“把 XAU 的止盈改成 3950”
+- “取消止损 XAU”“取消止盈 XAU”“取消止盈止损 XAU”“把止损撤掉”
+
+**算仓位**（只算数，不下单）
+- “算仓位 XAU 止损 3768”按现价算；“算仓位 XAU 入场 3873 止损 3768”
+- 按你定的单笔风险（RISK_PER_TRADE_PCT，现在默认权益的 1%）算最多开多大
+
+**在群里**
+- 你本人在登记过的群里 @我 发这些指令，和私聊一样执行；回确认码也要 @我。群里其他人发的不执行
 
 **安全**
 - 每条指令我先回一张预览，你回复“确认 四位数”才执行，回复“取消”作废，过期也作废
@@ -240,6 +262,10 @@ class CommandParser:
     # ------------------------------------------------------------------ orders
 
     def _order(self, text: str) -> Command | None:
+        lowered = text.lower()
+        for word in SIZE_WORDS:
+            if lowered.startswith(word):
+                return self._sizing(text[len(word) :])
         ord_type = ""
         for word, kind in _TYPE_PREFIXES:
             if text.startswith(word):
@@ -253,8 +279,9 @@ class CommandParser:
             for word in _CANCEL_VERBS:
                 if lowered.startswith(word):
                     return self._cancel(text[len(word) :])
-            if _STOP_START.match(text):
-                return self._stops(_STOP_START.sub("", text, count=1))
+            stops = self._stops_said(text)
+            if stops is not None:
+                return stops
         for word, direction, forced in _OPEN_VERBS:
             if lowered.startswith(word):
                 return self._open(direction, forced or ord_type, text[len(word) :])
@@ -370,12 +397,50 @@ class CommandParser:
             return None
         raise _Unclear("撤哪张单没看懂。可以发：撤单 XAU、撤单 全部，或 撤单 订单号。")
 
-    def _stops(self, text: str) -> Command | None:
+    def _sizing(self, rest: str) -> Command:
+        """算仓位: arithmetic on the owner's own prices. Nothing is sent anywhere."""
+        work, ids = self._without_instruments(rest)
+        sl, work = _take(_SL, work, "止损价")
+        entry, work = _take(_ENTRY, work, "入场价")
+        leftover = _FILLER.sub(" ", work).strip()
+        if entry is None and leftover and _BARE_NUMBER.fullmatch(leftover):
+            entry, leftover = Decimal(leftover), ""
+        if leftover or sl is None:
+            raise _Unclear(SIZE_HELP)
+        return Command("size", inst_id=self._single(ids, required=True), px=entry, sl=sl)
+
+    def _stops_said(self, text: str) -> Command | None:
+        """A stop-loss or take-profit command, in the plain form or the way people say it:
+        "止损 XAU 3800", "把止损调到 3800", "调整一下我的止损", "把 XAU 的止损改成 3800"."""
+        if _STOP_START.match(text):
+            asked = bool(_STOP_VERB_START.match(text))
+            return self._stops(_STOP_START.sub("", text, count=1), asked=asked)
+        lead = _STOP_LEAD.match(text)
+        rest = text[lead.end() :] if lead else text
+        verb = _STOP_VERB_START.match(rest)
+        if verb:
+            rest = _STOP_LEAD.sub("", rest[verb.end() :])
+        probe, ids = self._without_instruments(rest)
+        probe = probe.strip().lstrip("的").strip()
+        asked = bool(verb) or bool(lead and _BA.search(lead.group(0)))
+        if not asked or not probe.startswith(("止损", "止盈")):
+            return None
+        if not re.search(r"\d", probe) and any(word in probe for word in _REMOVE_WORDS):
+            # "把止损撤掉": the same as 取消止损.
+            named = probe.split(next(word for word in _REMOVE_WORDS if word in probe))[0]
+            return Command(
+                "stop", inst_id=self._single(ids, required=False), clear_sl="止损" in named, clear_tp="止盈" in named
+            )
+        return self._stops(rest, asked=True)
+
+    def _stops(self, text: str, asked: bool = False) -> Command | None:
+        """`asked`: the message was put as a request ("调整一下止损"), so without a price it is
+        still a command, one that needs the price, and not talk about stops."""
         work, ids = self._without_instruments(text)
         if not re.search(r"\d", work):
             # "止损被扫了" is talk. "止损 XAU" is a command with the price left out.
-            if ids and len(text) <= 24:
-                raise _Unclear("要写价格，例如：止损 XAU 3860，或 止损 XAU 3860 止盈 3950。")
+            if (ids and len(text) <= 24) or (asked and len(text) <= 24):
+                raise _Unclear(STOP_PRICE_MISSING)
             return None
         sl, work = _take(_SL, work, "止损价")
         tp, work = _take(_TP, work, "止盈价")
@@ -621,15 +686,20 @@ class TradeDesk:
 
     # ------------------------------------------------------------------ entry
 
-    def handle(self, text: str, private: bool = True) -> Reply | None:
-        """Answers an order command. None when the message is not one."""
+    def handle(self, text: str, refused_here: str = "", in_group: bool = False) -> Reply | None:
+        """Answers an order command. None when the message is not one.
+
+        `refused_here` is what to say instead when commands are not carried out
+        where this one was sent. The router decides that: the owner's private
+        chat always, the registered group when GROUP_TRADING is on.
+        """
         command = self._parser.parse(text)
         if command is None:
             return None
-        if not private:
-            return Reply("下单、平仓、撤单这类指令请在私聊里发给我，群里不执行。")
+        if refused_here:
+            return Reply(refused_here)
         try:
-            return self._dispatch(command)
+            return self._dispatch(command, in_group)
         except Refused as exc:
             return Reply(str(exc))
         except OkxError as exc:
@@ -637,7 +707,7 @@ class TradeDesk:
         except OkxNetworkError:
             return Reply("现在连不上 OKX，没有执行任何操作。请稍后再试。")
 
-    def _dispatch(self, command: Command) -> Reply:
+    def _dispatch(self, command: Command, in_group: bool = False) -> Reply:
         kind = command.kind
         if kind == "help":
             return Reply(HELP_TEXT + f"\n\n现在的状态：{self._mode_line()}", title="下单指令", template="turquoise")
@@ -653,13 +723,18 @@ class TradeDesk:
             return self._confirm(command)
         if kind == "abort":
             return self._abort()
+        if kind == "size":
+            return self._size(command)
         if self._mode == "off":
             return Reply(self._off_text())
         if kind == "unclear":
-            return Reply(f"{command.note}\n没有执行任何操作。发“交易帮助”可以看全部写法。")
+            where_now = self._stops_now() if command.note == STOP_PRICE_MISSING else ""
+            return Reply(f"{command.note}{where_now}\n没有执行任何操作。发“交易帮助”可以看全部写法。")
         if kind == "selftest":
             plan = self._selftest(command.inst_id).plan()
-            return self._ask_to_confirm(command, plan, "模拟盘自测 · 预览", "回复 **确认 {code}** 开始，回复“取消”作废。{seconds} 秒内有效。")
+            return self._ask_to_confirm(
+                command, plan, "模拟盘自测 · 预览", "回复 **确认 {code}** 开始，回复“取消”作废。{seconds} 秒内有效。", in_group
+            )
         action = _action(command)
         if action not in self._cfg.trade_actions:
             raise Refused(
@@ -669,16 +744,19 @@ class TradeDesk:
         plan = self._plan(command)
         return self._ask_to_confirm(
             command, plan, f"下单预览 · {MODE_LABELS[self._mode]}",
-            "回复 **确认 {code}** 执行，回复“取消”作废。{seconds} 秒内有效，过期要重新发指令。",
+            "回复 **确认 {code}** 执行，回复“取消”作废。{seconds} 秒内有效，过期要重新发指令。", in_group,
         )  # fmt: skip
 
-    def _ask_to_confirm(self, command: Command, plan: Plan, title: str, ending: str) -> Reply:
+    def _ask_to_confirm(self, command: Command, plan: Plan, title: str, ending: str, in_group: bool = False) -> Reply:
         """Shows the owner what would be done and holds it until the code comes back."""
         code = self._new_code()
         seconds = self._cfg.trade_confirm_seconds
         with self._lock:
             self._pending = _Pending(code, self._clock() + seconds, command, plan)
-        body = [f"**{plan.title}**", *(f"- {line}" for line in plan.lines), "", ending.format(code=code, seconds=seconds)]
+        ending = ending.format(code=code, seconds=seconds)
+        if in_group:
+            ending += "在群里回复要先 @我；只有你本人回的确认码有效。"
+        body = [f"**{plan.title}**", *(f"- {line}" for line in plan.lines), "", ending]
         return Reply("\n".join(body), title=title, template="red" if self._mode == "live" else "orange")
 
     # ----------------------------------------------------------- confirmation
@@ -786,6 +864,16 @@ class TradeDesk:
         else:
             lines.append("**开放的操作**：全部（止盈止损、平仓、撤单、限价挂单、市价开仓）")
         lines.append(f"**允许下单的品种**：{'、'.join(cfg.tradable_instruments)}")
+        if not cfg.group_trading:
+            group = "不执行，只在私聊里执行（GROUP_TRADING=false）"
+        elif not cfg.group_chat_id:
+            group = "还没有登记群，现在只在私聊里执行"
+        elif not cfg.group_show_pnl:
+            group = "不执行，因为群里不显示账户（GROUP_SHOW_PNL=false）"
+        else:
+            group = "你本人在登记的群里 @我 发的指令也执行，别人发的不执行"
+        lines.append(f"**群里**：{group}")
+        lines.append(f"**单笔风险**：权益的 {cfg.risk_per_trade_pct:g}%（“算仓位”按它算）")
         lines.append("**限额**")
         lines.append(f"- 单笔上限 {cfg.trade_max_order_usd:,.0f} USDT（名义价值）")
         lines.append(f"- 单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f} USDT（含没成交的挂单）")
@@ -863,6 +951,85 @@ class TradeDesk:
                     tp = "无" if stop.tp_trigger_px is None else self._price(stop.tp_trigger_px, spec)
                     lines.append(f"- {position.inst_id} {_side_word(position.direction)}单：止损 {sl}，止盈 {tp}")
         return Reply("\n".join(lines), title=f"当前挂单 · {self._account_label()}", template="wathet")
+
+    def _size(self, cmd: Command) -> Reply:
+        """How big a position may be so that its stop costs the owner's share of the equity (RISK_PER_TRADE_PCT)."""
+        spec = self._spec_or_none(cmd.inst_id)
+        if spec is None:
+            raise Refused(f"读不到 {cmd.inst_id} 的合约规格，算不了。")
+        if spec.ct_type and spec.ct_type != "linear":
+            raise Refused("算仓位目前只算 USDT 本位合约。")
+        state = self._okx.account_state()
+        equity = _dec(state.snapshot.total_eq or 0)
+        if equity <= 0:
+            raise Refused("读不到账户权益，算不了。")
+        last = _dec(self._okx.ticker(cmd.inst_id).last)
+        entry = cmd.px if cmd.px is not None else last
+        gap = abs(entry - cmd.sl)
+        if gap == 0:
+            raise Refused("止损价和入场价一样，算不了。")
+        long = cmd.sl < entry
+        base = cmd.inst_id.split("-")[0]
+        settle = spec.settle_ccy or "USDT"
+        pct = _dec(self._cfg.risk_per_trade_pct)
+        budget = equity * pct / 100
+        per_contract = spec.coins_per_contract
+        contracts = _floor_to(budget / gap / per_contract, spec.lot_sz)
+        lines = [
+            f"按你定的单笔风险 {float(pct):g}%：权益 {_amt(equity)} USD，这一笔止损触发时最多亏 {_amt(budget)} {settle}",
+            f"{_side_word('long' if long else 'short')}单，入场 {_px(entry, spec)}{'（现价）' if cmd.px is None else ''}，"
+            f"止损 {_px(cmd.sl, spec)}，相差 {_plain(gap)}（{gap / entry * 100:.2f}%），每 1 {base} 亏 {_plain(gap)} {settle}",
+        ]
+        if contracts < spec.min_sz or contracts <= 0:
+            least = spec.min_sz * per_contract * gap
+            lines.append(
+                f"按这个止损，最小的 {_plain(spec.min_sz)} 张也会亏约 {_amt(least)} {settle}，"
+                f"占权益 {least / equity * 100:.2f}%，超过了 {float(pct):g}%。止损要更近，或者这笔不做。"
+            )
+        else:
+            coins = contracts * per_contract
+            notional = coins * entry
+            lines.append(
+                f"最多 {_contracts_text(contracts, spec)}，名义价值约 {_amt(notional)} {settle}，"
+                f"实际杠杆 {notional / equity:.2f} 倍，止损触发亏约 {_amt(coins * gap)} {settle}"
+            )
+            held = [p for p in state.positions if p.inst_id == cmd.inst_id and p.direction == ("long" if long else "short")]
+            if held and held[0].lever:
+                margin = notional / _dec(held[0].lever)
+                lines.append(f"按你现在 {held[0].lever:g} 倍的杠杆设置，占用保证金约 {_amt(margin)} {settle}")
+                if margin > equity:
+                    lines.append("保证金超过了账户权益，这么大开不出来")
+            if notional > _dec(self._cfg.trade_max_order_usd):
+                lines.append(f"超过了单笔上限 {_amt(_dec(self._cfg.trade_max_order_usd))} USDT，要分几次开")
+        for position in state.positions:
+            if position.inst_id != cmd.inst_id or position.direction != ("long" if long else "short"):
+                continue
+            coins_held = _dec(position.qty) * per_contract
+            cost = coins_held * gap
+            lines.append(
+                f"你现在的{_side_word(position.direction)}单 {_plain(coins_held)} {base}，按同样的止损距离要亏约 {_amt(cost)} {settle}，"
+                f"占权益 {cost / equity * 100:.1f}%"
+            )
+        lines.append("这是按你给的价格和你自己的规则算出的数，不是开仓建议。")
+        return Reply("\n".join(f"- {line}" for line in lines), title=f"算仓位 · {cmd.inst_id}", template="wathet")
+
+    def _stops_now(self) -> str:
+        """Where each position's stop-loss and take-profit are now, so the owner can pick the new price."""
+        try:
+            positions = self._okx.account_state().positions
+        except (OkxError, OkxNetworkError):
+            return ""
+        lines = []
+        for position in positions:
+            spec = self._spec_or_none(position.inst_id)
+            sl = next((stop.sl_trigger_px for stop in position.stops if stop.sl_trigger_px is not None), None)
+            tp = next((stop.tp_trigger_px for stop in position.stops if stop.tp_trigger_px is not None), None)
+            mark = f"，标记价 {self._price(position.mark_px, spec)}" if position.mark_px else ""
+            lines.append(
+                f"- {position.inst_id} {_side_word(position.direction)}单{mark}："
+                f"止损 {'没有' if sl is None else self._price(sl, spec)}，止盈 {'没有' if tp is None else self._price(tp, spec)}"
+            )
+        return ("\n现在：\n" + "\n".join(lines)) if lines else "\n现在没有持仓。"
 
     def _order_line(self, order: OrderInfo) -> str:
         spec = self._spec_or_none(order.inst_id)

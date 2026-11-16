@@ -349,8 +349,11 @@ def test_the_reminder_says_how_to_set_one_only_when_that_would_reach_this_accoun
         monitor.poll_once()
         return "\n".join(events[0].private_lines)
 
-    hint = "私聊发“止损 XAU 价格”"
-    assert hint in text(trading="live")
+    hint = "发“止损 XAU 价格”"
+    assert "私聊或在群里 @我发“止损 XAU 价格”，我先回预览，你回确认码才执行" in text(trading="live")
+    assert "要动手的话，私聊发“止损 XAU 价格”" in text(trading="live", group_trading=False)
+    assert "要动手的话，私聊发“止损 XAU 价格”" in text(trading="live", group_show_pnl=False)
+    assert "平仓" not in text(trading="live")  # for a missing stop, the stop is the answer
     assert hint not in text(trading="live", trade_actions=("close",))
     assert hint not in text(trading="demo")  # an order would go to the demo account, not to this position
     assert hint not in text()

@@ -188,6 +188,18 @@ class OkxClient:
         data = self._get("/api/v5/public/funding-rate", {"instId": inst_id})
         return to_float(data[0].get("fundingRate")) if data else None
 
+    def funding(self, inst_id: str) -> tuple[float, float] | None:
+        """(the rate of the current funding period, the length of a period in hours). None when OKX has none."""
+        data = self._get("/api/v5/public/funding-rate", {"instId": inst_id})
+        if not data:
+            return None
+        rate = to_float(data[0].get("fundingRate"))
+        if rate is None:
+            return None
+        this, following = to_float(data[0].get("fundingTime")), to_float(data[0].get("nextFundingTime"))
+        hours = (following - this) / 3_600_000 if this and following and following > this else 8.0
+        return rate, hours
+
     def instruments(self, inst_type: str) -> list[dict]:
         """Every instrument of one type (SPOT, SWAP, ...), as OKX lists them."""
         return self._get("/api/v5/public/instruments", {"instType": inst_type})

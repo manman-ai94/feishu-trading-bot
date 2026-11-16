@@ -114,9 +114,9 @@ def test_the_preview_says_what_will_happen_and_sends_nothing():
     assert bench.sent == []
 
 
-def test_it_is_not_run_from_the_group():
+def test_it_is_not_run_where_orders_are_not_taken():
     bench = Bench(Demo())
-    assert "私聊" in bench.say("模拟盘自测", private=False).text
+    assert bench.say("模拟盘自测", refused_here="请在私聊里发给我。").text == "请在私聊里发给我。"
     assert bench.sent == []
 
 

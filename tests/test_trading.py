@@ -220,8 +220,8 @@ class Bench:
             new_code=lambda: next(self.codes), new_id=lambda: next(self.ids), day_change=day_change,
         )  # fmt: skip
 
-    def say(self, text: str, private: bool = True):
-        return self.desk.handle(text, private=private)
+    def say(self, text: str, refused_here: str = ""):
+        return self.desk.handle(text, refused_here=refused_here)
 
     def run(self, text: str, code: str = "1111"):
         """Sends a command and confirms it."""
@@ -298,6 +298,17 @@ def parser(instruments=(XAU, BTC)) -> CommandParser:
         ("取消止损 XAU", Command("stop", XAU, clear_sl=True)),
         ("取消止盈", Command("stop", clear_tp=True)),
         ("取消止盈止损 XAU", Command("stop", XAU, clear_sl=True, clear_tp=True)),
+        # The way people say it in a chat.
+        ("把止损调到 3860", Command("stop", sl=Decimal(3860))),
+        ("帮我把 XAU 的止损改成 3860", Command("stop", XAU, sl=Decimal(3860))),
+        ("调整一下我的止损，放到 3860", Command("stop", sl=Decimal(3860))),
+        ("把XAU止损挪到3860", Command("stop", XAU, sl=Decimal(3860))),
+        ("止损上移到 3860", Command("stop", sl=Decimal(3860))),
+        ("止损调整到 3860 止盈调到 3950", Command("stop", sl=Decimal(3860), tp=Decimal(3950))),
+        ("请把止盈设置为 3950", Command("stop", tp=Decimal(3950))),
+        ("改一下止盈 3950", Command("stop", tp=Decimal(3950))),
+        ("把止损撤掉", Command("stop", clear_sl=True)),
+        ("把 XAU 的止盈止损都取消", Command("stop", XAU, clear_sl=True, clear_tp=True)),
         ("确认 1234", Command("confirm", code="1234")),
         ("确认1234", Command("confirm", code="1234")),
         ("确认", Command("confirm")),
@@ -323,7 +334,13 @@ def test_commands_are_read_exactly(text, expected):
         "要不要做多 XAU 100张",
         "做多还是做空 XAU 100张",
         "止损被扫了",
+        "我的止损被扫了",
+        "我把止损设在3860了",
+        "我今天止损了两次",
+        "帮我看看止损",
+        "止损太近了",
         "止损放在 3860 合适吗",
+        "把止损调到哪里比较好",
         "平仓以后价格又涨回去了真是太可惜了",
         "挂单多不多",
         "今天做多 XAU 100张",  # the verb is not at the start
@@ -409,12 +426,21 @@ def test_a_blocked_setting_is_explained():
     assert "保持关闭" in bench.say("交易设置").text
 
 
-def test_orders_are_never_taken_in_a_group():
+def test_the_settings_say_where_orders_are_taken_and_the_risk_rule():
+    settings = Bench().say("交易设置").text
+    assert "**群里**：你本人在登记的群里 @我 发的指令也执行，别人发的不执行" in settings
+    assert "**单笔风险**：权益的 1%" in settings
+    assert "GROUP_TRADING=false" in Bench(group_trading=False).say("交易设置").text
+    assert "还没有登记群" in Bench(group_chat_id="").say("交易设置").text
+
+
+def test_where_orders_are_not_taken_the_desk_says_so_and_does_nothing():
     bench = Bench()
     for text in ("做多 XAU 100张", "确认 1111", "全部平仓"):
-        assert "私聊" in bench.say(text, private=False).text
+        assert bench.say(text, refused_here="请到私聊里发。").text == "请到私聊里发。"
     assert bench.sent == []
     assert bench.say("确认 1111").text == "现在没有等待确认的指令。"
+    assert bench.say("黄金现在怎么看", refused_here="请到私聊里发。") is None  # not an order: the rest of the bot answers
 
 
 def test_anything_that_is_not_an_order_is_left_to_the_rest_of_the_bot():
@@ -974,6 +1000,45 @@ def test_stop_loss_and_take_profit_in_one_go():
     assert bench.sent[0][1] == {
         "inst_id": XAU, "td_mode": "cross", "side": "buy", "sl_trigger_px": "3900", "tp_trigger_px": "3800", "cl_ord_id": "ftb0001",
     }  # fmt: skip
+
+
+def test_the_size_calculator_follows_the_owners_risk_rule_and_sends_nothing():
+    bench = Bench(FakeExchange([gold()]))
+    reply = bench.say("算仓位 XAU 入场 3873 止损 3768")
+    assert reply.title == "算仓位 · XAU-USDT-SWAP"
+    assert "按你定的单笔风险 1%：权益 2,000.00 USD，这一笔止损触发时最多亏 20.00 USDT" in reply.text
+    assert "多单，入场 3,873.0，止损 3,768.0，相差 105（2.71%）" in reply.text
+    assert "最多 190 张（合 0.19 XAU），名义价值约 735.87 USDT，实际杠杆 0.37 倍，止损触发亏约 19.95 USDT" in reply.text
+    assert "按你现在 100 倍的杠杆设置，占用保证金约 7.36 USDT" in reply.text
+    assert "你现在的多单 10 XAU，按同样的止损距离要亏约 1,050.00 USDT，占权益 52.5%" in reply.text
+    assert "不是开仓建议" in reply.text
+    assert "空单，入场 3,880.0（现价）" in bench.say("算仓位 XAU 止损 3990").text
+    assert bench.say("算仓位 XAU 3873 止损 3768").text == reply.text  # the entry may be written bare
+    assert "单笔风险 2%" in Bench(FakeExchange([gold()]), risk_per_trade_pct=2.0).say("算仓位 XAU 止损 3768").text
+    assert "超过了单笔上限 1,000.00 USDT" in bench.say("算仓位 XAU 止损 3870").text
+    assert bench.say("算仓位 XAU").text.startswith("算仓位要写品种和止损价")
+    assert "止损价和入场价一样" in bench.say("算仓位 XAU 入场 3800 止损 3800").text
+    assert bench.sent == []
+    off = Bench(FakeExchange([gold()]), trading="off")
+    assert off.say("算仓位 XAU 止损 3768").title == "算仓位 · XAU-USDT-SWAP"  # arithmetic, whatever the trading mode
+
+
+def test_a_stop_too_tight_for_even_the_smallest_size_is_said_so():
+    bench = Bench(FakeExchange([]))
+    text = bench.say("算仓位 XAU 止损 1000").text
+    assert "最小的 1 张也会亏约 2.88 USDT" not in text  # 1 lot of 0.001 XAU over 2,880 is 2.88: still under 20
+    bench = Bench(FakeExchange([]), risk_per_trade_pct=0.1)
+    assert "最小的 1 张也会亏约 2.88 USDT，占权益 0.14%，超过了 0.1%" in bench.say("算仓位 XAU 止损 1000").text
+
+
+def test_asked_to_move_a_stop_without_a_price_the_desk_shows_where_it_is_now():
+    bench = Bench(FakeExchange([gold(stops=(StopOrder("a1", 3700.0, None),))]))
+    for text in ("帮我调整一下止损", "调整一下我的止损", "把止损调高一点", "止损 XAU"):
+        reply = bench.say(text).text
+        assert reply.startswith("要写价格，例如：止损 XAU 3860、把止损调到 3860")
+        assert "XAU-USDT-SWAP 多单，标记价 3,880.8：止损 3,700.0，止盈 没有" in reply and "没有执行任何操作" in reply
+    assert bench.sent == []
+    assert "现在没有持仓" in Bench(FakeExchange([])).say("调整一下止损").text
 
 
 def test_moving_an_existing_stop_amends_it():

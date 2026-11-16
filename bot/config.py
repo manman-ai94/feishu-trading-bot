@@ -131,11 +131,20 @@ class Config:
     alert_daily_loss_usd: float | None = None
     alert_cooldown_minutes: int = 30
     alert_no_stop_minutes: float | None = 10.0  # a position this long without a stop-loss is pointed out
+    # Risk measured against the market's own movement (risk.py). () or None switches a line off.
+    alert_liq_atr: tuple[float, ...] = (3.0, 2.0, 1.0)  # liquidation closer than this many days of normal range
+    alert_leverage: tuple[float, ...] = ()  # positions worth more than this many times the equity; off by default
+    risk_per_trade_pct: float = 1.0  # the owner's rule: one trade may cost at most this share of the equity
+    alert_stop_risk_pct: float | None = 1.0  # a stop-loss that would cost more than this share; follows the rule above
+    weekend_check: bool = True  # on Friday evening (UTC), say what stands out in markets that close for the weekend
+    weekend_leverage: float | None = None  # off by default: the owner keeps 100x on the exchange and sizes by risk
+    weekend_stop_atr: float = 1.5
     brief_morning: time | None = time(6, 0)
     brief_evening: time | None = time(14, 0)
     weekly_review: tuple[int, time] | None = (6, time(17, 0))
     group_show_pnl: bool = True  # the group sees balances and PnL, and so does the AI when it answers there
     group_owner_only: bool = True  # in the group, only the owner's messages are answered
+    group_trading: bool = True  # the owner's order commands are carried out in the registered group too
     group_daily_question_limit: int = 30
     db_path: Path = Path("data/bot.db")
     log_dir: Path = Path("logs")
@@ -290,6 +299,23 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
             )
         trade_actions = tuple(action for action in TRADE_ACTIONS if action in asked)
 
+    def _levels(name: str, default: tuple[float, ...], rising: bool) -> tuple[float, ...]:
+        """A list of thresholds such as "3,2,1", mildest first. "off" gives none."""
+        raw = _get(name).replace("，", ",")
+        if not raw:
+            return default
+        if raw.lower() in OFF_WORDS:
+            return ()
+        try:
+            values = sorted({float(part) for part in raw.split(",") if part.strip()}, reverse=not rising)
+        except ValueError:
+            values = []
+        if not values or any(value <= 0 for value in values):
+            shown = ",".join(f"{value:g}" for value in default)
+            problems.append(f"{name} 要填用逗号隔开的正数，例如 {shown or '5,10'}，或者 off；现在按默认值算")
+            return default
+        return tuple(values)
+
     margin_mode = _get("TRADE_MARGIN_MODE", "cross").lower()
     if margin_mode not in MARGIN_MODES:
         problems.append(f"TRADE_MARGIN_MODE 只能填 cross（全仓）或 isolated（逐仓），现在是 {margin_mode!r}")
@@ -302,6 +328,11 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
                 problems.append(f"{name} 要填一个大于 0 的数，现在按默认值 {default:g} 算")
             return default
         return value
+
+    risk_per_trade_pct = _positive("RISK_PER_TRADE_PCT", 1.0)
+    if risk_per_trade_pct > 10:
+        problems.append(f"RISK_PER_TRADE_PCT 是权益的百分比，{risk_per_trade_pct:g} 太大了，现在按 1 算")
+        risk_per_trade_pct = 1.0
 
     cfg = Config(
         feishu_app_id=secrets["FEISHU_APP_ID"],
@@ -335,11 +366,19 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         alert_daily_loss_usd=_get_float("ALERT_DAILY_LOSS_USD", None, problems),
         alert_cooldown_minutes=max(1, _get_int("ALERT_COOLDOWN_MINUTES", 30, problems)),
         alert_no_stop_minutes=_get_float("ALERT_NO_STOP_MINUTES", 10.0, problems),
+        alert_liq_atr=_levels("ALERT_LIQ_ATR", (3.0, 2.0, 1.0), rising=False),
+        alert_leverage=_levels("ALERT_LEVERAGE", (), rising=True),
+        risk_per_trade_pct=risk_per_trade_pct,
+        alert_stop_risk_pct=_get_float("ALERT_STOP_RISK_PCT", risk_per_trade_pct, problems),
+        weekend_check=_get_bool("WEEKEND_CHECK", True),
+        weekend_leverage=_get_float("WEEKEND_LEVERAGE", None, problems),
+        weekend_stop_atr=_positive("WEEKEND_STOP_ATR", 1.5),
         brief_morning=_time("BRIEF_MORNING", "06:00"),
         brief_evening=_time("BRIEF_EVENING", "14:00"),
         weekly_review=weekly,
         group_show_pnl=_get_bool("GROUP_SHOW_PNL", True),
         group_owner_only=_get_bool("GROUP_OWNER_ONLY", True),
+        group_trading=_get_bool("GROUP_TRADING", True),
         group_daily_question_limit=max(0, _get_int("GROUP_DAILY_QUESTION_LIMIT", 30, problems)),
         db_path=Path(_get("DB_PATH", "data/bot.db")),
         log_dir=Path(_get("LOG_DIR", "logs")),

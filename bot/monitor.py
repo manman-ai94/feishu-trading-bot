@@ -2,6 +2,7 @@
 checks the risk thresholds. No AI involved, only rules."""
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -13,6 +14,7 @@ from .config import Config
 from .journal import Journal
 from .models import AccountState, Position
 from .okx_client import OkxClient, OkxError, OkxNetworkError
+from .risk import LEVEL_WORDS, AccountRisk, liq_line, readings, stop_line
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +22,7 @@ QTY_TOLERANCE = 1e-9
 FAILURES_BEFORE_ALERT = 3
 NO_STOP_REPEAT_SECONDS = 24 * 3600  # a position left without a stop is pointed out again this often
 NO_STOP_SETTING = "no_stop_alert:"  # in the journal: when each position was last pointed out, so a restart does not repeat it
+RISK_LEVELS_SETTING = "risk_levels"  # in the journal: the level each risk reading was last reported at
 
 
 @dataclass(frozen=True)
@@ -216,12 +219,15 @@ class Monitor:
         journal: Journal,
         notify: Callable[[Event], None],
         clock: Callable[[], float] = time.time,
+        gauge=None,
     ):
         self._okx = okx
         self._cfg = cfg
         self._journal = journal
         self._notify = notify
         self._clock = clock
+        self._gauge = gauge  # risk.RiskGauge, or None: then positions are not measured against the market's range
+        self._risk_levels: dict[str, int] | None = None  # read from the journal when first needed
         self._lock = threading.Lock()
         self._state: AccountState | None = None
         self._positions: dict[tuple, Position] | None = None
@@ -280,7 +286,9 @@ class Monitor:
         for event in check_risk(state, self._cfg, self.day_start_equity()):
             if self._cooled_down(event, now):
                 events.append(event)
-        events.extend(self._without_stops(state, now))
+        risk = self._measure(state)
+        events.extend(self._without_stops(state, now, risk))
+        events.extend(self._risk_events(risk, now))
 
         for event in events:
             self._journal.record_event(event.kind, event.title + "；" + "；".join(event.private_lines), event.inst_id, ts=now)
@@ -297,7 +305,66 @@ class Monitor:
 
     # ------------------------------------------------------------- internals
 
-    def _without_stops(self, state: AccountState, now: float) -> list[Event]:
+    def _measure(self, state: AccountState) -> AccountRisk | None:
+        if self._gauge is None:
+            return None
+        try:
+            return self._gauge.assess(state)
+        except Exception:  # a measurement must never stop the watching of positions
+            log.exception("could not measure the positions' risk")
+            return None
+
+    def _risk_events(self, risk: AccountRisk | None, now: float) -> list[Event]:
+        """Readings that crossed one of the owner's thresholds since they were last reported.
+
+        One card with everything that stands out, sent when something gets worse.
+        A reading that stays where it is, or gets better, is not repeated here:
+        it is on every status card and in every brief.
+        """
+        if risk is None:
+            return []
+        if self._risk_levels is None:
+            try:
+                stored = json.loads(self._journal.get_setting(RISK_LEVELS_SETTING) or "{}")
+                self._risk_levels = {str(key): int(value) for key, value in stored.items()}
+            except (ValueError, TypeError, AttributeError):
+                self._risk_levels = {}
+        known = self._risk_levels
+        before = dict(known)
+        found = readings(risk, self._cfg)
+        current = {reading.key: reading.level for reading in found}
+        for key in list(known):
+            if current.get(key, 0) < known[key]:  # better, closed, or no longer measurable
+                known[key] = current.get(key, 0)
+        raised = [reading for reading in found if reading.level > known.get(reading.key, 0)]
+        events: list[Event] = []
+        if raised:
+            worst = max(reading.level for reading in found)
+            event = Event(
+                kind="risk_level",
+                title=f"仓位风险{LEVEL_WORDS[worst]}",
+                private_lines=tuple(
+                    line
+                    for line in (
+                        *(reading.line for reading in found if reading.level > 0),
+                        "这些是按你设的线量出来的读数。要不要减仓、止损放在哪里，由你决定。",
+                        self._how_to_act([measured.position.inst_id for measured in risk.positions]),
+                    )
+                    if line
+                ),
+                warning=True,
+            )
+            if self._cooled_down(event, now):
+                for reading in raised:
+                    known[reading.key] = reading.level
+                events.append(event)
+        for key in [key for key, level in known.items() if level == 0]:
+            del known[key]
+        if known != before:
+            self._journal.set_setting(RISK_LEVELS_SETTING, json.dumps(known, ensure_ascii=False))
+        return events
+
+    def _without_stops(self, state: AccountState, now: float, risk: AccountRisk | None = None) -> list[Event]:
         """Positions that have gone without a stop-loss for longer than the owner allows.
 
         Each is pointed out once, and again a day later while it stays that way.
@@ -326,23 +393,28 @@ class Monitor:
             if now - last < NO_STOP_REPEAT_SECONDS:
                 continue
             self._journal.set_setting(name, repr(now))
-            events.append(self._no_stop_event(position, minutes))
+            events.append(self._no_stop_event(position, minutes, risk))
         for key in [key for key in self._bare_since if key not in seen]:
             del self._bare_since[key]  # closed
             self._journal.set_setting(NO_STOP_SETTING + "|".join(key), "")
         return events
 
-    def _no_stop_event(self, position: Position, minutes: float) -> Event:
+    def _no_stop_event(self, position: Position, minutes: float, risk: AccountRisk | None = None) -> Event:
         cfg = self._cfg
         lines = [
             f"数量 {_size(position)}，均价 {_px(position.avg_px)}，标记价 {_px(position.mark_px)}，"
             f"浮动盈亏 {_money(position.upl, position.pnl_ccy)}"
         ]
-        if position.liq_px and position.liq_distance_pct is not None:
+        measured = risk.of(position) if risk is not None else None
+        if measured is not None and liq_line(measured):
+            lines.append(liq_line(measured))
+            lines.append(stop_line(measured))
+        elif position.liq_px and position.liq_distance_pct is not None:
             lines.append(f"预估强平价 {_px(position.liq_px)}，离现在的标记价 {position.liq_distance_pct:.2f}%")
         lines.append(f"这个仓位已经 {minutes:g} 分钟以上没有止损单。设不设、设在哪由你决定。")
-        if cfg.trading == "live" and "stops" in cfg.trade_actions and position.inst_id in cfg.tradable_instruments:
-            lines.append(f"要设的话，私聊发“止损 {position.inst_id.split('-')[0]} 价格”，我先回预览。")
+        how = self._how_to_act([position.inst_id], close=False)
+        if how:
+            lines.append(how)
         lines.append("挂上止损后不再提醒；一直不挂，每 24 小时提醒一次。")
         return Event(
             kind="no_stop",
@@ -351,6 +423,25 @@ class Monitor:
             private_lines=tuple(lines),
             warning=True,
         )
+
+    def _how_to_act(self, inst_ids: list[str], close: bool = True) -> str:
+        """The commands that would lower the risk, ready to send; the price is the owner's to fill in.
+        "" when there is nothing he could send: trading off, or those commands not open."""
+        cfg = self._cfg
+        if cfg.trading != "live":
+            return ""  # on the demo account an order would not touch the position being watched
+        bases = [inst_id.split("-")[0] for inst_id in inst_ids if inst_id in cfg.tradable_instruments]
+        if not bases:
+            return ""
+        commands = []
+        if "stops" in cfg.trade_actions:
+            commands.append(f"“止损 {bases[0]} 价格”")
+        if close and "close" in cfg.trade_actions:
+            commands.append(f"“平仓 {bases[0]} 一半”")
+        if not commands:
+            return ""
+        where = "私聊或在群里 @我" if cfg.group_trading and cfg.group_chat_id and cfg.group_show_pnl else "私聊"
+        return f"要动手的话，{where}发{'或'.join(commands)}，我先回预览，你回确认码才执行。"
 
     def _cooled_down(self, event: Event, now: float) -> bool:
         key = (event.kind, event.inst_id)

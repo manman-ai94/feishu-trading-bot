@@ -16,6 +16,7 @@ from .models import AccountState
 from .monitor import Event, Monitor
 from .okx_client import OkxClient
 from .reports import DISCLAIMER, account_text, equity_text, event_markdown, journal_text, status_markdown
+from .risk import AccountRisk, weekend_lines
 from .track import scorecard_markdown
 from .upkeep import downtime_text
 
@@ -29,7 +30,7 @@ EVENT_COLOURS = {
     "stop_changed": "yellow",
     "okx_recovered": "green",
 }
-RISK_KINDS = ("margin_warning", "liq_warning", "daily_loss", "no_stop")
+RISK_KINDS = ("margin_warning", "liq_warning", "daily_loss", "no_stop", "risk_level")
 
 
 class Reporter:
@@ -42,8 +43,10 @@ class Reporter:
         journal: Journal,
         clock: Callable[[], float] = time.time,
         crowd=None,
+        gauge=None,
     ):
         self._cfg = cfg
+        self._gauge = gauge  # risk.RiskGauge, or None
         self._feishu = feishu
         self._okx = okx
         self._analyst = analyst
@@ -86,6 +89,16 @@ class Reporter:
     def current_state(self) -> AccountState | None:
         return self.monitor.state if self.monitor else None
 
+    def risk(self, state: AccountState | None) -> AccountRisk | None:
+        """How the positions stand against the market's own movement. None when it cannot be measured."""
+        if self._gauge is None or state is None or not state.positions:
+            return None
+        try:
+            return self._gauge.assess(state)
+        except Exception:  # figures beside the position: a card is never held up for them
+            log.exception("could not measure the positions' risk")
+            return None
+
     # ----------------------------------------------------------------- events
 
     def notify_event(self, event: Event) -> None:
@@ -107,7 +120,7 @@ class Reporter:
         if state is None:
             body = "机器人已启动，但还没读到 OKX 账户。稍后如果连续失败，我会再提醒你。"
         else:
-            body = "机器人已启动，开始监控。\n\n" + status_markdown(state, self.day_change(state), private=True)
+            body = "机器人已启动，开始监控。\n\n" + status_markdown(state, self.day_change(state), private=True, risk=self.risk(state))
         if downtime is not None:
             body = downtime_text(downtime, self._cfg.tz) + "\n\n" + body
         if self._cfg.trading_on:
@@ -146,7 +159,7 @@ class Reporter:
         title = ("盘前简报" if kind == "morning" else "收盘小结") + " · " + self.now_local().strftime("%m月%d日")
         market = self.market_text()
         state = self.current_state()
-        account = account_text(state, self.day_change(state)) if state else None
+        account = account_text(state, self.day_change(state), self.risk(state), self._cfg.risk_per_trade_pct) if state else None
         today = self.now_local().replace(hour=0, minute=0, second=0, microsecond=0)
         journal = journal_text(self._journal.events_between(today.timestamp(), self._clock() + 1), self._cfg.tz)
         shared = self.group_shares_account
@@ -189,6 +202,30 @@ class Reporter:
         if self._cfg.track_record and self._journal.analyses_between(start, end):
             record = scorecard_markdown(self._journal, self._clock(), self._cfg.tz, 7, None, self._cfg.track_window_hours)
             self._owner_safely("本周成绩单", record, "green")
+
+    def send_weekend_check(self) -> None:
+        """Friday, an hour before spot gold closes: what stands out in the positions that will sit through the weekend.
+
+        Rules only. Nothing is sent when nothing stands out.
+        """
+        state = self.current_state()
+        risk = self.risk(state)
+        if risk is None:
+            return
+        lines = weekend_lines(risk, self._cfg)
+        if not lines:
+            return
+        body = "\n".join(
+            [
+                "现货黄金周五 22:00 UTC 收盘，周日 23:00 UTC 重开。OKX 的贵金属永续周末照常交易，但成交稀薄、价差更宽（OKX 的商品永续说明）。",
+                *(f"- {line}" for line in lines),
+                "这些是读数，不是指令。周末前要不要调整，由你决定。",
+            ]
+        )
+        title = "周末前检查 · " + self.now_local().strftime("%m月%d日")
+        self._owner_safely(title, body, "yellow")
+        if self.group_shares_account:
+            self.to_group(title, body, "yellow", footer=DISCLAIMER)
 
     def _owner_safely(self, title: str, markdown: str, template: str) -> None:
         """Send to the owner; a failure there must not stop the group copy."""

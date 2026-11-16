@@ -13,6 +13,7 @@ from bot.router import (
     SLOW_SECONDS_NO_SIGN,
     SLOW_TEXT,
     SLOW_TEXT_DEEP,
+    TRADE_OTHER_GROUP_TEXT,
     TRADE_OWNER_ONLY_TEXT,
     WORKING_EMOJI,
     Router,
@@ -559,11 +560,42 @@ def test_the_demo_rehearsal_shows_that_it_is_running():
     assert len(bench.feishu.reactions) == 2
 
 
-def test_orders_are_not_taken_in_the_group_even_from_the_owner():
+def test_the_owner_places_an_order_from_the_registered_group():
     bench = Bench(exchange=FakeExchange(), **TRADING)
-    reply = bench.say("做多 XAU 100张", private=False)[0]
-    assert "私聊" in reply.body and bench.exchange.changes == []
-    assert "私聊" in bench.say("确认 4821", private=False)[0].body
+    preview = bench.say("做多 XAU 100张 止损 3860", private=False)[0]
+    assert preview.title == "下单预览 · 模拟盘" and "确认 4821" in preview.body and "先 @我" in preview.body
+    assert bench.exchange.changes == []
+
+    # Someone else in the group types the code he can see: nothing happens.
+    friendly = Bench(exchange=FakeExchange(), **TRADING, group_owner_only=False, group_show_pnl=True)
+    friendly.say("做多 XAU 100张", private=False)
+    assert friendly.say("确认 4821", sender=FRIEND, private=False)[0].body == TRADE_OWNER_ONLY_TEXT
+    assert friendly.say("取消", sender=FRIEND, private=False)[0].body != "已取消，没有执行。"
+    assert friendly.exchange.changes == []
+
+    done = bench.say("确认 4821", private=False)[0]
+    assert done.title == "已执行 · 模拟盘" and [name for name, _ in bench.exchange.changes] == ["place_order"]
+    assert bench.analyst.calls == []
+
+
+def test_a_code_from_the_group_works_in_the_private_chat_and_back():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.say("做多 XAU 100张", private=False)
+    assert bench.say("确认 4821")[0].title == "已执行 · 模拟盘"  # one pending order, wherever he answers it
+
+
+def test_orders_are_not_taken_where_they_should_not_be():
+    bench = Bench(exchange=FakeExchange(), **TRADING, group_trading=False)
+    assert "GROUP_TRADING" in bench.say("做多 XAU 100张", private=False)[0].body
+    hidden = Bench(exchange=FakeExchange(), **TRADING, group_show_pnl=False)
+    assert "GROUP_SHOW_PNL" in hidden.say("止损 XAU 3800", private=False)[0].body
+    other = Bench(exchange=FakeExchange(), **TRADING)
+    assert other.say("做多 XAU 100张", private=False, chat_id="oc_other_group")[0].body == TRADE_OTHER_GROUP_TEXT
+    unregistered = Bench(exchange=FakeExchange(), **TRADING, group_chat_id="")
+    assert unregistered.say("做多 XAU 100张", private=False)[0].body == TRADE_OTHER_GROUP_TEXT
+    for each in (bench, hidden, other, unregistered):
+        assert each.exchange.changes == [] and each.analyst.calls == []
+        assert each.say("确认 4821")[0].body == "现在没有等待确认的指令。"  # nothing was held for confirmation
 
 
 def test_nobody_but_the_owner_can_place_an_order():

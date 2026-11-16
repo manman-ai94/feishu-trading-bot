@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .models import AccountState, Position
 from .monitor import Event
+from .risk import AccountRisk, PositionRisk, leverage_line, liq_line, position_risk_lines
 
 DISCLAIMER = "仅供参考，不构成投资建议。"
 
@@ -76,7 +77,8 @@ def _stop(value: float | None) -> str:
     return "无" if value is None else f"{value:,.2f}"
 
 
-def position_lines(position: Position, with_amounts: bool) -> list[str]:
+def position_lines(position: Position, with_amounts: bool, risk: PositionRisk | None = None) -> list[str]:
+    """`risk` adds how the position stands against the market's own movement; it is shown with the amounts only."""
     lines = [f"**{position.inst_id} {_side(position)}单**"]
     if with_amounts:
         size = f"- 数量 {_size(position)}"
@@ -91,15 +93,21 @@ def position_lines(position: Position, with_amounts: bool) -> list[str]:
         if position.upl_ratio is not None:
             pnl += f"（按保证金算 {position.upl_ratio * 100:+.2f}%）"
         lines.append(pnl)
-        if position.liq_px:
+        if risk is not None and liq_line(risk):
+            lines.append(f"- {liq_line(risk)}")
+        elif position.liq_px:
             distance = position.liq_distance_pct
             suffix = f"，相距 {distance:.2f}%" if distance is not None else ""
             lines.append(f"- 预估强平价 {_px(position.liq_px)}{suffix}")
     lines.append(f"- 止损 {_stop(position.stop_loss)}，止盈 {_stop(position.take_profit)}")
+    if with_amounts and risk is not None:
+        lines.extend(f"- {line}" for line in position_risk_lines(risk)[1 if liq_line(risk) else 0 :])
     return lines
 
 
-def status_markdown(state: AccountState, day_change: float | None, private: bool, show_amounts_in_group: bool = False) -> str:
+def status_markdown(
+    state: AccountState, day_change: float | None, private: bool, show_amounts_in_group: bool = False, risk: AccountRisk | None = None
+) -> str:
     """The status card body."""
     with_amounts = private or show_amounts_in_group
     lines: list[str] = []
@@ -113,22 +121,31 @@ def status_markdown(state: AccountState, day_change: float | None, private: bool
             lines.append(f"- 今日权益变化 {_money(day_change, signed=True)}（含出入金）")
         if snapshot.mgn_ratio is not None:
             lines.append(f"- 保证金率 {snapshot.mgn_ratio * 100:.0f}%（到 100% 开始强平）")
+        if risk is not None and leverage_line(risk):
+            lines.append(f"- {leverage_line(risk)}")
         lines.append("")
     if not state.positions:
         lines.append("当前没有持仓。")
     for position in state.positions:
-        lines.extend(position_lines(position, with_amounts))
+        lines.extend(position_lines(position, with_amounts, risk.of(position) if risk is not None else None))
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def account_text(state: AccountState, day_change: float | None) -> str:
+def account_text(state: AccountState, day_change: float | None, risk: AccountRisk | None = None, risk_pct: float | None = None) -> str:
     """Plain-text account summary for the AI (owner-only prompts)."""
     snapshot = state.snapshot
     lines = [f"账户权益 {_money(snapshot.total_eq)}"]
+    if risk_pct:
+        budget = f"，按现在的权益约 {_money(snapshot.total_eq * risk_pct / 100)}" if snapshot.total_eq else ""
+        lines.append(f"交易员自己定的规则：一笔交易止损触发时最多亏权益的 {risk_pct:g}%{budget}")
+    if risk is not None:
+        lines.append("（下面的实际杠杆、强平距离折合几天的波幅、止损触发时亏多少，是程序按 OKX 的数字算好的，可以直接引用。）")
     lines.extend(currency_lines(state))
     if snapshot.mgn_ratio is not None:
         lines.append(f"保证金率 {snapshot.mgn_ratio * 100:.0f}%（到 100% 开始强平）")
+    if risk is not None and leverage_line(risk):
+        lines.append(leverage_line(risk))
     if day_change is not None:
         lines.append(f"今日权益变化 {_money(day_change, signed=True)}（含出入金）")
     if not state.positions:
@@ -149,6 +166,9 @@ def account_text(state: AccountState, day_change: float | None) -> str:
         parts.append(f"止损 {_stop(position.stop_loss)}")
         parts.append(f"止盈 {_stop(position.take_profit)}")
         lines.append("，".join(parts))
+        measured = risk.of(position) if risk is not None else None
+        if measured is not None:
+            lines.extend(f"  {line}" for line in position_risk_lines(measured))
     return "\n".join(lines)
 
 

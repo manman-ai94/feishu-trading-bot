@@ -10,6 +10,11 @@ Rules that matter:
   * Private chats from anyone other than the owner are not served.
   * The knowledge base, the usage report, registering a group and restarting
     are the owner's alone.
+  * Order commands are the owner's alone too. They are carried out in his
+    private chat, and in the registered group when GROUP_TRADING=true (the
+    default) and that group sees the account. Everyone else's are turned away
+    before the trade desk sees them, so a code shown in the group works only
+    when he types it.
 
 How an answer looks follows the answer. While the AI works, the question
 carries an emoji and nothing is said; words come only when the wait is long.
@@ -46,7 +51,8 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 发 /whoami，查看你的飞书 ID
 
 主人专用：
-- 下单、平仓、撤单、设止盈止损：只在私聊里，每条指令我先回预览，你回复确认码才执行。发“交易帮助”看写法
+- 下单、平仓、撤单、设止盈止损：私聊里，或者在登记的群里 @我。每条指令我先回预览，你回复确认码才执行。发“交易帮助”看写法
+- 发“算仓位 XAU 止损 3768”：按你定的单笔风险算最多开多大，只算数不下单
 - 问题前面加“深度”，我会多查几轮、分析得更细
 - 发“记住：……”，把交易规则、心得或资料存进资料库，以后回答时我会参考。发“资料”看资料库里有什么
 - 发“用量”，看今天和本月 AI 大约花了多少钱
@@ -57,7 +63,10 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 我每天定时发盘前简报和收盘小结，仓位有变动时会自动提醒。我只做分析、提醒和执行主人确认过的指令，不替任何人做买卖决定。"""
 
 OWNER_ONLY_TEXT = "我只响应主人的指令。仓位变动和简报我会自动发到群里。"
-TRADE_OWNER_ONLY_TEXT = "下单、平仓、撤单这类指令只有主人能发，而且只在私聊里执行。"
+TRADE_OWNER_ONLY_TEXT = "下单、平仓、撤单、改止损这类指令只有主人能发。"
+TRADE_GROUP_OFF_TEXT = "群里不执行下单类指令（服务器上 GROUP_TRADING 关着），请在私聊里发给我。"
+TRADE_GROUP_HIDDEN_TEXT = "这个群看不到账户和持仓（GROUP_SHOW_PNL 关着），下单预览里有持仓数字，所以请在私聊里发给我。"
+TRADE_OTHER_GROUP_TEXT = "这个群没有登记，下单类指令只在私聊和登记过的群里执行。"
 
 HELLO_TEXT = "在。直接问就行，例如“黄金现在怎么看”；发“帮助”可以看我能做什么。"
 HELLO_WORDS = ("你好", "您好", "hi", "hello", "在吗", "在不在", "谢谢", "多谢", "辛苦了", "早", "早上好", "晚上好")
@@ -263,10 +272,11 @@ class Router:
         """Order commands: the trade desk reads them by fixed patterns, never the AI."""
         if self._trade is None:
             return False
+        refused_here = "" if message.is_private else self._group_trade_refusal(message)
         # An order answers in a second or two. Only the rehearsal on the demo account takes long enough for a sign.
-        done = self._show_working(message, slow_text=SLOW_TEXT_SELFTEST) if message.is_private and self._trade.takes_long(text) else None
+        done = self._show_working(message, slow_text=SLOW_TEXT_SELFTEST) if not refused_here and self._trade.takes_long(text) else None
         try:
-            reply = self._trade.handle(text, private=message.is_private)
+            reply = self._trade.handle(text, refused_here=refused_here, in_group=not message.is_private)
         finally:
             if done is not None:
                 done()
@@ -277,6 +287,21 @@ class Router:
         else:
             self._feishu.reply_text(message.message_id, reply.text)
         return True
+
+    def _group_trade_refusal(self, message: IncomingMessage) -> str:
+        """Why the owner's order command is not carried out in this group; "" when it is.
+
+        Only the owner gets this far (the router turns everyone else away first),
+        and his confirmation code works only from him, wherever it is typed.
+        """
+        cfg = self._cfg
+        if not cfg.group_chat_id or message.chat_id != cfg.group_chat_id:
+            return TRADE_OTHER_GROUP_TEXT
+        if not cfg.group_trading:
+            return TRADE_GROUP_OFF_TEXT
+        if not cfg.group_show_pnl:
+            return TRADE_GROUP_HIDDEN_TEXT
+        return ""
 
     def _bind_group(self, message: IncomingMessage) -> None:
         """The owner says "登记本群" in a group: that group becomes the one that
@@ -445,7 +470,8 @@ class Router:
         if not with_account and not state.positions:
             self._feishu.reply_text(message.message_id, "当前没有持仓。")
             return
-        body = status_markdown(state, self._reporter.day_change(state), private=with_account)
+        risk = self._reporter.risk(state) if with_account else None
+        body = status_markdown(state, self._reporter.day_change(state), private=with_account, risk=risk)
         self._feishu.reply_markdown(message.message_id, "当前持仓", body, "blue", footer=None if message.is_private else DISCLAIMER)
 
     def _reply_hello(self, message: IncomingMessage, text: str) -> None:
@@ -477,7 +503,7 @@ class Router:
             if self._shows_account(message):
                 state = self._reporter.current_state()
                 if state is not None:
-                    account = account_text(state, self._reporter.day_change(state))
+                    account = account_text(state, self._reporter.day_change(state), self._reporter.risk(state), self._cfg.risk_per_trade_pct)
             try:
                 answer = self._analyst.answer(
                     text, market, account, in_group=in_group, deep=deep, history=self._recent(message.chat_id)
