@@ -665,6 +665,24 @@ def test_a_key_without_the_trade_permission_is_refused():
     assert "确认" in bench.say("做多 XAU 100张").text  # read again once the owner fixed the key
 
 
+def test_a_spot_mode_account_cannot_open_contracts_and_says_how_to_fix_it():
+    bench = Bench()
+    bench.exchange.config = AccountConfig("net_mode", ("read_only", "trade"), "", "1")
+    refusal = bench.say("做多 XAU 100张")
+    assert "现货模式" in refusal.text and "现货和合约模式" in refusal.text and "OKX 的模拟交易里" in refusal.text
+    assert "确认" not in refusal.text and bench.sent == []
+    assert "没有等待确认的指令" in bench.say("确认 1111").text
+    bench.exchange.config = AccountConfig("net_mode", ("read_only", "trade"), "", "2")
+    assert "确认" in bench.say("做多 XAU 100张").text  # read again once the account mode was changed
+
+
+def test_a_spot_mode_account_can_still_cancel_and_look():
+    bench = Bench()
+    bench.exchange.config = AccountConfig("net_mode", ("read_only", "trade"), "", "1")
+    assert "现在没有挂单" in bench.say("挂单").text
+    assert "现货模式" not in bench.say("平仓 XAU").text  # nothing to close, and that is what it says
+
+
 def test_opening_against_an_existing_position_is_refused_in_net_mode():
     bench = Bench(FakeExchange([small()]))
     refusal = bench.say("做空 XAU 100张")
@@ -1115,3 +1133,17 @@ def test_the_settings_show_limits_and_what_the_key_may_do():
     assert "交易权限：有" in text and "提现权限：有。机器人用不到，建议在 OKX 里关掉" in text
     assert "已绑定 IP" in text and "203.0.113.7" not in text
     assert "单向持仓" in text and "飞书里改不了" in text
+    assert "账户模式：现货和合约模式" in text
+    assert "**账户资金**（模拟盘）" in text and "总权益约 2,000.00 USD" in text
+    assert "- USDT：权益 2,000.00，可用保证金 1,000.00" in text and "- 持仓 0 个" in text
+
+
+def test_the_settings_say_when_the_account_cannot_trade_contracts():
+    bench = Bench()
+    bench.exchange.config = AccountConfig("net_mode", ("read_only", "trade"), "", "1")
+    text = bench.say("交易设置").text
+    assert "账户模式：现货模式。" in text and "现货和合约模式" in text
+
+
+def test_the_settings_show_no_funds_while_trading_is_off():
+    assert "账户资金" not in Bench(trading="off").say("交易设置").text

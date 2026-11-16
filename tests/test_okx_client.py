@@ -180,6 +180,26 @@ def test_account_state_attaches_pending_stops():
     assert len([url for url, _ in session.requests if "/public/instruments" in url]) == 1  # the contract size is remembered
 
 
+def test_a_spot_mode_account_reports_what_is_free_as_a_balance():
+    """Spot mode has no margin, so OKX leaves availEq empty and says what is free in availBal."""
+    balance = {
+        "totalEq": "80107.15", "adjEq": "", "upl": "", "mgnRatio": "",
+        "details": [
+            {"ccy": "USDT", "eq": "5000", "eqUsd": "5001.2", "availEq": "", "availBal": "5000", "upl": "", "mgnRatio": ""},
+            {"ccy": "BTC", "eq": "1", "eqUsd": "64684.5", "availEq": "", "availBal": "1", "upl": "", "mgnRatio": ""},
+        ],
+    }  # fmt: skip
+    okx, _ = client(
+        {
+            "/api/v5/account/balance": [ok([balance])],
+            "/api/v5/account/positions": [ok([])],
+            "/api/v5/trade/orders-algo-pending": [ok([])],
+        }
+    )
+    usdt = okx.account_state().snapshot.currencies[1]
+    assert usdt.ccy == "USDT" and usdt.avail_eq is None and usdt.avail_bal == 5000.0
+
+
 def test_a_futures_mode_account_reports_margin_per_currency():
     """An account that keeps one margin pool per currency leaves the account-level fields empty."""
     balance = {

@@ -61,6 +61,8 @@ def currency_lines(state: AccountState) -> list[str]:
         parts = [f"权益 {item.eq:,.2f}"]
         if item.avail_eq is not None:
             parts.append(f"可用保证金 {item.avail_eq:,.2f}")
+        elif item.avail_bal is not None:
+            parts.append(f"可用余额 {item.avail_bal:,.2f}")
         upl = from_positions.get(item.ccy)
         if upl is None:
             upl = item.upl

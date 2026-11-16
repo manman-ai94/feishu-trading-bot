@@ -40,6 +40,7 @@ from .instruments import ALIASES, InstrumentResolver
 from .journal import Journal
 from .models import AccountConfig, AccountState, InstrumentSpec, OrderInfo, Position
 from .okx_client import OkxError, OkxNetworkError
+from .reports import currency_lines
 
 log = logging.getLogger(__name__)
 
@@ -739,7 +740,33 @@ class TradeDesk:
             lines.append("- 提现权限：有。机器人用不到，建议在 OKX 里关掉" if account.can_withdraw else "- 提现权限：没有")
             lines.append("- 已绑定 IP" if account.ip else "- 没有绑定 IP，建议绑定服务器的 IP")
             lines.append(f"- 持仓模式：{'双向持仓' if account.hedge_mode else '单向持仓'}")
+            if account.spot_only:
+                lines.append(f"- 账户模式：现货模式。{self._spot_mode_text()}")
+            elif account.level_name:
+                lines.append(f"- 账户模式：{account.level_name}")
+        if self._mode != "off":
+            lines.extend(self._funds_lines())
         lines.append("限额和品种名单只能在服务器的 .env 里改，飞书里改不了。")
+        return lines
+
+    def _spot_mode_text(self) -> str:
+        where = "OKX 的模拟交易里" if self._mode == "demo" else "OKX 里"
+        return (
+            f"这个{self._account_label()}账户在 OKX 里是“现货模式”，这个模式下 OKX 不接受合约订单，所以开不了仓。"
+            f"请在{where}打开交易页的设置，把“账户模式”改成“现货和合约模式”（第一次只能在网页或 App 里改），改完重发指令就行。"
+        )
+
+    def _funds_lines(self) -> list[str]:
+        """What the account that orders go to holds, with units: in demo mode the cards show the real account only."""
+        try:
+            state = self._okx.account_state()
+        except (OkxError, OkxNetworkError) as exc:
+            return [f"**账户资金**（{self._account_label()}）", f"- 暂时读不到：{exc}"]
+        lines = [f"**账户资金**（{self._account_label()}）"]
+        if state.snapshot.total_eq is not None:
+            lines.append(f"- 总权益约 {state.snapshot.total_eq:,.2f} USD")
+        lines.extend(f"- {line}" for line in currency_lines(state))
+        lines.append(f"- 持仓 {len(state.positions)} 个")
         return lines
 
     def _account_label(self) -> str:
@@ -856,6 +883,9 @@ class TradeDesk:
         base = inst_id.split("-")[0]
         spec = self._tradable(inst_id)
         account, state = self._account()
+        if account.spot_only:
+            self._account_config = None  # read it again next time: the mode may just have been changed
+            raise Refused(self._spot_mode_text())
         held = [p for p in state.positions if p.inst_id == inst_id]
         self._unchanged(previous, held)
         direction = cmd.direction

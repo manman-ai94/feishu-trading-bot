@@ -36,6 +36,12 @@ def test_private_status_has_everything():
         assert expected in text
 
 
+def test_a_spot_mode_account_shows_its_free_balance():
+    currencies = (CurrencyBalance("USDT", eq=5000.0, eq_usd=5001.2, avail_bal=4900.5),)
+    card = status_markdown(make_state([], total_eq=5001.2, upl=None, mgn_ratio=None, currencies=currencies), day_change=None, private=True)
+    assert "- USDT：权益 5,000.00，可用余额 4,900.50" in card and "可用保证金" not in card
+
+
 def test_amounts_carry_the_currency_they_are_counted_in():
     """A USDT-settled contract's PnL is USDT, the equity is USD, and the size says what the contracts add up to."""
     position = make_position(qty=5000.0, coins=5.0, coin_ccy="XAU", ccy="USDT", upl=412.5, upl_ratio=1.0855, lever=50.0, notional_usd=19398.7)

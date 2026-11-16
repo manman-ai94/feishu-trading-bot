@@ -143,6 +143,7 @@ class CurrencyBalance:
     avail_eq: float | None = None  # free to open new positions with
     upl: float | None = None
     mgn_ratio: float | None = None
+    avail_bal: float | None = None  # free to trade with; the only "free" figure of a spot-mode account
 
     @classmethod
     def from_okx(cls, row: dict) -> "CurrencyBalance":
@@ -153,6 +154,7 @@ class CurrencyBalance:
             avail_eq=to_float(row.get("availEq")),
             upl=to_float(row.get("upl")),
             mgn_ratio=to_float(row.get("mgnRatio")),
+            avail_bal=to_float(row.get("availBal")),
         )
 
 
@@ -240,6 +242,9 @@ class AccountState:
     positions: list[Position] = field(default_factory=list)
 
 
+ACCOUNT_LEVELS = {"1": "现货模式", "2": "现货和合约模式", "3": "跨币种保证金模式", "4": "组合保证金模式"}
+
+
 @dataclass(frozen=True)
 class AccountConfig:
     """What the API key may do and how the account is set up."""
@@ -260,6 +265,15 @@ class AccountConfig:
     @property
     def can_withdraw(self) -> bool:
         return "withdraw" in self.permissions
+
+    @property
+    def spot_only(self) -> bool:
+        """Spot mode: OKX refuses every contract order of such an account (its error 51010)."""
+        return self.acct_lv == "1"
+
+    @property
+    def level_name(self) -> str:
+        return ACCOUNT_LEVELS.get(self.acct_lv, "")
 
     @classmethod
     def from_okx(cls, row: dict) -> "AccountConfig":
