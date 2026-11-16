@@ -22,7 +22,7 @@ from typing import Callable
 import anthropic
 
 from .config import Config
-from .tools import WEB_TOOL_SETS, Toolbox
+from .tools import WEB_SEARCHES, WEB_SEARCHES_DEEP, WEB_TOOL_SETS, Toolbox
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 数据从哪里来：
 - 消息里的“OKX 实时行情数据”是程序刚从 OKX 读到的数字。问到的品种不在里面时，用 get_market 去取，OKX 上交易的品种基本都能查，例如 BTC、ETH、SOL、XAU。需要精确的波段高低点时，用 get_candles 看 K 线。
 - 新闻、经济数据和公布时间、OKX 上没有的市场（美股、美元指数、美债收益率等），用 web_search 查，并说明消息的时间。网页上的价格可能有延迟，OKX 上有的品种一律以 OKX 的数字为准。
+- 搜索要精，每搜一次都有费用。先想清楚要查什么，一般一到两次就够，例如一次查这个品种当天的重要消息，一次查近期的经济数据日程。不要为同一件事换着说法反复搜索；只问价位、指标或概念、用不到消息面的问题，不用搜索。
 - 交易员自己的交易规则、笔记，以及他收集的投资人理念和方法，在资料库里，用 search_knowledge 查。问题涉及他的规则和方法、某位投资人的做法，或者值得拿他自己的规则来对照时，先查一下，引用时说明出自资料库。
 - 所有价位、数据和新闻都必须来自上面这些来源。没取到的就说没取到，不要凭印象写价格、新闻或数据结果。
 
@@ -86,6 +87,7 @@ SHARED_NOTE = (
 )
 NO_TOOLS_NOTE = "这次没有任何工具可用，只能根据上面给出的数据回答，缺的数据直接说明。"
 NO_WEB_NOTE = "这次没有联网搜索工具，新闻和经济数据查不到，需要时直接说明看不到。"
+SEARCHED_ENOUGH_NOTE = "这个问题的联网搜索次数已经用完。请不要再搜索，新闻和事件用已经查到的内容；行情数据还缺的话可以继续用其他工具。"
 DEEP_NOTE = (
     "这次交易员要的是深度分析：可以多查几轮数据和资料，把各周期的结构、关键事件和两种情景讲透，"
     "篇幅可以到两三屏，结构不变。"
@@ -102,6 +104,7 @@ class Tier:
     effort: str
     max_tokens: int
     tools: bool = False
+    web_searches: int = WEB_SEARCHES  # how many searches one request may run
 
 
 @dataclass
@@ -178,7 +181,7 @@ class Analyst:
         self._tiers = {
             "quick": Tier(cfg.model_quick, "low", 1024),
             "daily": Tier(cfg.model_daily, cfg.effort_daily, 16000, tools=True),
-            "deep": Tier(cfg.model_deep, cfg.effort_deep, 32000, tools=True),
+            "deep": Tier(cfg.model_deep, cfg.effort_deep, 32000, tools=True, web_searches=WEB_SEARCHES_DEEP),
         }
 
     @property
@@ -282,6 +285,7 @@ class Analyst:
         # breakpoint then follows the conversation as the tool rounds add to it.
         system_blocks = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
         start = len(messages)
+        told_to_stop_searching = False
         for step in range(MAX_STEPS):
             while True:
                 request = dict(
@@ -289,7 +293,7 @@ class Analyst:
                     max_tokens=tier.max_tokens,
                     system=system_blocks,
                     messages=messages,
-                    tools=toolbox.definitions(self._web_level),
+                    tools=toolbox.definitions(self._web_level, tier.web_searches),
                     output_config={"effort": tier.effort},
                     cache_control={"type": "ephemeral"},
                 )
@@ -322,6 +326,12 @@ class Analyst:
                 results.append(result)
             if step == MAX_STEPS - 2:
                 results.append({"type": "text", "text": "查询次数快到上限了。请不要再调用工具，直接根据已经拿到的信息写出最终回答。"})
+            elif usage.web_searches >= tier.web_searches and not told_to_stop_searching:
+                # The limit in the tool definition counts per request, and every round is a
+                # new request. Changing the definition would throw away the cached prompt,
+                # so the AI is told instead.
+                told_to_stop_searching = True
+                results.append({"type": "text", "text": SEARCHED_ENOUGH_NOTE})
             messages.append({"role": "user", "content": results})
         raise AnalystUnavailable("这个问题查了很多轮还没有结论，请把问题问得具体一点再试。")
 

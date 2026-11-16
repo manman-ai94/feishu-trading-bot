@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from bot.instruments import InstrumentResolver
 from bot.knowledge import KnowledgeBase, split_chunks, tokens
 from bot.okx_client import OkxNetworkError
-from bot.tools import CLIENT_TOOLS, MAX_CANDLES, Toolbox
+from bot.tools import CLIENT_TOOLS, MAX_CANDLES, WEB_TOOL_SETS, Toolbox
 
 from .helpers import FakeOkx
 
@@ -99,6 +99,10 @@ def test_tool_definitions_are_stable_and_step_down(tmp_path):
     assert box.definitions() == box.definitions()  # same order every time, so the prompt cache holds
     assert [tool["type"] for tool in box.definitions()[3:]] == ["web_search_20260209", "web_fetch_20260209"]
     assert [tool.get("type") for tool in box.definitions(1)[3:]] == ["web_search_20250305"]
+    search, fetch = box.definitions()[3:]  # searches are most of what a question costs, so they are capped
+    assert search["max_uses"] == 3 and fetch["max_uses"] == 2 and fetch["max_content_tokens"] == 10000
+    assert box.definitions(0, 6)[3]["max_uses"] == 6 and box.definitions(1, 6)[3]["max_uses"] == 6
+    assert "max_uses" not in WEB_TOOL_SETS[0][0]  # the shared definitions are copied, not changed
     assert [tool["name"] for tool in box.definitions(2)] == names[:3] == [tool["name"] for tool in box.definitions(9)]
     without, _, _ = toolbox(tmp_path, knowledge=False)
     assert "search_knowledge" not in [tool["name"] for tool in without.definitions()]

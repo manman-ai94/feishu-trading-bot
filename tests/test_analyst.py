@@ -6,7 +6,7 @@ import anthropic
 import httpx2
 import pytest
 
-from bot.analyst import ANALYST_SYSTEM, FALLBACK_BETA, Analyst, AnalystUnavailable
+from bot.analyst import ANALYST_SYSTEM, FALLBACK_BETA, SEARCHED_ENOUGH_NOTE, Analyst, AnalystUnavailable
 
 from .helpers import make_cfg
 
@@ -223,10 +223,10 @@ class FakeToolbox:
         self.runs: list[tuple[str, dict]] = []
         self.results = {"get_market": ("品种：BTC-USDT-SWAP\n最新价：67,000.00", False)}
 
-    def definitions(self, web_level=0):
+    def definitions(self, web_level=0, web_searches=3):
         client_tools = [{"name": "get_market"}, {"name": "search_knowledge"}]
-        web = [[{"type": "web_search_20260209", "name": "web_search"}], [{"type": "web_search_20250305", "name": "web_search"}], []]
-        return client_tools + web[min(web_level, 2)]
+        web = [["web_search_20260209"], ["web_search_20250305"], []][min(web_level, 2)]
+        return client_tools + [{"type": kind, "name": "web_search", "max_uses": web_searches} for kind in web]
 
     def run(self, name, tool_input):
         self.runs.append((name, tool_input))
@@ -296,6 +296,35 @@ def test_a_failed_tool_is_reported_to_the_ai_as_an_error():
     assert bot.answer("盘口怎么样", "", None, in_group=False) == "取不到盘口数据。"
     [result] = client.messages.calls[1]["messages"][-1]["content"]
     assert result == {"type": "tool_result", "tool_use_id": "call_1", "content": "没有这个工具", "is_error": True}
+
+
+def test_searches_are_limited_and_a_deep_question_gets_more():
+    bot, client, _, _ = tooled([reply([text_block("回答")]), reply([text_block("深度回答")])])
+    bot.answer("BTC 现在怎么看", "", None, in_group=False)
+    bot.answer("BTC 现在怎么看", "", None, in_group=False, deep=True)
+    everyday, deep = client.messages.calls
+    assert everyday["tools"][-1] == {"type": "web_search_20260209", "name": "web_search", "max_uses": 3}
+    assert deep["tools"][-1]["max_uses"] == 6
+
+
+def test_the_ai_is_told_once_when_its_searches_are_used_up():
+    searched = reply([tool_use("call_1", "get_market", symbol="BTC")], "tool_use", usage(searches=3))
+    again = reply([tool_use("call_2", "get_market", symbol="ETH")], "tool_use", usage())
+    bot, client, _, reports = tooled([searched, again, reply([text_block("回答")], used=usage())])
+    assert bot.answer("BTC 和 ETH 怎么看", "", None, in_group=False) == "回答"
+
+    one, two, three = client.messages.calls
+    assert one["tools"] == two["tools"] == three["tools"]  # the limit is said in words, so the cached prefix holds
+    assert two["messages"][-1]["content"][-1] == {"type": "text", "text": SEARCHED_ENOUGH_NOTE}
+    assert [block["type"] for block in three["messages"][-1]["content"]] == ["tool_result"]  # said once, not every round
+    assert reports[0][1].web_searches == 3
+
+
+def test_no_note_about_searches_while_some_are_left():
+    first = reply([tool_use("call_1", "get_market", symbol="BTC")], "tool_use", usage(searches=2))
+    bot, client, _, _ = tooled([first, reply([text_block("回答")])])
+    bot.answer("BTC 现在怎么看", "", None, in_group=False)
+    assert [block["type"] for block in client.messages.calls[1]["messages"][-1]["content"]] == ["tool_result"]
 
 
 def test_a_paused_web_search_is_sent_back_to_continue():
@@ -428,7 +457,7 @@ def test_self_check_of_web_search():
 
 
 def test_the_instructions_ask_for_short_answers_with_exact_levels():
-    for expected in ("精确数字", "失效位", "get_market", "web_search", "search_knowledge", "不要凭印象", "由交易员自己决定"):
+    for expected in ("精确数字", "失效位", "get_market", "web_search", "search_knowledge", "不要凭印象", "由交易员自己决定", "搜索要精"):
         assert expected in ANALYST_SYSTEM
     assert "教学" not in ANALYST_SYSTEM
 

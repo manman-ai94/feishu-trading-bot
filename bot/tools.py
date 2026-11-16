@@ -28,6 +28,13 @@ WEB_TOOL_SETS: tuple[tuple[dict, ...], ...] = (
     (),
 )
 
+# Limits on the web tools. Every search is billed, and its results stay in the
+# conversation as input tokens, so searches are most of what a question costs.
+WEB_SEARCHES = 3  # searches in one request for an everyday question or a brief
+WEB_SEARCHES_DEEP = 6  # for a "深度" question and the weekly review
+WEB_FETCHES = 2  # pages opened in one request
+WEB_FETCH_TOKENS = 10000  # how much of an opened page the AI is given
+
 CLIENT_TOOLS: tuple[dict, ...] = (
     {
         "name": "get_market",
@@ -88,10 +95,15 @@ class Toolbox:
         self._knowledge = knowledge
         self._tz = tz
 
-    def definitions(self, web_level: int = 0) -> list[dict]:
+    def definitions(self, web_level: int = 0, web_searches: int = WEB_SEARCHES) -> list[dict]:
         """Tool definitions in a fixed order, so the cached prompt prefix stays the same."""
         tools = [tool for tool in CLIENT_TOOLS if tool["name"] != "search_knowledge" or self._knowledge is not None]
-        return tools + list(WEB_TOOL_SETS[min(web_level, len(WEB_TOOL_SETS) - 1)])
+        for tool in WEB_TOOL_SETS[min(web_level, len(WEB_TOOL_SETS) - 1)]:
+            if tool["name"] == "web_search":
+                tools.append({**tool, "max_uses": web_searches})
+            else:
+                tools.append({**tool, "max_uses": WEB_FETCHES, "max_content_tokens": WEB_FETCH_TOKENS})
+        return tools
 
     def run(self, name: str, tool_input) -> tuple[str, bool]:
         """Runs one client tool. Returns (text for the AI, whether it is an error)."""
