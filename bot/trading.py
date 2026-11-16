@@ -60,6 +60,10 @@ QUESTION_MARKS = (
 
 NUM = r"\d+(?:\.\d+)?"
 _CONFIRM = re.compile(r"(?:/confirm|确认|确定)\s*(\d{1,8})?")
+# A word that turns a reply to the card into a "no": "取消 4812", "4812 不要执行", "算了 4812", "4812 先等等".
+# Such a reply voids the preview; it is never taken as the confirmation, whatever code is in it.
+_REFUSAL = re.compile(r"取消|不|别|算了|等|停|撤|作废|放弃|慢|错|(?<![a-z])(?:no|not|don'?t|wait|cancel|stop|hold)(?![a-z])")
+REFUSED_NOTE = "refused"
 _POLITE = re.compile(r"^(?:请|麻烦|帮我|给我|帮忙)+\s*")
 _LATIN = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[-/][A-Za-z0-9]+){0,2}")
 _NOT_INSTRUMENTS = {"u", "usdt", "usdc", "usd", "sl", "tp", "oz", "all"}
@@ -149,7 +153,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 你本人在登记过的群里 @我 发这些指令，和私聊一样执行；回确认码也要 @我。群里其他人发的不执行
 
 **安全**
-- 每条指令我先回一张预览，你回复确认码才执行（“确认 4812”“4812”“确认4812执行”都行），回复“取消”作废，过期也作废
+- 每条指令我先回一张预览，你回复确认码才执行（“确认 4812”“4812”“确认4812执行”都行），回复“取消”作废；回复里只要带“取消、不要、别、先等等”这类话，即使有确认码也按作废处理；过期也作废
 - 不是标准写法也可以，例如“止损减两点”“把 3808 的止损挪到 3806”：我会先写出我理解成哪条指令，再出预览
 - “停止交易”：立刻不再接受开仓（平仓、撤单、改止损照常）。“恢复交易”解除
 - “交易设置”：看当前是模拟盘还是实盘、各项限额、这把 key 的权限
@@ -696,7 +700,8 @@ class TradeDesk:
     def _code_reply(self, text: str) -> Command | None:
         """While a preview waits, a short message with its code in it is the confirmation, however it is
         put: "4812", "确认4812执行", "好 4812". A four-digit number with "确认" in front that is not the
-        code is a wrong code, and is answered as one, never passed on as a question."""
+        code is a wrong code, and is answered as one, never passed on as a question. A reply to the card
+        with a "no" in it ("取消 4812", "4812 先别执行", "不确认") voids the preview instead."""
         with self._lock:
             pending = self._pending
         if pending is None:
@@ -705,6 +710,11 @@ class TradeDesk:
         if len(plain) > 24 or "?" in plain:
             return None
         numbers = re.findall(r"\d+", plain)
+        about_the_card = any(len(number) == len(pending.code) for number in numbers) or any(
+            word in plain for word in ("确认", "确定", "执行")
+        )
+        if about_the_card and _REFUSAL.search(plain):
+            return Command("abort", note=REFUSED_NOTE)
         if pending.code in numbers:
             return Command("confirm", code=pending.code)
         if len(numbers) == 1 and len(numbers[0]) == len(pending.code):
@@ -781,7 +791,7 @@ class TradeDesk:
         if kind == "confirm":
             return self._confirm(command)
         if kind == "abort":
-            return self._abort()
+            return self._abort(command.note == REFUSED_NOTE)
         if kind == "size":
             return self._size(command)
         if self._mode == "off":
@@ -858,11 +868,17 @@ class TradeDesk:
 
         return SelfTest(self, inst_id)
 
-    def _abort(self) -> Reply:
+    def _abort(self, refused: bool = False) -> Reply:
         with self._lock:
             pending, self._pending = self._pending, None
         if pending is None:
             return Reply("现在没有等待确认的指令。")
+        if refused:
+            log.info("a reply to the card said no: the preview is voided")
+            return Reply(
+                f"已作废：{pending.plan.title}。没有执行任何操作。\n"
+                "（你的回复里有“取消、不要、先等等”这类话，我按不执行处理。要执行就重新发指令，再只回确认码。）"
+            )
         return Reply(f"已作废：{pending.plan.title}。没有执行任何操作。")
 
     def _pause(self) -> Reply:

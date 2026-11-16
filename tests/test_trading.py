@@ -1044,6 +1044,28 @@ def test_the_code_counts_however_it_is_put(answer):
     assert [name for name, _ in bench.sent] == ["place_stop"]
 
 
+@pytest.mark.parametrize(
+    "answer",
+    ["取消 1111", "1111 不要执行", "别执行 1111", "不确认 1111", "1111取消", "算了 1111", "1111 先等等",
+     "不确认", "确认取消", "2222 取消", "no 1111", "1111 wait", "１１１１ 停"],
+)  # fmt: skip
+def test_a_reply_with_the_code_and_a_no_in_it_voids_the_preview(answer):
+    bench = Bench(FakeExchange([gold()]), trading="live", trade_actions=("stops", "close", "cancel"))
+    bench.say("止损 XAU 3816")
+    reply = bench.say(answer)
+    assert reply.text.startswith("已作废") and "没有执行任何操作" in reply.text and "只回确认码" in reply.text
+    assert bench.sent == []
+    assert bench.say("1111") is None  # nothing waits any more: the code went with the preview
+    assert bench.sent == []
+
+
+def test_cancel_with_the_code_never_closes_the_position():
+    bench = Bench(FakeExchange([gold()]), trading="live", trade_actions=("stops", "close", "cancel"))
+    assert "确认 1111" in bench.say("平仓 XAU").text
+    assert bench.say("取消 1111").text.startswith("已作废")
+    assert bench.sent == []
+
+
 def test_a_wrong_code_is_answered_as_one_and_a_number_alone_is_nothing_without_a_preview():
     bench = Bench(FakeExchange([gold()]))
     assert bench.say("1111") is None  # nothing waiting: just a number, for the rest of the bot
