@@ -35,3 +35,17 @@ def test_secrets_are_masked_in_messages_and_tracebacks(tmp_path):
     for secret in ("okx-key-1234567890", "Passphrase!2026", "OKXSECRET99887766", "sk-ant-test-0123456789", "feishu-secret-abcdef", "0f8e7d6c-uuid"):
         assert secret not in text
     assert text.count("***") >= 6 and "ValueError" in text and "short values like pass" in text
+
+
+def test_the_websocket_library_never_logs_its_frames(tmp_path):
+    root = logging.getLogger()
+    saved = root.handlers[:], root.level
+    try:
+        setup_logging(make_cfg(log_dir=tmp_path))
+        root.setLevel(logging.DEBUG)  # someone looking into a problem
+        assert not logging.getLogger("websockets.client").isEnabledFor(logging.DEBUG)
+        assert logging.getLogger("bot.monitor").isEnabledFor(logging.DEBUG)
+    finally:
+        for handler in root.handlers:
+            handler.close()
+        root.handlers, root.level = saved

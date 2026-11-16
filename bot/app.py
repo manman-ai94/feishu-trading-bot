@@ -69,6 +69,9 @@ def setup_logging(cfg: Config) -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers = [file_handler, console]
+    # At DEBUG the websockets library writes every frame, the stream's login with its key included.
+    # Kept at WARNING even if someone turns the root logger down to DEBUG to look into a problem.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
 def build_okx(cfg: Config) -> OkxClient:
