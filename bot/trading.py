@@ -160,6 +160,13 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 # --------------------------------------------------------------------------- commands
 
 
+def new_confirmation_code() -> str:
+    """A random four-digit code that never looks like a gold price (3000-4999), so a price typed
+    while a preview waits cannot be taken for the confirmation by chance."""
+    n = secrets.randbelow(7000)
+    return str(n + 1000 if n < 2000 else n + 3000)
+
+
 @dataclass(frozen=True)
 class Command:
     """What the owner asked for, as far as the words alone say it."""
@@ -663,7 +670,7 @@ class TradeDesk:
         self._mode = cfg.trading if trader is not None and cfg.trading_on else "off"
         self._clock = clock
         self._sleep = sleep
-        self._new_code = new_code or (lambda: f"{secrets.randbelow(9000) + 1000}")
+        self._new_code = new_code or new_confirmation_code
         self._new_id = new_id or (lambda: "ftb" + uuid.uuid4().hex[:24])
         self._day_change = day_change
         self._parser = CommandParser(resolver or InstrumentResolver(reader, clock), lambda: cfg.tradable_instruments)

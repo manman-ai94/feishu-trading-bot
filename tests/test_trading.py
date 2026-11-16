@@ -18,7 +18,7 @@ from bot.models import (
     Ticker,
 )
 from bot.okx_client import OkxError, OkxNetworkError
-from bot.trading import PAUSED_SETTING, Command, CommandParser, TradeDesk
+from bot.trading import PAUSED_SETTING, Command, CommandParser, TradeDesk, new_confirmation_code
 
 from .helpers import Clock, make_cfg, make_position
 
@@ -1311,3 +1311,10 @@ def test_an_order_with_stops_attached_counts_as_an_opening_order():
     bench = Bench(trade_actions=("limit",))
     assert "确认 1111" in bench.say("限价做多 XAU 100张 3850 止损 3800").text
     assert "“市价开仓和加仓”现在没有开放" in bench.say("做多 XAU 100张").text
+
+
+def test_confirmation_codes_never_look_like_a_gold_price():
+    codes = {new_confirmation_code() for _ in range(5000)}
+    assert all(len(code) == 4 and code.isdigit() for code in codes)
+    assert not any(3000 <= int(code) <= 4999 for code in codes)
+    assert any(int(code) < 3000 for code in codes) and any(int(code) >= 5000 for code in codes)
