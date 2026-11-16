@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable
 
@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 
 QTY_TOLERANCE = 1e-9
 FAILURES_BEFORE_ALERT = 3
+NO_STOP_REPEAT_SECONDS = 24 * 3600  # a position left without a stop is pointed out again this often
+NO_STOP_SETTING = "no_stop_alert:"  # in the journal: when each position was last pointed out, so a restart does not repeat it
 
 
 @dataclass(frozen=True)
@@ -225,6 +227,7 @@ class Monitor:
         self._positions: dict[tuple, Position] | None = None
         self._last_snapshot_at = 0.0
         self._cooldowns: dict[tuple[str, str], float] = {}
+        self._bare_since: dict[tuple, float] = {}  # positions without a stop-loss, and since when
         self._failures = 0
         self._down_reported = False
         self.last_error: str = ""
@@ -250,6 +253,16 @@ class Monitor:
             return None
         self._on_success()
 
+        if not state.stops_known and self._positions:
+            # The stop orders could not be read this time. That is not "the stops are gone":
+            # each position keeps the stops it was last seen with.
+            state = replace(
+                state,
+                positions=[
+                    replace(position, stops=self._positions[position.key].stops) if position.key in self._positions else position
+                    for position in state.positions
+                ],
+            )
         current = {position.key: position for position in state.positions}
         events: list[Event] = []
         if self._positions is None:
@@ -267,6 +280,7 @@ class Monitor:
         for event in check_risk(state, self._cfg, self.day_start_equity()):
             if self._cooled_down(event, now):
                 events.append(event)
+        events.extend(self._without_stops(state, now))
 
         for event in events:
             self._journal.record_event(event.kind, event.title + "；" + "；".join(event.private_lines), event.inst_id, ts=now)
@@ -282,6 +296,61 @@ class Monitor:
             stop.wait(self._cfg.poll_seconds)
 
     # ------------------------------------------------------------- internals
+
+    def _without_stops(self, state: AccountState, now: float) -> list[Event]:
+        """Positions that have gone without a stop-loss for longer than the owner allows.
+
+        Each is pointed out once, and again a day later while it stays that way.
+        Whether to set a stop, and where, stays the owner's decision.
+        """
+        minutes = self._cfg.alert_no_stop_minutes
+        if minutes is None or not state.stops_known:
+            return []
+        events: list[Event] = []
+        seen = set()
+        for position in state.positions:
+            key = position.key
+            seen.add(key)
+            name = NO_STOP_SETTING + "|".join(key)
+            if position.stop_loss is not None:
+                if self._bare_since.pop(key, None) is not None or self._journal.get_setting(name):
+                    self._journal.set_setting(name, "")  # it has a stop now: the next time starts afresh
+                continue
+            since = self._bare_since.setdefault(key, now)
+            if now - since < minutes * 60:
+                continue
+            try:
+                last = float(self._journal.get_setting(name) or 0)
+            except ValueError:
+                last = 0.0
+            if now - last < NO_STOP_REPEAT_SECONDS:
+                continue
+            self._journal.set_setting(name, repr(now))
+            events.append(self._no_stop_event(position, minutes))
+        for key in [key for key in self._bare_since if key not in seen]:
+            del self._bare_since[key]  # closed
+            self._journal.set_setting(NO_STOP_SETTING + "|".join(key), "")
+        return events
+
+    def _no_stop_event(self, position: Position, minutes: float) -> Event:
+        cfg = self._cfg
+        lines = [
+            f"数量 {_size(position)}，均价 {_px(position.avg_px)}，标记价 {_px(position.mark_px)}，"
+            f"浮动盈亏 {_money(position.upl, position.pnl_ccy)}"
+        ]
+        if position.liq_px and position.liq_distance_pct is not None:
+            lines.append(f"预估强平价 {_px(position.liq_px)}，离现在的标记价 {position.liq_distance_pct:.2f}%")
+        lines.append(f"这个仓位已经 {minutes:g} 分钟以上没有止损单。设不设、设在哪由你决定。")
+        if cfg.trading == "live" and "stops" in cfg.trade_actions and position.inst_id in cfg.tradable_instruments:
+            lines.append(f"要设的话，私聊发“止损 {position.inst_id.split('-')[0]} 价格”，我先回预览。")
+        lines.append("挂上止损后不再提醒；一直不挂，每 24 小时提醒一次。")
+        return Event(
+            kind="no_stop",
+            title=f"还没有止损：{position.inst_id} {_side(position)}单",
+            inst_id=position.inst_id,
+            private_lines=tuple(lines),
+            warning=True,
+        )
 
     def _cooled_down(self, event: Event, now: float) -> bool:
         key = (event.kind, event.inst_id)

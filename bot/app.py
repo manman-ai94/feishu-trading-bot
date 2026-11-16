@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .analyst import Analyst, Usage
 from .config import Config
+from .crowd import Crowd
 from .envfile import write_env_values
 from .feishu_client import FeishuClient, IncomingMessage
 from .instruments import InstrumentResolver
@@ -76,7 +77,14 @@ def build_trade_desk(cfg: Config, journal: Journal, okx: OkxClient, resolver: In
     return TradeDesk(cfg, journal, okx, build_trader(cfg), resolver, day_change=day_change)
 
 
-def build_ai(cfg: Config, okx: OkxClient, journal: Journal) -> tuple[Analyst, InstrumentResolver, KnowledgeBase]:
+def build_crowd(cfg: Config, okx: OkxClient) -> Crowd | None:
+    """Where the crowd's positions are read from. None when the owner switched that off."""
+    return Crowd(okx, cfg.tz) if cfg.crowd_data else None
+
+
+def build_ai(
+    cfg: Config, okx: OkxClient, journal: Journal, crowd: Crowd | None = None
+) -> tuple[Analyst, InstrumentResolver, KnowledgeBase]:
     """The analyst with its tools, metered into the journal."""
     resolver = InstrumentResolver(okx)
     knowledge = KnowledgeBase(cfg.knowledge_dir)
@@ -100,7 +108,11 @@ def build_ai(cfg: Config, okx: OkxClient, journal: Journal) -> tuple[Analyst, In
         journal.record_analysis(purpose, levels.inst_id, levels.bias, ref_px, scenarios, question[:120])
 
     analyst = Analyst(
-        cfg, toolbox=Toolbox(okx, resolver, knowledge, cfg.tz), on_usage=record, month_spend=month_spend, on_levels=keep_levels
+        cfg,
+        toolbox=Toolbox(okx, resolver, knowledge, cfg.tz, crowd),
+        on_usage=record,
+        month_spend=month_spend,
+        on_levels=keep_levels,
     )
     return analyst, resolver, knowledge
 
@@ -119,9 +131,10 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     setup_logging(cfg)
     journal = Journal(cfg.db_path)
     okx = build_okx(cfg)
-    analyst, resolver, knowledge = build_ai(cfg, okx, journal)
+    crowd = build_crowd(cfg, okx)
+    analyst, resolver, knowledge = build_ai(cfg, okx, journal, crowd)
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
-    reporter = Reporter(cfg, feishu, okx, analyst, journal)
+    reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd)
     monitor = Monitor(okx, cfg, journal, reporter.notify_event)
     reporter.monitor = monitor
 
@@ -146,9 +159,9 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     if cfg.trading_blocked:
         log.warning("trading stays off: the TRADING setting in .env cannot be honoured")
     log.info(
-        "AI: questions on %s (%s), deep on %s (%s), web search %s, %d knowledge file(s)",
+        "AI: questions on %s (%s), deep on %s (%s), web search %s, crowd data %s, %d knowledge file(s)",
         cfg.model_daily, cfg.effort_daily, cfg.model_deep, cfg.effort_deep,
-        "on" if cfg.web_search else "off", len(knowledge.summary()),
+        "on" if cfg.web_search else "off", "on" if crowd is not None else "off", len(knowledge.summary()),
     )  # fmt: skip
 
     stop = threading.Event()

@@ -29,7 +29,7 @@ EVENT_COLOURS = {
     "stop_changed": "yellow",
     "okx_recovered": "green",
 }
-RISK_KINDS = ("margin_warning", "liq_warning", "daily_loss")
+RISK_KINDS = ("margin_warning", "liq_warning", "daily_loss", "no_stop")
 
 
 class Reporter:
@@ -41,6 +41,7 @@ class Reporter:
         analyst: Analyst,
         journal: Journal,
         clock: Callable[[], float] = time.time,
+        crowd=None,
     ):
         self._cfg = cfg
         self._feishu = feishu
@@ -48,6 +49,7 @@ class Reporter:
         self._analyst = analyst
         self._journal = journal
         self._clock = clock
+        self._crowd = crowd  # crowd.Crowd, or None when CROWD_DATA is off
         self.monitor: Monitor | None = None  # set by the app once both exist
 
     # ----------------------------------------------------------- destinations
@@ -116,8 +118,23 @@ class Reporter:
     # ----------------------------------------------------------------- briefs
 
     def market_text(self) -> str:
-        blocks = [build_market_context(self._okx, inst_id).to_text() for inst_id in self._cfg.watch_instruments]
+        """What a brief or a review is written from: every watched instrument, and how the crowd stands in it."""
+        blocks = []
+        for inst_id in self._cfg.watch_instruments:
+            blocks.append(build_market_context(self._okx, inst_id).to_text())
+            crowd = self._crowd_text(inst_id)
+            if crowd:
+                blocks.append(crowd)
         return "\n\n".join(blocks)
+
+    def _crowd_text(self, inst_id: str) -> str:
+        if self._crowd is None:
+            return ""
+        try:
+            return self._crowd.text(inst_id)
+        except Exception:  # background only: a brief is never held up for it
+            log.exception("could not read how the crowd is positioned in %s", inst_id)
+            return ""
 
     def send_brief(self, kind: str) -> None:
         """kind is 'morning' or 'evening'.

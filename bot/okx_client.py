@@ -204,6 +204,27 @@ class OkxClient:
         row = data[0]
         return OpenInterest(coins=to_float(row.get("oiCcy")), usd=to_float(row.get("oiUsd")))
 
+    def top_trader_ratio(self, inst_id: str, by: str = "account", period: str = "1H") -> list[tuple[int, float]]:
+        """Long/short ratio of OKX's top traders in one contract, newest first: (time in ms, ratio).
+
+        by="account" counts accounts that are net long against those net short;
+        by="position" compares the size of their long and short positions.
+        """
+        kind = "position" if by == "position" else "account"
+        data = self._get(
+            f"/api/v5/rubik/stat/contracts/long-short-{kind}-ratio-contract-top-trader",
+            {"instId": inst_id, "period": period},
+        )
+        rows = []
+        for row in data:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            ts, ratio = to_float(row[0]), to_float(row[1])
+            if ts is not None and ratio is not None:
+                rows.append((int(ts), ratio))
+        rows.sort(reverse=True)
+        return rows
+
     # --------------------------------------------------------------- private
 
     def balance(self) -> AccountSnapshot:
@@ -259,18 +280,22 @@ class OkxClient:
         """Balance + positions, with stop orders attached to their positions."""
         snapshot = self.balance()
         positions = self.positions()
+        stops_known = True
         if positions:
             try:
                 positions = attach_stops(positions, self.pending_stops())
             except (OkxError, OkxNetworkError) as exc:
-                # Stops are a nice-to-have; never lose the positions because of them.
+                # Never lose the positions because of the stops; say that the stops are not known.
+                stops_known = False
                 log.warning("could not read pending stop orders: %s", exc)
         if snapshot.mgn_ratio is None:
             # Still nothing at account or currency level: a cross position carries the ratio of its margin pool.
             ratios = [p.mgn_ratio for p in positions if p.mgn_mode == "cross" and p.mgn_ratio is not None]
             if ratios:
                 snapshot = replace(snapshot, mgn_ratio=min(ratios))
-        return AccountState(snapshot=snapshot, positions=[self._with_coins(position) for position in positions])
+        return AccountState(
+            snapshot=snapshot, positions=[self._with_coins(position) for position in positions], stops_known=stops_known
+        )
 
     def _with_coins(self, position: Position) -> Position:
         """Adds what the contracts add up to (10000 contracts of 0.001 XAU are 10 XAU)."""

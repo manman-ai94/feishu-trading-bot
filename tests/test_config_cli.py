@@ -395,3 +395,25 @@ def test_heartbeat_and_backup_settings(tmp_path):
             del os.environ[name]
     cfg, problems = load_config(write_env(tmp_path, "HEARTBEAT_URL=ftp://somewhere\n"))
     assert cfg.heartbeat_url == "" and any("HEARTBEAT_URL" in problem for problem in problems)
+
+
+def actions_from(tmp_path, line: str):
+    os.environ.pop("TRADE_ACTIONS", None)  # a file never overrides what an earlier one put in the environment
+    cfg, problems = load_config(write_env(tmp_path, line))
+    return cfg.trade_actions, [item for item in problems if "TRADE_ACTIONS" in item]
+
+
+def test_every_order_action_is_open_unless_the_file_narrows_them(tmp_path):
+    everything = ("stops", "close", "cancel", "limit", "open")
+    assert actions_from(tmp_path, LIVE_KEYS) == (everything, [])
+    assert actions_from(tmp_path, "TRADE_ACTIONS=all\n") == (everything, [])
+    assert actions_from(tmp_path, "TRADE_ACTIONS=stops\n") == (("stops",), [])
+    assert actions_from(tmp_path, "TRADE_ACTIONS= Close , STOPS，cancel\n") == (("stops", "close", "cancel"), [])  # one fixed order
+    assert actions_from(tmp_path, "TRADE_ACTIONS=none\n") == ((), [])
+
+
+def test_a_misspelt_order_action_opens_nothing(tmp_path):
+    actions, problems = actions_from(tmp_path, "TRADE_ACTIONS=stops,opne,everything\n")
+    assert actions == ("stops",) and "看不懂的词：opne、everything" in problems[0]
+    actions, problems = actions_from(tmp_path, "TRADE_ACTIONS=stop\n")  # the word is "stops"
+    assert actions == () and len(problems) == 1

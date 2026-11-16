@@ -240,6 +240,7 @@ class AccountState:
 
     snapshot: AccountSnapshot
     positions: list[Position] = field(default_factory=list)
+    stops_known: bool = True  # False when the stop orders could not be read: "no stop" then means "not known"
 
 
 # OKX renamed level 2 from "现货和合约模式" to "合约模式" (its help centre, November 2026).

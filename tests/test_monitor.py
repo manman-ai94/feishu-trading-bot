@@ -211,3 +211,146 @@ def test_day_start_equity_is_the_first_snapshot_of_the_local_day():
     clock.advance(16 * 60)
     monitor.poll_once()
     assert monitor.day_start_equity() == 10000.0
+
+
+# ------------------------------------------------------ positions without a stop
+
+
+def bare(**overrides):
+    return make_state([make_position(stops=(), **overrides)])
+
+
+def test_a_position_left_without_a_stop_is_pointed_out_once_and_again_a_day_later():
+    monitor, _, events, clock, _ = build(bare())
+    monitor.poll_once()
+    clock.advance(9 * 60)
+    monitor.poll_once()
+    assert events == []  # ten minutes' grace: the stop may be on its way
+    clock.advance(61)
+    monitor.poll_once()
+    [event] = events
+    assert event.kind == "no_stop" and event.title == "还没有止损：XAU-USDT-SWAP 多单" and event.warning
+    text = "\n".join(event.private_lines)
+    assert "数量 2 张，均价 2,650.00，标记价 2,660.00，浮动盈亏 +20.00 USDT" in text
+    assert "预估强平价 2,400.00，离现在的标记价 9.77%" in text
+    assert "设不设、设在哪由你决定" in text and "每 24 小时提醒一次" in text
+
+    clock.advance(23 * 3600)
+    monitor.poll_once()
+    assert len(events) == 1
+    clock.advance(3600)
+    monitor.poll_once()
+    assert kinds(events) == ["no_stop", "no_stop"]
+
+
+def test_setting_a_stop_ends_it_and_taking_it_off_starts_again():
+    monitor, okx, events, clock, _ = build(bare())
+    monitor.poll_once()
+    clock.advance(11 * 60)
+    monitor.poll_once()
+    okx.state = make_state()  # the stop is on
+    clock.advance(60)
+    monitor.poll_once()
+    okx.state = bare()  # and off again an hour later
+    clock.advance(3600)
+    monitor.poll_once()
+    assert kinds(events) == ["no_stop", "stop_changed", "stop_changed"]
+    clock.advance(11 * 60)
+    monitor.poll_once()
+    assert kinds(events)[-1] == "no_stop" and kinds(events).count("no_stop") == 2  # not held back by the day's wait
+
+
+def test_a_restart_does_not_repeat_the_reminder():
+    monitor, okx, events, clock, journal = build(bare())
+    monitor.poll_once()
+    clock.advance(11 * 60)
+    monitor.poll_once()
+    assert kinds(events) == ["no_stop"]
+
+    again = []
+    restarted = Monitor(okx, make_cfg(), journal, again.append, clock)
+    restarted.poll_once()
+    clock.advance(11 * 60)
+    restarted.poll_once()
+    assert again == []
+    clock.advance(24 * 3600)
+    restarted.poll_once()
+    assert kinds(again) == ["no_stop"]
+
+
+def test_a_closed_position_is_forgotten():
+    monitor, okx, events, clock, _ = build(bare())
+    monitor.poll_once()
+    clock.advance(11 * 60)
+    monitor.poll_once()
+    okx.state = make_state([])
+    clock.advance(60)
+    monitor.poll_once()
+    okx.state = bare()  # opened again, still without a stop
+    clock.advance(60)
+    monitor.poll_once()
+    clock.advance(11 * 60)
+    monitor.poll_once()
+    assert kinds(events) == ["no_stop", "closed", "opened", "no_stop"]
+
+
+def test_the_reminder_can_be_switched_off_or_given_more_time():
+    monitor, _, events, clock, _ = build(bare(), alert_no_stop_minutes=None)
+    monitor.poll_once()
+    clock.advance(3600)
+    monitor.poll_once()
+    assert events == []
+
+    monitor, _, events, clock, _ = build(bare(), alert_no_stop_minutes=60)
+    monitor.poll_once()
+    clock.advance(59 * 60)
+    monitor.poll_once()
+    assert events == []
+    clock.advance(61)
+    monitor.poll_once()
+    assert kinds(events) == ["no_stop"] and "已经 60 分钟以上没有止损单" in "\n".join(events[0].private_lines)
+
+
+def test_a_take_profit_alone_is_not_a_stop():
+    from bot.models import StopOrder
+
+    monitor, _, events, clock, _ = build(make_state([make_position(stops=(StopOrder("a1", None, 2700.0),))]))
+    monitor.poll_once()
+    clock.advance(11 * 60)
+    monitor.poll_once()
+    assert kinds(events) == ["no_stop"]
+
+
+def test_stops_that_could_not_be_read_are_neither_gone_nor_missing():
+    from dataclasses import replace
+
+    monitor, okx, events, clock, _ = build()
+    monitor.poll_once()
+    unread = replace(make_state([make_position(stops=())]), stops_known=False)  # OKX did not answer for the stop orders
+    okx.state = unread
+    for _ in range(3):
+        clock.advance(11 * 60)
+        monitor.poll_once()
+    assert events == []  # no "止损 变为 无", no reminder
+    assert monitor.state.positions[0].stop_loss == 2630.0  # what was last seen stands
+
+    monitor, okx, events, clock, _ = build(replace(bare(), stops_known=False))  # unknown from the very start
+    monitor.poll_once()
+    clock.advance(11 * 60)
+    monitor.poll_once()
+    assert events == []
+
+
+def test_the_reminder_says_how_to_set_one_only_when_that_would_reach_this_account():
+    def text(**cfg):
+        monitor, _, events, clock, _ = build(bare(), **cfg)
+        monitor.poll_once()
+        clock.advance(11 * 60)
+        monitor.poll_once()
+        return "\n".join(events[0].private_lines)
+
+    hint = "私聊发“止损 XAU 价格”"
+    assert hint in text(trading="live")
+    assert hint not in text(trading="live", trade_actions=("close",))
+    assert hint not in text(trading="demo")  # an order would go to the demo account, not to this position
+    assert hint not in text()

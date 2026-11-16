@@ -1148,3 +1148,56 @@ def test_the_settings_say_when_the_account_cannot_trade_contracts():
 
 def test_the_settings_show_no_funds_while_trading_is_off():
     assert "账户资金" not in Bench(trading="off").say("交易设置").text
+
+
+# ------------------------------------------- opening the real account step by step
+
+
+def test_only_the_actions_that_are_open_are_carried_out():
+    bench = Bench(FakeExchange([gold()]), trading="live", trade_actions=("stops",))
+    for text, name in (
+        ("做多 XAU 100张", "市价开仓和加仓"),
+        ("加仓 XAU 100张", "市价开仓和加仓"),
+        ("限价做多 XAU 100张 3850", "限价挂单"),
+        ("平仓 XAU", "平仓和减仓"),
+        ("全部平仓", "平仓和减仓"),
+        ("撤单 XAU", "撤单"),
+    ):
+        reply = bench.say(text)
+        assert f"“{name}”现在没有开放，这条指令没有执行。现在只开放：设置和取消止盈止损。" in reply.text, reply.text
+        assert "TRADE_ACTIONS" in reply.text and "确认" not in reply.text
+    assert bench.say("确认 1111").text == "现在没有等待确认的指令。"  # a refusal leaves nothing to confirm
+    assert bench.sent == []  # nothing of it reached OKX
+
+    done = bench.run("止损 XAU 3860")  # the one thing that is open works as ever
+    assert [name for name, _ in bench.sent] == ["place_stop"] and done.title == "已执行 · 实盘"
+    bench.run("取消止损 XAU", code="2222")
+    assert [name for name, _ in bench.sent] == ["place_stop", "cancel_stops"]
+
+
+def test_looking_is_always_allowed_and_the_settings_say_what_is_open():
+    bench = Bench(FakeExchange([gold()]), trading="live", trade_actions=("stops", "close"))
+    settings = bench.say("交易设置").text
+    assert "**开放的操作**：现在只开放：设置和取消止盈止损、平仓和减仓。没有开放：撤单、限价挂单、市价开仓和加仓" in settings
+    assert "现在只开放：设置和取消止盈止损、平仓和减仓。" in bench.say("交易帮助").text
+    assert bench.say("挂单") is not None and "没有开放" not in bench.say("挂单").text
+    assert "确认 1111" in bench.say("平仓 XAU").text
+
+    everything = Bench().say("交易设置").text
+    assert "**开放的操作**：全部" in everything and "没有开放" not in everything
+    assert "只开放" not in Bench().say("交易帮助").text
+
+
+def test_with_nothing_open_every_order_command_is_refused():
+    bench = Bench(FakeExchange([gold()]), trade_actions=())
+    for text in ("做多 XAU 100张", "平仓 XAU", "止损 XAU 3860", "撤单 XAU"):
+        assert "现在没有开放任何下单操作" in bench.say(text).text
+    assert bench.sent == [] and "没有开放任何下单操作" in bench.say("交易设置").text
+
+
+def test_an_order_with_stops_attached_counts_as_an_opening_order():
+    bench = Bench(trade_actions=("stops",))
+    assert "“市价开仓和加仓”现在没有开放" in bench.say("做多 XAU 100张 止损 3860").text
+    bench = Bench(trade_actions=("limit",))
+    assert "确认 1111" in bench.say("限价做多 XAU 100张 3850 止损 3800").text
+    assert "“市价开仓和加仓”现在没有开放" in bench.say("做多 XAU 100张").text

@@ -371,3 +371,19 @@ def test_open_interest_without_data_or_fields():
     assert okx.open_interest("XAU-USDT-SWAP") is None
     interest = okx.open_interest("XAU-USDT-SWAP")
     assert interest.coins is None and interest.usd is None
+
+
+def test_account_state_says_when_the_stops_are_not_known():
+    routes = {
+        "/api/v5/account/balance": [ok([{"totalEq": "1000", "details": []}])],
+        "/api/v5/account/positions": [ok([{"instId": "XAU-USDT-SWAP", "instType": "SWAP", "pos": "2", "posSide": "net", "mgnMode": "cross", "avgPx": "2650"}])],
+        "/api/v5/public/instruments": [XAU_RULES],
+        "/api/v5/trade/orders-algo-pending": [ok([])],
+    }  # fmt: skip
+    okx, _ = client(routes)
+    assert okx.account_state().stops_known is True
+
+    routes["/api/v5/trade/orders-algo-pending"] = [requests.ConnectionError("down")]
+    okx, _ = client(routes)
+    state = okx.account_state()
+    assert state.stops_known is False and len(state.positions) == 1 and state.positions[0].stop_loss is None

@@ -1,8 +1,9 @@
 """The tools the AI may call while it works on an answer.
 
-Client tools (run here, on the server): market data and candles from OKX, and
-a search of the owner's knowledge base. Server tools (run by Anthropic): web
-search and web fetch, for news and economic data.
+Client tools (run here, on the server): market data and candles from OKX, a
+search of the owner's knowledge base, and how the crowd is positioned
+(crowd.py). Server tools (run by Anthropic): web search and web fetch, for
+news and economic data.
 
 Every tool only reads. None of them touches the account or places an order.
 """
@@ -81,7 +82,23 @@ CLIENT_TOOLS: tuple[dict, ...] = (
             "required": ["query"],
         },
     },
+    {
+        "name": "get_positioning",
+        "description": (
+            "How other traders are positioned in one instrument: the long/short ratio of OKX's top traders, by number "
+            "of accounts and by size of positions, now and 24 hours ago; and for gold the latest weekly CFTC report of "
+            "managed-money positions in COMEX gold futures. Background for judging crowding and risk only: never the "
+            "basis of a price level and never a signal on its own. Say when the data is from."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"symbol": {"type": "string", "description": "Ticker, name or OKX instrument id."}},
+            "required": ["symbol"],
+        },
+    },
 )
+# Offered only when the toolbox was given what the tool reads from.
+OPTIONAL_TOOLS = {"search_knowledge": "_knowledge", "get_positioning": "_crowd"}
 
 
 class ToolError(Exception):
@@ -89,15 +106,20 @@ class ToolError(Exception):
 
 
 class Toolbox:
-    def __init__(self, okx, resolver: InstrumentResolver, knowledge: KnowledgeBase | None, tz: ZoneInfo):
+    def __init__(self, okx, resolver: InstrumentResolver, knowledge: KnowledgeBase | None, tz: ZoneInfo, crowd=None):
         self._okx = okx
         self._resolver = resolver
         self._knowledge = knowledge
         self._tz = tz
+        self._crowd = crowd  # crowd.Crowd, or None when CROWD_DATA is off
 
     def definitions(self, web_level: int = 0, web_searches: int = WEB_SEARCHES) -> list[dict]:
         """Tool definitions in a fixed order, so the cached prompt prefix stays the same."""
-        tools = [tool for tool in CLIENT_TOOLS if tool["name"] != "search_knowledge" or self._knowledge is not None]
+        tools = [
+            tool
+            for tool in CLIENT_TOOLS
+            if tool["name"] not in OPTIONAL_TOOLS or getattr(self, OPTIONAL_TOOLS[tool["name"]]) is not None
+        ]
         for tool in WEB_TOOL_SETS[min(web_level, len(WEB_TOOL_SETS) - 1)]:
             if tool["name"] == "web_search":
                 tools.append({**tool, "max_uses": web_searches})
@@ -116,6 +138,8 @@ class Toolbox:
                 return self._candles(tool_input), False
             if name == "search_knowledge":
                 return self._search(tool_input), False
+            if name == "get_positioning":
+                return self._positioning(tool_input), False
             raise ToolError(f"没有叫 {name} 的工具。")
         except ToolError as exc:
             return str(exc), True
@@ -161,3 +185,12 @@ class Toolbox:
         if self._knowledge is None:
             raise ToolError("资料库没有启用。")
         return self._knowledge.search_text(query.strip())
+
+    def _positioning(self, tool_input: dict) -> str:
+        inst_id = self._instrument(tool_input)
+        if self._crowd is None:
+            raise ToolError("群体持仓数据没有打开。")
+        text = self._crowd.text(inst_id)
+        if not text:
+            raise ToolError(f"{inst_id} 没有群体持仓数据。OKX 只给合约提供大户多空比，CFTC 周报目前只接了黄金。")
+        return text

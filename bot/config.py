@@ -25,6 +25,9 @@ WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 OFF_WORDS = ("off", "none", "关")  # how the owner switches a feature off in .env
 EFFORTS = ("low", "medium", "high", "xhigh", "max")  # how hard the AI thinks; higher costs more and takes longer
 TRADING_MODES = ("off", "demo", "live")
+# What an order command may do, from the least risk to the most. TRADE_ACTIONS
+# names the ones that are open, so the real account can be opened step by step.
+TRADE_ACTIONS = ("stops", "close", "cancel", "limit", "open")
 MARGIN_MODES = ("cross", "isolated")
 
 
@@ -115,6 +118,7 @@ class Config:
     web_search: bool = True  # the AI may search the web for news and economic data
     ai_monthly_budget_usd: float | None = 180.0  # above this the AI switches to its cheapest setting
     knowledge_dir: Path = Path("knowledge")
+    crowd_data: bool = True  # show the AI how the crowd is positioned: OKX's top-trader ratios, the CFTC's weekly report
     track_record: bool = True  # keep the levels the AI gives and score them against the market later
     track_window_hours: int = 72  # how long a scenario is watched
 
@@ -126,6 +130,7 @@ class Config:
     alert_liq_distance_pct: float | None = 5.0
     alert_daily_loss_usd: float | None = None
     alert_cooldown_minutes: int = 30
+    alert_no_stop_minutes: float | None = 10.0  # a position this long without a stop-loss is pointed out
     brief_morning: time | None = time(6, 0)
     brief_evening: time | None = time(14, 0)
     weekly_review: tuple[int, time] | None = (6, time(17, 0))
@@ -153,6 +158,7 @@ class Config:
     trade_margin_mode: str = "cross"  # for a new position; an existing one keeps its own
     trade_confirm_seconds: int = 120
     trade_require_stop: bool = False  # refuse an opening order that carries no stop-loss
+    trade_actions: tuple[str, ...] = TRADE_ACTIONS  # the kinds of command that are carried out; the rest are refused
 
     @property
     def tz(self) -> ZoneInfo:
@@ -271,6 +277,19 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         problems.append(trading_blocked + "。下单功能保持关闭")
         trading = "off"
 
+    actions_raw = _get("TRADE_ACTIONS", "all").lower().replace("，", ",")
+    if actions_raw == "all":
+        trade_actions = TRADE_ACTIONS
+    else:
+        asked = [word.strip() for word in actions_raw.split(",") if word.strip() and word.strip() != "none"]
+        unknown = [word for word in asked if word not in TRADE_ACTIONS]
+        if unknown:
+            # A word that cannot be read never opens anything: only what is spelled right is open.
+            problems.append(
+                f"TRADE_ACTIONS 里有看不懂的词：{'、'.join(unknown)}。能填的是 {'、'.join(TRADE_ACTIONS)}，或者 all；看不懂的词按没写处理"
+            )
+        trade_actions = tuple(action for action in TRADE_ACTIONS if action in asked)
+
     margin_mode = _get("TRADE_MARGIN_MODE", "cross").lower()
     if margin_mode not in MARGIN_MODES:
         problems.append(f"TRADE_MARGIN_MODE 只能填 cross（全仓）或 isolated（逐仓），现在是 {margin_mode!r}")
@@ -305,6 +324,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         web_search=_get_bool("WEB_SEARCH", True),
         ai_monthly_budget_usd=_get_float("AI_MONTHLY_BUDGET_USD", 180.0, problems),
         knowledge_dir=Path(_get("KNOWLEDGE_DIR", "knowledge")),
+        crowd_data=_get_bool("CROWD_DATA", True),
         track_record=_get_bool("TRACK_RECORD", True),
         track_window_hours=min(72, max(4, _get_int("TRACK_WINDOW_HOURS", 72, problems))),
         timezone=timezone,
@@ -314,6 +334,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         alert_liq_distance_pct=_get_float("ALERT_LIQ_DISTANCE_PCT", 5.0, problems),
         alert_daily_loss_usd=_get_float("ALERT_DAILY_LOSS_USD", None, problems),
         alert_cooldown_minutes=max(1, _get_int("ALERT_COOLDOWN_MINUTES", 30, problems)),
+        alert_no_stop_minutes=_get_float("ALERT_NO_STOP_MINUTES", 10.0, problems),
         brief_morning=_time("BRIEF_MORNING", "06:00"),
         brief_evening=_time("BRIEF_EVENING", "14:00"),
         weekly_review=weekly,
@@ -341,6 +362,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         trade_margin_mode=margin_mode,
         trade_confirm_seconds=max(20, _get_int("TRADE_CONFIRM_SECONDS", 120, problems)),
         trade_require_stop=_get_bool("TRADE_REQUIRE_STOP", False),
+        trade_actions=trade_actions,
     )
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:

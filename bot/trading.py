@@ -35,7 +35,7 @@ from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
 
-from .config import Config
+from .config import TRADE_ACTIONS, Config
 from .instruments import ALIASES, InstrumentResolver
 from .journal import Journal
 from .models import AccountConfig, AccountState, InstrumentSpec, OrderInfo, Position
@@ -73,6 +73,15 @@ _FILLER = re.compile(r"的仓位|仓位|的单子|单子|开仓|数量|现价|�
 _STOP_START = re.compile(r"^(?:设置|设|修改|改|移动|调整)?\s*(?=止损|止盈)|^/(?=sl|tp)", re.I)
 _FRACTION_WORDS = (("一半", Decimal("0.5")), ("半仓", Decimal("0.5")), ("三分之一", Decimal(1) / 3), ("四分之一", Decimal("0.25")))
 _EVERYTHING_WORDS = ("全部", "所有", "全平")
+
+# The kinds of command TRADE_ACTIONS opens and closes, in the owner's words.
+ACTION_NAMES = {
+    "stops": "设置和取消止盈止损",
+    "close": "平仓和减仓",
+    "cancel": "撤单",
+    "limit": "限价挂单",
+    "open": "市价开仓和加仓",
+}
 
 ABORT_WORDS = ("取消", "不要了", "算了", "取消下单", "/abort")
 PAUSE_WORDS = ("停止交易", "暂停交易", "停止下单", "暂停下单", "/stoptrading")
@@ -465,6 +474,15 @@ class CommandParser:
 # ------------------------------------------------------------------------------ plans
 
 
+def _action(command: Command) -> str:
+    """Which of the TRADE_ACTIONS a command belongs to."""
+    if command.kind == "stop":
+        return "stops"
+    if command.kind in ("close", "cancel"):
+        return command.kind
+    return "limit" if command.ord_type == "limit" else "open"
+
+
 class Refused(Exception):
     """A check said no. The message is for the owner, in plain words."""
 
@@ -625,6 +643,12 @@ class TradeDesk:
             return Reply(self._off_text())
         if kind == "unclear":
             return Reply(f"{command.note}\n没有执行任何操作。发“交易帮助”可以看全部写法。")
+        action = _action(command)
+        if action not in self._cfg.trade_actions:
+            raise Refused(
+                f"“{ACTION_NAMES[action]}”现在没有开放，这条指令没有执行。{self._actions_line()}"
+                "要开放它，需要在服务器的 .env 里改 TRADE_ACTIONS，飞书里改不了。"
+            )
         plan = self._plan(command)
         code = self._new_code()
         seconds = self._cfg.trade_confirm_seconds
@@ -695,7 +719,16 @@ class TradeDesk:
         if self._mode == "off":
             return "下单功能关闭（TRADING=off），发指令不会执行。"
         paused = "，开仓已暂停" if self._paused() else ""
-        return f"下单功能已打开，{MODE_LABELS[self._mode]}{paused}。"
+        return f"下单功能已打开，{MODE_LABELS[self._mode]}{paused}。{self._actions_line()}"
+
+    def _actions_line(self) -> str:
+        """Which kinds of command are open, when not all of them are. "" when all are."""
+        open_now = [ACTION_NAMES[action] for action in TRADE_ACTIONS if action in self._cfg.trade_actions]
+        if len(open_now) == len(TRADE_ACTIONS):
+            return ""
+        if not open_now:
+            return "现在没有开放任何下单操作，只能看挂单和设置。"
+        return f"现在只开放：{'、'.join(open_now)}。"
 
     def _off_text(self) -> str:
         lines = [
@@ -715,6 +748,11 @@ class TradeDesk:
             lines.append(f"- 配置有问题，所以保持关闭：{cfg.trading_blocked}")
         if self._mode != "off":
             lines.append("- 开仓已暂停（发“恢复交易”解除）" if self._paused() else "- 没有暂停")
+        closed = [ACTION_NAMES[action] for action in TRADE_ACTIONS if action not in cfg.trade_actions]
+        if closed:
+            lines.append(f"**开放的操作**：{self._actions_line()}没有开放：{'、'.join(closed)}")
+        else:
+            lines.append("**开放的操作**：全部（止盈止损、平仓、撤单、限价挂单、市价开仓）")
         lines.append(f"**允许下单的品种**：{'、'.join(cfg.tradable_instruments)}")
         lines.append("**限额**")
         lines.append(f"- 单笔上限 {cfg.trade_max_order_usd:,.0f} USDT（名义价值）")
@@ -746,7 +784,7 @@ class TradeDesk:
                 lines.append(f"- 账户模式：{account.level_name}")
         if self._mode != "off":
             lines.extend(self._funds_lines())
-        lines.append("限额和品种名单只能在服务器的 .env 里改，飞书里改不了。")
+        lines.append("限额、品种名单和开放哪些操作只能在服务器的 .env 里改，飞书里改不了。")
         return lines
 
     def _spot_mode_text(self) -> str:
