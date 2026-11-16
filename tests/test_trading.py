@@ -984,7 +984,8 @@ def test_a_first_stop_closes_the_whole_position():
     preview = bench.say("止损 XAU 3860")
     assert "**设置止盈止损 XAU-USDT-SWAP 多单**" in preview.text
     assert "仓位 10000 张（合 10 XAU），均价 3,844.8，现价 3,880.0" in preview.text
-    assert "止损 无 → 3,860.0（离现价 0.52%，按均价算触发时大约 +152.00 USDT）" in preview.text
+    # Two figures, each with its starting point: from now, and from the entry.
+    assert "止损 无 → 3,860.0（离现价 0.52%；触发时账户比现在少约 200.00 USDT，占权益 10.0%；从开仓均价算，这笔交易 +152.00 USDT）" in preview.text
     assert "止盈 无（不变）" in preview.text and "触发后按市价平掉整个仓位" in preview.text
     done = bench.say("确认 1111")
     assert bench.sent == [
@@ -1033,6 +1034,46 @@ def test_a_stop_too_tight_for_even_the_smallest_size_is_said_so():
     assert "最小的 1 张也会亏约 2.88 USDT" not in text  # 1 lot of 0.001 XAU over 2,880 is 2.88: still under 20
     bench = Bench(FakeExchange([]), risk_per_trade_pct=0.1)
     assert "最小的 1 张也会亏约 2.88 USDT，占权益 0.14%，超过了 0.1%" in bench.say("算仓位 XAU 止损 1000").text
+
+
+@pytest.mark.parametrize("answer", ["1111", "确认1111执行", "确认 1111 执行", "好 1111", "确认码 1111", "１１１１"])
+def test_the_code_counts_however_it_is_put(answer):
+    bench = Bench(FakeExchange([gold()]))
+    bench.say("止损 XAU 3860")
+    assert bench.say(answer).title.startswith("已执行")
+    assert [name for name, _ in bench.sent] == ["place_stop"]
+
+
+def test_a_wrong_code_is_answered_as_one_and_a_number_alone_is_nothing_without_a_preview():
+    bench = Bench(FakeExchange([gold()]))
+    assert bench.say("1111") is None  # nothing waiting: just a number, for the rest of the bot
+    bench.say("止损 XAU 3860")
+    assert bench.say("2222").text.startswith("确认码不对")
+    assert bench.say("确认2222执行").text.startswith("确认码不对")
+    assert bench.say("黄金 3860 那里的支撑强不强 1111 这个位置呢") is None  # too long to be an answer to the card
+    assert bench.say("1111吗?") is None
+    assert bench.sent == []
+    assert bench.desk.is_command("1111")  # while a preview waits, someone else's "1111" is turned away as an order
+
+
+def test_a_command_written_out_by_the_ai_is_previewed_like_any_other():
+    bench = Bench(FakeExchange([gold(stops=(StopOrder("a1", 3808.0, 3938.0),))]))
+    assert "XAU-USDT-SWAP 多单，标记价 3,880.8：止损 3,808.0，止盈 3,938.0" in bench.desk.positions_text()
+    reply = bench.desk.handle_understood("把我的止损减两点", "止损 XAU 3806")
+    assert reply.text.startswith("我把“把我的止损减两点”理解为：**止损 XAU 3806**")
+    assert "止损 3,808.0 → 3,806.0" in reply.text and "确认 1111" in reply.text and "不是这个意思就回“取消”" in reply.text
+    assert bench.sent == []
+    assert bench.say("1111").title.startswith("已执行")
+    assert bench.sent == [("amend_stop", {"inst_id": XAU, "algo_id": "a1", "sl_trigger_px": "3806"})]
+
+
+def test_the_ai_can_never_confirm_cancel_or_switch_anything():
+    bench = Bench(FakeExchange([gold()]))
+    bench.say("止损 XAU 3860")
+    for written in ("确认 1111", "1111", "取消", "停止交易", "恢复交易", "模拟盘自测", "交易设置", "黄金怎么看", ""):
+        assert bench.desk.handle_understood("随便一句话", written) is None
+    assert bench.sent == []
+    assert bench.say("1111").title.startswith("已执行")  # the preview the owner asked for is still his to confirm
 
 
 def test_asked_to_move_a_stop_without_a_price_the_desk_shows_where_it_is_now():

@@ -149,7 +149,8 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 你本人在登记过的群里 @我 发这些指令，和私聊一样执行；回确认码也要 @我。群里其他人发的不执行
 
 **安全**
-- 每条指令我先回一张预览，你回复“确认 四位数”才执行，回复“取消”作废，过期也作废
+- 每条指令我先回一张预览，你回复确认码才执行（“确认 4812”“4812”“确认4812执行”都行），回复“取消”作废，过期也作废
+- 不是标准写法也可以，例如“止损减两点”“把 3808 的止损挪到 3806”：我会先写出我理解成哪条指令，再出预览
 - “停止交易”：立刻不再接受开仓（平仓、撤单、改止损照常）。“恢复交易”解除
 - “交易设置”：看当前是模拟盘还是实盘、各项限额、这把 key 的权限
 - “模拟盘自测”：只在模拟盘。我用最小的数量把开仓、止盈止损、减仓、挂单、撤单、平仓各跑一遍，告诉你 OKX 每一步收没收
@@ -586,6 +587,7 @@ class Reply:
     text: str
     title: str = ""  # with a title the reply is a card
     template: str = "blue"
+    unclear: bool = False  # an order, but not one the fixed patterns could read in full
 
 
 @dataclass
@@ -675,11 +677,61 @@ class TradeDesk:
         return self._mode
 
     def is_command(self, text: str) -> bool:
-        return self._parser.parse(text) is not None
+        return self._read(text) is not None
+
+    def _read(self, text: str) -> Command | None:
+        """The command in a message: one of the fixed patterns, or the code of the preview that is waiting."""
+        command = self._parser.parse(text)
+        if command is None or command.kind == "unclear":
+            return self._code_reply(text) or command
+        return command
+
+    def _code_reply(self, text: str) -> Command | None:
+        """While a preview waits, a short message with its code in it is the confirmation, however it is
+        put: "4812", "确认4812执行", "好 4812". A four-digit number with "确认" in front that is not the
+        code is a wrong code, and is answered as one, never passed on as a question."""
+        with self._lock:
+            pending = self._pending
+        if pending is None:
+            return None
+        plain = normalise(text).lower()
+        if len(plain) > 24 or "?" in plain:
+            return None
+        numbers = re.findall(r"\d+", plain)
+        if pending.code in numbers:
+            return Command("confirm", code=pending.code)
+        if len(numbers) == 1 and len(numbers[0]) == len(pending.code):
+            if plain == numbers[0] or any(word in plain for word in ("确认", "确定", "执行")):
+                return Command("confirm", code=numbers[0])
+        return None
+
+    def positions_text(self) -> str:
+        """The positions and their stops, for reading a command that names a stop relative to the current one."""
+        return self._stops_now().replace("\n现在：\n", "").strip() or "现在没有持仓。"
+
+    def handle_understood(self, said: str, command_text: str, in_group: bool = False) -> Reply | None:
+        """A command the AI wrote out from the owner's own words. It goes through the same reading,
+        checks, preview and code as one he typed; the preview starts with what it was taken to mean.
+        Only orders: a confirmation, a cancellation or a switch is never taken from the AI."""
+        command = self._parser.parse(command_text)
+        if command is None or command.kind not in ("open", "close", "cancel", "stop", "orders", "unclear"):
+            return None
+        log.info("an order was read with the AI's help: %s", command.kind)
+        heading = f"我把“{said.strip()[:60]}”理解为：**{command_text}**"
+        try:
+            reply = self._dispatch(command, in_group)
+        except Refused as exc:
+            reply = Reply(str(exc))
+        except OkxError as exc:
+            reply = Reply(f"OKX 返回了错误，没有执行任何操作：{exc.message or '没有给出原因'}（代码 {exc.code}）")
+        except OkxNetworkError:
+            reply = Reply("现在连不上 OKX，没有执行任何操作。请稍后再试。")
+        ending = "" if command.kind == "orders" else "\n不是这个意思就回“取消”，再换个说法。" if reply.title.startswith("下单预览") else ""
+        return Reply(f"{heading}\n\n{reply.text}{ending}", title=reply.title, template=reply.template)
 
     def takes_long(self, text: str) -> bool:
         """Whether answering this message takes a while: the confirmation that starts the demo rehearsal."""
-        command = self._parser.parse(text)
+        command = self._read(text)
         with self._lock:
             pending = self._pending
         return command is not None and command.kind == "confirm" and pending is not None and pending.command.kind == "selftest"
@@ -693,7 +745,7 @@ class TradeDesk:
         where this one was sent. The router decides that: the owner's private
         chat always, the registered group when GROUP_TRADING is on.
         """
-        command = self._parser.parse(text)
+        command = self._read(text)
         if command is None:
             return None
         if refused_here:
@@ -729,7 +781,7 @@ class TradeDesk:
             return Reply(self._off_text())
         if kind == "unclear":
             where_now = self._stops_now() if command.note == STOP_PRICE_MISSING else ""
-            return Reply(f"{command.note}{where_now}\n没有执行任何操作。发“交易帮助”可以看全部写法。")
+            return Reply(f"{command.note}{where_now}\n没有执行任何操作。发“交易帮助”可以看全部写法。", unclear=True)
         if kind == "selftest":
             plan = self._selftest(command.inst_id).plan()
             return self._ask_to_confirm(
@@ -753,6 +805,7 @@ class TradeDesk:
         seconds = self._cfg.trade_confirm_seconds
         with self._lock:
             self._pending = _Pending(code, self._clock() + seconds, command, plan)
+        log.info("preview (%s) %s %s: waiting for the code", self._mode, command.kind, command.inst_id or "-")
         ending = ending.format(code=code, seconds=seconds)
         if in_group:
             ending += "在群里回复要先 @我；只有你本人回的确认码有效。"
@@ -765,13 +818,16 @@ class TradeDesk:
         with self._lock:
             pending = self._pending
             if pending is None:
+                log.info("a confirmation came with no preview waiting")
                 return Reply("现在没有等待确认的指令。")
             if self._clock() > pending.expires_at:
                 self._pending = None
+                log.info("a confirmation came after the preview had expired")
                 return Reply("这个预览已经过期了，没有执行。请重新发指令。")
             if not command.code:
-                return Reply("请带上预览卡片里的四位确认码，例如：确认 1234。")
+                return Reply("请带上预览卡片里的四位确认码，例如：确认 1234，或者只发 1234。")
             if command.code != pending.code:
+                log.info("a confirmation came with the wrong code")
                 pending.wrong += 1
                 if pending.wrong >= MAX_WRONG_CODES:
                     self._pending = None
@@ -1514,10 +1570,11 @@ class TradeDesk:
 
         coins = _dec(position.qty) * spec.coins_per_contract
         average = _dec(position.avg_px) if position.avg_px else None
+        equity = _dec(state.snapshot.total_eq) if state.snapshot.total_eq else None
         lines = [
             f"仓位 {_contracts_text(_dec(position.qty), spec)}，均价 {self._price(position.avg_px or 0, spec)}，现价 {_px(last, spec)}",
-            self._stop_line("止损", old_sl, new_sl, last, average, coins, position, spec),
-            self._stop_line("止盈", old_tp, new_tp, last, average, coins, position, spec),
+            self._stop_line("止损", old_sl, new_sl, last, average, coins, position, spec, equity),
+            self._stop_line("止盈", old_tp, new_tp, last, average, coins, position, spec, equity),
             *notes,
         ]
         return Plan("stop", title, tuple(lines), steps, inst_id, {"positions": self._fingerprint([position])})
@@ -1525,17 +1582,27 @@ class TradeDesk:
     @staticmethod
     def _stop_line(
         name: str, old: Decimal | None, new: Decimal | None, last: Decimal, average: Decimal | None, coins: Decimal,
-        position: Position, spec: InstrumentSpec,
+        position: Position, spec: InstrumentSpec, equity: Decimal | None = None,
     ) -> str:  # fmt: skip
+        """Two figures, each saying where it counts from: from now (what the account would lose or gain
+        from here) and from the entry (what the whole trade would come to). Side by side without that
+        they look like a sum done twice with two answers."""
         before = "无" if old is None else _px(old, spec)
         if new == old:
             return f"{name} {before}（不变）"
         if new is None:
             return f"{name} {before} → 取消"
-        text = f"{name} {before} → {_px(new, spec)}（离现价 {abs(new - last) / last * 100:.2f}%"
+        sign = 1 if position.direction == "long" else -1
+        ccy = position.pnl_ccy
+        from_now = (new - last) * coins * sign
+        share = f"，占权益 {abs(from_now) / equity * 100:.1f}%" if equity else ""
+        text = (
+            f"{name} {before} → {_px(new, spec)}（离现价 {abs(new - last) / last * 100:.2f}%；"
+            f"触发时账户比现在{'少' if from_now < 0 else '多'}约 {_amt(abs(from_now))} {ccy}{share}"
+        )
         if average is not None:
-            result = (new - average) * coins * (1 if position.direction == "long" else -1)
-            text += f"，按均价算触发时大约 {float(result):+,.2f} {position.pnl_ccy}"
+            result = (new - average) * coins * sign
+            text += f"；从开仓均价算，这笔交易 {float(result):+,.2f} {ccy}"
         return text + "）"
 
     # -------------------------------------------------------------- execution

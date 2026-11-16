@@ -598,6 +598,55 @@ def test_orders_are_not_taken_where_they_should_not_be():
         assert each.say("确认 4821")[0].body == "现在没有等待确认的指令。"  # nothing was held for confirmation
 
 
+def test_words_the_patterns_miss_are_written_out_by_the_ai_and_previewed():
+    from bot.models import StopOrder
+
+    from .test_trading import gold
+
+    bench = Bench(exchange=FakeExchange([gold(stops=(StopOrder("a1", 3808.0, 3938.0),))]), **TRADING)
+    bench.analyst.command = "止损 XAU 3806"
+    [preview] = bench.say("你就根据现在的止损情况，3808挪到3806止损", private=False)
+    assert preview.title == "下单预览 · 模拟盘" and "理解为：**止损 XAU 3806**" in preview.body
+    [call] = bench.analyst.named("to_command")
+    assert "止损 3,808.0" in call["positions_text"]
+    assert bench.analyst.named("answer") == [] and bench.exchange.changes == []
+    done = bench.say("@交易助手 确认4821执行", private=False)[0]
+    assert done.title == "已执行 · 模拟盘" and [name for name, _ in bench.exchange.changes] == ["amend_stop"]
+
+
+def test_the_ai_is_asked_only_when_the_words_sound_like_an_order():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.say("黄金今晚怎么看")
+    bench.say("止损放在哪里比较好？")
+    bench.say("做多 XAU 100张")  # read by the patterns: no AI
+    assert bench.analyst.named("to_command") == []
+    bench.analyst.command = ""  # the AI says it is not an order: the question goes on to be answered
+    assert bench.say("我今天的止损被扫了两次，心态有点崩")[-1].body == "AI:answer"
+    assert len(bench.analyst.named("to_command")) == 1
+
+
+def test_the_ai_is_not_asked_where_orders_are_not_taken():
+    bench = Bench(exchange=FakeExchange(), **TRADING, group_trading=False)
+    bench.analyst.command = "止损 XAU 3806"
+    assert "GROUP_TRADING" in bench.say("把我的止损减两点", private=False)[-1].body
+    assert bench.analyst.named("to_command") == [] and bench.exchange.changes == []
+
+
+def test_a_relative_stop_the_patterns_cannot_price_is_priced_from_the_current_stop():
+    from bot.models import StopOrder
+
+    from .test_trading import gold
+
+    bench = Bench(exchange=FakeExchange([gold(stops=(StopOrder("a1", 3808.0, 3938.0),))]), **TRADING)
+    bench.analyst.command = "止损 XAU 3806"
+    [preview] = bench.say("把我的止损减两点", private=False)
+    assert "理解为：**止损 XAU 3806**" in preview.body and "止损 3,808.0 → 3,806.0" in preview.body
+    # When the AI cannot make it out either, the desk asks for the price and shows where the stop is.
+    bench.analyst.command = ""
+    [reply] = bench.say("把止损调高一点", private=False)
+    assert reply.body.startswith("要写价格") and "止损 3,808.0" in reply.body
+
+
 def test_nobody_but_the_owner_can_place_an_order():
     bench = Bench(exchange=FakeExchange(), **TRADING)
     assert bench.say("做多 XAU 100张", sender=FRIEND, private=False)[0].body == "我只响应主人的指令。仓位变动和简报我会自动发到群里。"

@@ -67,6 +67,12 @@ TRADE_OWNER_ONLY_TEXT = "下单、平仓、撤单、改止损这类指令只有�
 TRADE_GROUP_OFF_TEXT = "群里不执行下单类指令（服务器上 GROUP_TRADING 关着），请在私聊里发给我。"
 TRADE_GROUP_HIDDEN_TEXT = "这个群看不到账户和持仓（GROUP_SHOW_PNL 关着），下单预览里有持仓数字，所以请在私聊里发给我。"
 TRADE_OTHER_GROUP_TEXT = "这个群没有登记，下单类指令只在私聊和登记过的群里执行。"
+# Words that make a message from the owner worth reading as an order, when no fixed pattern matched it.
+ORDER_WORDS = (
+    "止损", "止盈", "平仓", "平掉", "平一半", "减仓", "加仓", "开仓", "做多", "做空", "开多", "开空", "平多", "平空",
+    "撤单", "撤掉", "挂单", "清仓", "sl", "tp",
+)  # fmt: skip
+ORDER_WORDS_MAX_CHARS = 80
 
 HELLO_TEXT = "在。直接问就行，例如“黄金现在怎么看”；发“帮助”可以看我能做什么。"
 HELLO_WORDS = ("你好", "您好", "hi", "hello", "在吗", "在不在", "谢谢", "多谢", "辛苦了", "早", "早上好", "晚上好")
@@ -280,6 +286,10 @@ class Router:
         finally:
             if done is not None:
                 done()
+        if (reply is None or reply.unclear) and not refused_here and self._sounds_like_an_order(text):
+            # "止损减两点": an order the patterns could not read in full. The AI may make it out from the
+            # current stop; when it cannot either, the desk's own question stands.
+            reply = self._order_in_own_words(text, in_group=not message.is_private) or reply
         if reply is None:
             return False
         if reply.title:
@@ -287,6 +297,21 @@ class Router:
         else:
             self._feishu.reply_text(message.message_id, reply.text)
         return True
+
+    def _sounds_like_an_order(self, text: str) -> bool:
+        """Worth asking the AI whether the owner's words are an order the fixed patterns missed."""
+        if not self._analyst.enabled or len(text) > ORDER_WORDS_MAX_CHARS or text.rstrip().endswith(("?", "？")):
+            return False
+        lowered = text.lower()
+        return any(word in lowered for word in ORDER_WORDS)
+
+    def _order_in_own_words(self, text: str, in_group: bool):
+        """The AI writes the owner's words out as a fixed-pattern command; the trade desk reads, checks and
+        previews it like any other, and nothing is sent without his code. None when they are not an order."""
+        command_text = self._analyst.to_command(text, self._trade.positions_text())
+        if not command_text:
+            return None
+        return self._trade.handle_understood(text, command_text, in_group=in_group)
 
     def _group_trade_refusal(self, message: IncomingMessage) -> str:
         """Why the owner's order command is not carried out in this group; "" when it is.

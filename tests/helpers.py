@@ -185,6 +185,7 @@ class FakeAnalyst:
         self.intent = "analysis"
         self.error: AnalystUnavailable | None = None
         self.reply: str | None = None  # what answer() gives back; "AI:answer" when not set
+        self.command = ""  # what to_command() gives back: the owner's words as a fixed-pattern order
         self.calls: list[tuple[str, dict]] = []
 
     def _record(self, name: str, **details) -> str:
@@ -206,6 +207,10 @@ class FakeAnalyst:
             deep=deep, history=list(history or []),
         )  # fmt: skip
         return text if self.reply is None else self.reply
+
+    def to_command(self, text, positions_text):
+        self.calls.append(("to_command", {"text": text, "positions_text": positions_text}))
+        return "" if self.error else self.command
 
     def small_talk(self, text):
         self.calls.append(("small_talk", {"text": text}))

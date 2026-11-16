@@ -73,7 +73,7 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 
 边界：
 你给的是分析和价位，买不买、卖不卖由交易员自己决定。用“站稳 X 上方看 Y，跌破 Z 则这个判断失效”这样的条件句来表达，不要写“现在买入”“马上做空”这样的指令，不承诺收益，也不替他决定仓位大小。他给出止损价和愿意承担的亏损金额、让你算仓位时，可以帮他算；账户信息里写了他定的单笔风险比例时，按那个比例算。
-你自己不下单、不改单。他要设或改止损止盈、平仓、撤单时，不要说没有权限，也不要说做不到，告诉他直接发指令，例如“止损 XAU 3800”“把止损调到 3800”“平仓 XAU 一半”，私聊和登记过的群里都可以发（在群里要 @机器人）。机器人会先回一张预览，他回确认码才下到 OKX。价格由他定，你可以把你分析出的关键位告诉他作参考。
+你就是“交易助手”这个机器人，下单也是你所在的这个程序做的，不要把自己和“机器人”说成两个东西，不要让他“去 @机器人”或“发给机器人”。你在回答里不能直接下单改单：程序认出下单类的话会自己出预览，轮不到你回答。如果他要下单改单的话还是到了你这里，说明程序没认出来，就直接给他一句能用的标准写法，例如“止损 XAU 3806”“平仓 XAU 一半”“撤单 XAU”，在群里发时前面 @交易助手。程序会先回一张预览，他回四位确认码（只发数字也行）才下到 OKX。不要说没有权限。价格由他定，你可以把你分析出的关键位告诉他作参考。
 
 格式：
 回答显示在飞书里，多数时候在手机上看。用简体中文。重要术语第一次出现时可以在括号里附英文，因为读者在学英语，每条回答三四处就够。内容多、需要分段时可以用加粗的小标题和短横线列表，短回答用普通的句子就行；不要用表格和 # 标题。价格按该品种通常的小数位写。"""
@@ -85,6 +85,26 @@ status：想看自己的持仓、仓位、账户或盈亏。
 hello：只是打招呼、道谢或寒暄，没有提出任何问题，例如“你好”“在吗”“谢谢”“辛苦了”。
 help：问机器人能做什么、怎么用。
 analysis：其他所有情况，包括问行情、走势、价位、新闻、交易概念和交易想法。"""
+
+COMMAND_SYSTEM = """交易员在飞书里给交易机器人发了一句话。机器人只认固定写法的指令，你的事是把这句话改写成一条固定写法的指令。只输出一行：那条指令，或者 NONE。不要输出别的。
+
+固定写法（品种用英文代码，如 XAU、BTC、ETH；价格写纯数字，不带逗号）：
+- 止损 XAU 3806
+- 止盈 XAU 3950
+- 止损 XAU 3806 止盈 3950
+- 取消止损 XAU、取消止盈 XAU、取消止盈止损 XAU
+- 平仓 XAU（整个仓位）、平仓 XAU 一半、平仓 XAU 30%、减仓 XAU 100张
+- 全部平仓
+- 撤单 XAU、撤单 全部
+- 做多 XAU 100张、做空 XAU 0.5个、做多 XAU 500U（数量一定带单位：张、个、U）
+- 限价做多 XAU 100张 3850
+- 挂单（查看现在的挂单）
+
+规则：
+- 只有他明确要机器人现在去做一件事时才改写。提问、讨论、征求意见、说已经发生的事、假设，一律输出 NONE。
+- 相对的说法按“现在的持仓”换算成具体价格。例如止损在 3808 时，“止损减两点”“止损往下挪 2”就是“止损 XAU 3806”，“止损上移 5 个点”就是“止损 XAU 3813”。一个“点”按 1 个价格单位算。
+- 他没说品种、而现在只有一个持仓时，用那个持仓的品种。
+- 缺少必要的信息（品种不明、价格既没给也换算不出、数量不明）时输出 NONE。不要编造他没说的价格或数量。"""
 
 SMALL_TALK_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的行情分析助手。对方只是打了个招呼、道了声谢或者寒暄了一句。像熟悉的同事那样用一句自然的中文回应，不超过 30 个字。不要介绍你的功能，不要主动讲行情，不要用表情符号，也不要连着反问。"""
 
@@ -400,6 +420,21 @@ class Analyst:
             if intent in answer:
                 return intent
         return "analysis"
+
+    def to_command(self, text: str, positions_text: str) -> str:
+        """The owner's words as one fixed-pattern order command, for the trade desk to read and preview.
+        "" when they are not an order, or the AI cannot be asked. The AI only writes the command out;
+        the desk checks it, shows it and waits for the owner's code as for any other."""
+        user = f"现在的持仓：\n{positions_text}\n\n他发的话：{text}"
+        try:
+            answer = self._ask("quick", COMMAND_SYSTEM, user, purpose="reading an order")
+        except AnalystUnavailable as exc:
+            log.info("reading an order with the AI is unavailable: %s", exc)
+            return ""
+        lines = [line.strip().strip("`“”\"'。 ") for line in answer.strip().splitlines() if line.strip()]
+        if not lines or lines[0].upper().startswith("NONE"):
+            return ""
+        return lines[0]
 
     def small_talk(self, text: str) -> str:
         """One line in reply to a greeting or a thank-you. "" when the AI cannot be asked."""
