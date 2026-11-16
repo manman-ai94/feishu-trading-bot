@@ -209,6 +209,14 @@ def test_startup_message():
     assert "还没读到 OKX 账户" in feishu.sent[0].body
 
 
+def test_startup_message_says_when_the_bot_was_not_running():
+    reporter, feishu, _, _, clock, _ = build()
+    reporter.send_startup((clock() - 3 * 3600, clock()))
+    [sent] = feishu.sent
+    assert sent.body.startswith("上次停止运行约 3 小时（") and "这段时间没有监控仓位" in sent.body
+    assert "开始监控" in sent.body and sent.template == "orange"
+
+
 def test_brief_is_written_once_and_shared_in_full_by_default():
     reporter, feishu, analyst, *_ = build()
     reporter.send_brief("morning")

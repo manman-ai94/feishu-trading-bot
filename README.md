@@ -274,6 +274,12 @@ AI 每次给出某个品种的多空情景时，机器人把里面的触发位�
 
 `TRACK_RECORD=false` 可以关掉。`python -m bot record` 在服务器上打印同一张成绩单，只读取记录。
 
+## 心跳和备份 (heartbeat and backup)
+
+- 停机会被说出来。机器人每分钟记一次时间。再次启动时如果发现中间空了 5 分钟以上，上线卡片的第一行会写明停了多久、从几点到几点，因为那段时间没有监控仓位。
+- 整台服务器停掉时，机器人自己发不出消息。想在这种时候也收到通知，可以用 healthchecks.io 这类“超时没来就报警”的服务：在那边建一个检查，把它给的网址填进 `HEARTBEAT_URL`，机器人每 5 分钟访问一次，访问时不带任何账户信息。不填就不访问。
+- 每天自动备份。仓位记录、事件、订单、成绩单（`data/bot.db`）和你发给机器人的笔记，每天复制一份到 `data/backups/`，默认保留 14 天（`BACKUP_KEEP_DAYS`，填 0 关掉）。恢复的办法：停掉机器人，把 `data/backups/bot-日期.db` 复制成 `data/bot.db`，再启动。备份和数据在同一台服务器上，服务器硬盘坏了会一起丢，重要的话定期把 `data/backups` 下载到别处。
+
 ## 让它一直运行
 
 ### Windows
@@ -327,6 +333,7 @@ bot/okx_client.py     OKX 只读客户端（签名、行情、账户、持仓、
 bot/okx_trade.py      会改动东西的 OKX 调用：下单、撤单、平仓、止盈止损。只有打开下单功能时才创建
 bot/trading.py        下单流程：读指令、对照限额检查、预览、确认码、执行、回报
 bot/track.py          成绩单：从 AI 的回答里取出点位，按 K 线打分，出成绩单卡片
+bot/upkeep.py         心跳（发现停机）和每天的数据备份
 bot/models.py         数据结构
 bot/indicators.py     EMA、RSI、ATR
 bot/instruments.py    把“BTC”“比特币”这样的说法对应到 OKX 的品种

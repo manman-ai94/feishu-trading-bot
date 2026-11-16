@@ -16,6 +16,7 @@ from .models import AccountState
 from .monitor import Event, Monitor
 from .okx_client import OkxClient
 from .reports import DISCLAIMER, account_text, equity_text, event_markdown, journal_text, status_markdown
+from .upkeep import downtime_text
 
 log = logging.getLogger(__name__)
 
@@ -97,16 +98,19 @@ class Reporter:
             body = event_markdown(event, private=shared)
             self.to_group(event.title, body or "（无更多信息）", template, footer=DISCLAIMER)
 
-    def send_startup(self) -> None:
+    def send_startup(self, downtime: tuple[float, float] | None = None) -> None:
+        """`downtime` is (last seen running, now) when the bot was off long enough to matter."""
         state = self.current_state()
         if state is None:
             body = "机器人已启动，但还没读到 OKX 账户。稍后如果连续失败，我会再提醒你。"
         else:
             body = "机器人已启动，开始监控。\n\n" + status_markdown(state, self.day_change(state), private=True)
+        if downtime is not None:
+            body = downtime_text(downtime, self._cfg.tz) + "\n\n" + body
         if self._cfg.trading_on:
             where = "模拟盘" if self._cfg.trading == "demo" else "实盘"
             body += f"\n\n下单功能已打开（{where}）。每条指令都要你回复确认码才执行，发“停止交易”可以随时叫停。"
-        self.to_owner("交易助手已上线", body, "green")
+        self.to_owner("交易助手已上线", body, "orange" if downtime is not None else "green")
 
     # ----------------------------------------------------------------- briefs
 

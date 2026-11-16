@@ -26,6 +26,7 @@ from .service import Reporter
 from .tools import Toolbox
 from .track import Levels, Scorer
 from .trading import TradeDesk
+from .upkeep import Upkeep
 
 log = logging.getLogger(__name__)
 
@@ -171,8 +172,14 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         scorer = Scorer(journal, okx, cfg.track_window_hours)
         threading.Thread(target=scorer.run_forever, args=(stop,), name="track", daemon=True).start()
 
+    upkeep = Upkeep(cfg, journal)
+    downtime = upkeep.downtime()  # read before this run's first heartbeat overwrites it
+    if downtime is not None:
+        log.warning("the bot was not running for about %d minute(s)", (downtime[1] - downtime[0]) // 60)
+    threading.Thread(target=upkeep.run_forever, args=(stop,), name="upkeep", daemon=True).start()
+
     try:
-        reporter.send_startup()
+        reporter.send_startup(downtime)
     except Exception:
         log.exception("could not send the start-up message")
 

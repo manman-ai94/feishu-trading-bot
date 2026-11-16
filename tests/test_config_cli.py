@@ -10,7 +10,7 @@ from bot.__main__ import main
 from bot.config import load_config, parse_weekly
 from bot.okx_client import OkxNetworkError
 
-PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING", "TRACK_")
+PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING", "TRACK_", "HEARTBEAT_", "BACKUP_")
 NAMES = (
     "OWNER_OPEN_ID", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
     "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR",
@@ -376,3 +376,22 @@ def test_record_command_prints_the_card_and_creates_nothing(tmp_path, monkeypatc
     assert main(["--env", str(env), "record", "7"]) == 0
     output = capsys.readouterr().out
     assert "最近 7 天" in output and "记录了 1 次带点位的分析" in output and "**" not in output
+
+
+# --------------------------------------------------------------------- upkeep
+
+
+def test_heartbeat_and_backup_settings(tmp_path):
+    cfg, problems = load_config(write_env(tmp_path, ""))
+    assert cfg.heartbeat_url == "" and cfg.backup_keep_days == 14
+    for name in list(os.environ):
+        if name.startswith(PREFIXES):
+            del os.environ[name]
+    cfg, problems = load_config(write_env(tmp_path, "HEARTBEAT_URL=https://hc.example/ping/abc\nBACKUP_KEEP_DAYS=0\n"))
+    assert cfg.heartbeat_url == "https://hc.example/ping/abc" and cfg.backup_keep_days == 0
+    assert "hc.example" not in repr(cfg)  # the address works like a password for the watcher
+    for name in list(os.environ):
+        if name.startswith(PREFIXES):
+            del os.environ[name]
+    cfg, problems = load_config(write_env(tmp_path, "HEARTBEAT_URL=ftp://somewhere\n"))
+    assert cfg.heartbeat_url == "" and any("HEARTBEAT_URL" in problem for problem in problems)

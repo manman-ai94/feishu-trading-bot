@@ -334,6 +334,15 @@ class Journal:
             )
             self._db.commit()
 
+    def backup_to(self, path: str | Path) -> None:
+        """Writes a complete, consistent copy of the journal to `path`."""
+        target = sqlite3.connect(str(path))
+        try:
+            with self._lock:
+                self._db.backup(target)
+        finally:
+            target.close()
+
     def close(self) -> None:
         with self._lock:
             self._db.close()

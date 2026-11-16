@@ -134,6 +134,8 @@ class Config:
     group_daily_question_limit: int = 30
     db_path: Path = Path("data/bot.db")
     log_dir: Path = Path("logs")
+    heartbeat_url: str = field(default="", repr=False)  # fetched every few minutes, for an outside watcher; empty = off
+    backup_keep_days: int = 14  # daily copies of the data kept in data/backups; 0 = no backups
 
     # Placing orders. Off unless the owner switches it on in .env; none of this can be changed from a chat.
     trading: str = "off"  # "off", "demo" (OKX demo trading) or "live" (the real account)
@@ -247,6 +249,13 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
     has_main_keys = all(secrets[name] for name in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"))
     has_demo_keys = all(secrets[name] for name in ("OKX_DEMO_API_KEY", "OKX_DEMO_SECRET_KEY", "OKX_DEMO_PASSPHRASE"))
     trading = _get("TRADING", "off").lower()
+    heartbeat_url = _get("HEARTBEAT_URL")
+    if heartbeat_url.lower() in OFF_WORDS:
+        heartbeat_url = ""
+    if heartbeat_url and not heartbeat_url.lower().startswith(("https://", "http://")):
+        problems.append("HEARTBEAT_URL 要填一个以 https:// 开头的网址，现在填的不是，已忽略")
+        heartbeat_url = ""
+
     trading_blocked = ""
     if trading in OFF_WORDS or trading in ("false", "0", "no"):
         trading = "off"
@@ -313,6 +322,8 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         group_daily_question_limit=max(0, _get_int("GROUP_DAILY_QUESTION_LIMIT", 30, problems)),
         db_path=Path(_get("DB_PATH", "data/bot.db")),
         log_dir=Path(_get("LOG_DIR", "logs")),
+        heartbeat_url=heartbeat_url,
+        backup_keep_days=max(0, _get_int("BACKUP_KEEP_DAYS", 14, problems)),
         trading=trading,
         trading_blocked=trading_blocked,
         okx_demo_api_key=secrets["OKX_DEMO_API_KEY"],
