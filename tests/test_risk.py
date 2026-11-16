@@ -246,6 +246,13 @@ def test_the_thresholds_are_read_from_the_file(tmp_path):
     assert (cfg.risk_per_trade_pct, cfg.alert_stop_risk_pct, cfg.weekend_leverage) == (2.0, 2.0, 3.0)  # the alert follows the rule
     cfg, problems = levels_from(tmp_path, "RISK_PER_TRADE_PCT=2\nALERT_STOP_RISK_PCT=off\n")
     assert (cfg.risk_per_trade_pct, cfg.alert_stop_risk_pct) == (2.0, None)
+    cfg, _ = levels_from(tmp_path, "RISK_PER_TRADE_PCT=25\n")
+    assert (cfg.risk_per_trade_pct, cfg.alert_stop_risk_pct) == (25.0, 25.0)  # his call, small capital (2026-11-16)
+    os.environ.pop("RISK_PER_TRADE_PCT", None)
+    path = tmp_path / ".env"
+    path.write_text("RISK_PER_TRADE_PCT=150\n", encoding="utf-8")
+    cfg, problems = load_config(path)
+    assert cfg.risk_per_trade_pct == 1.0 and any("不能超过 100" in item for item in problems)
     cfg, problems = levels_from(tmp_path, "ALERT_LIQ_ATR=1, 4，2\nALERT_LEVERAGE=10,3\nALERT_STOP_RISK_PCT=1\nWEEKEND_CHECK=false\n")
     assert (cfg.alert_liq_atr, cfg.alert_leverage, cfg.alert_stop_risk_pct, cfg.weekend_check) == ((4.0, 2.0, 1.0), (3.0, 10.0), 1.0, False)
     assert problems == []

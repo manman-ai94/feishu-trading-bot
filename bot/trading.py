@@ -999,7 +999,11 @@ class TradeDesk:
                 lines.append(f"按你现在 {held[0].lever:g} 倍的杠杆设置，占用保证金约 {_amt(margin)} {settle}")
                 if margin > equity:
                     lines.append("保证金超过了账户权益，这么大开不出来")
-            if notional > _dec(self._cfg.trade_max_order_usd):
+            if notional > _dec(self._cfg.trade_max_position_usd):
+                lines.append(
+                    f"超过了单个品种的持仓上限 {_amt(_dec(self._cfg.trade_max_position_usd))} USDT，按现在的限额开不了这么大"
+                )
+            elif notional > _dec(self._cfg.trade_max_order_usd):
                 lines.append(f"超过了单笔上限 {_amt(_dec(self._cfg.trade_max_order_usd))} USDT，要分几次开")
         for position in state.positions:
             if position.inst_id != cmd.inst_id or position.direction != ("long" if long else "short"):

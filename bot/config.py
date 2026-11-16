@@ -330,8 +330,8 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         return value
 
     risk_per_trade_pct = _positive("RISK_PER_TRADE_PCT", 1.0)
-    if risk_per_trade_pct > 10:
-        problems.append(f"RISK_PER_TRADE_PCT 是权益的百分比，{risk_per_trade_pct:g} 太大了，现在按 1 算")
+    if risk_per_trade_pct > 100:
+        problems.append(f"RISK_PER_TRADE_PCT 是权益的百分比，不能超过 100，现在是 {risk_per_trade_pct:g}，按 1 算")
         risk_per_trade_pct = 1.0
 
     cfg = Config(

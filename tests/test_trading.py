@@ -1015,6 +1015,9 @@ def test_the_size_calculator_follows_the_owners_risk_rule_and_sends_nothing():
     assert "空单，入场 3,880.0（现价）" in bench.say("算仓位 XAU 止损 3990").text
     assert bench.say("算仓位 XAU 3873 止损 3768").text == reply.text  # the entry may be written bare
     assert "单笔风险 2%" in Bench(FakeExchange([gold()]), risk_per_trade_pct=2.0).say("算仓位 XAU 止损 3768").text
+    heavy = Bench(FakeExchange([gold()]), risk_per_trade_pct=25.0).say("算仓位 XAU 止损 3768").text
+    assert "单笔风险 25%：权益 2,000.00 USD，这一笔止损触发时最多亏 500.00 USDT" in heavy
+    assert "最多 4464 张（合 4.464 XAU）" in heavy and "超过了单个品种的持仓上限 3,000.00 USDT，按现在的限额开不了这么大" in heavy
     assert "超过了单笔上限 1,000.00 USDT" in bench.say("算仓位 XAU 止损 3870").text
     assert bench.say("算仓位 XAU").text.startswith("算仓位要写品种和止损价")
     assert "止损价和入场价一样" in bench.say("算仓位 XAU 入场 3800 止损 3800").text
