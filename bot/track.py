@@ -52,9 +52,9 @@ MIN_SAMPLE = 20  # below this the percentages say very little
 LEVELS_NOTE = """
 
 成绩记录：
-回答里给出了某个品种的多头或空头情景（有触发位、目标位和失效位）时，在全文的最后另起一行，附一段给程序读的记录。读者看不到这一段，格式严格如下，写在一行里：
-<levels>{"inst":"XAU-USDT-SWAP","bias":"long","scenarios":[{"side":"long","trigger":3900,"target":3950,"invalid":3860},{"side":"short","trigger":3860,"target":3820,"invalid":3900}]}</levels>
-inst 写 OKX 的品种代码；bias 是结论的方向，只能是 long、short 或 range；side 只能是 long 或 short。数字必须和正文里的一致，只写正文里明确给出的情景，目标位有多个时写第一个。一条回答只附一段，写最主要的那个品种。没有给出完整情景的回答（事实问答、概念解释、算仓位）不要附。"""
+回答里给出了某个品种的多头或空头情景（有触发位、目标位和失效位）时，在全文的最后另起一行，附一段给程序读的记录。读者看不到这一段。格式严格如下，写在一行里，不要放进代码块：
+<levels>{"inst":"品种代码","bias":"long","scenarios":[{"side":"long","trigger":触发位,"target":目标位,"invalid":失效位},{"side":"short","trigger":触发位,"target":目标位,"invalid":失效位}]}</levels>
+inst 写 OKX 的品种代码，例如 XAU-USDT-SWAP、BTC-USDT-SWAP；bias 是结论的方向，只能是 long、short 或 range；side 只能是 long 或 short。价位写成普通数字，不带逗号和引号，必须和正文里的数字完全一致。只写正文里明确给出的情景，目标位有多个时写第一个。一条回答只附一段，写最主要的那个品种。没有给出完整情景的回答（事实问答、概念解释、算仓位）不要附。"""
 
 _BLOCK = re.compile(r"\s*<levels>(.*?)</levels>[ \t]*", re.DOTALL | re.IGNORECASE)
 _DANGLING = re.compile(r"\s*<levels>.*?(?=\n\s*\n|\Z)", re.DOTALL | re.IGNORECASE)
@@ -100,6 +100,7 @@ def extract_levels(text: str) -> tuple[str, Levels | None]:
 
 
 def _tidy(text: str) -> str:
+    text = re.sub(r"```[a-zA-Z]*\s*```", "", text)  # the fence it was (against instructions) wrapped in
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 

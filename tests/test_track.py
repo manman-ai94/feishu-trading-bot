@@ -41,6 +41,16 @@ def test_sources_after_the_block_stay():
     assert text == "偏多。\n\n**来源**\n- [路透](https://example.com/a)" and levels is not None
 
 
+def test_a_block_wrapped_in_a_code_fence_leaves_no_fence_behind():
+    text, levels = extract_levels("偏多。\n\n```json\n" + BLOCK + "\n```\n")
+    assert text == "偏多。" and levels is not None
+
+
+def test_the_instructions_show_the_format_without_numbers_to_copy():
+    shown = LEVELS_NOTE[LEVELS_NOTE.index("<levels>") : LEVELS_NOTE.index("</levels>")]
+    assert not any(character.isdigit() for character in shown)
+
+
 def test_an_answer_without_a_block_is_left_alone():
     assert extract_levels("非农周五 21:30 公布。") == ("非农周五 21:30 公布。", None)
 
