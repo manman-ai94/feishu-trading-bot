@@ -4,4 +4,4 @@ It reads the account. With TRADING switched on it also places the orders the
 owner writes and confirms himself; the AI never trades.
 """
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"

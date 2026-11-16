@@ -84,9 +84,10 @@ def build_crowd(cfg: Config, okx: OkxClient) -> Crowd | None:
 
 
 def build_ai(
-    cfg: Config, okx: OkxClient, journal: Journal, crowd: Crowd | None = None
+    cfg: Config, okx: OkxClient, journal: Journal, crowd: Crowd | None = None, track: bool = True
 ) -> tuple[Analyst, InstrumentResolver, KnowledgeBase]:
-    """The analyst with its tools, metered into the journal."""
+    """The analyst with its tools, metered into the journal. `track=False` keeps the levels of its
+    answers out of the track record (a rehearsal is not advice anyone was given)."""
     resolver = InstrumentResolver(okx)
     knowledge = KnowledgeBase(cfg.knowledge_dir)
 
@@ -113,7 +114,7 @@ def build_ai(
         toolbox=Toolbox(okx, resolver, knowledge, cfg.tz, crowd),
         on_usage=record,
         month_spend=month_spend,
-        on_levels=keep_levels,
+        on_levels=keep_levels if track else None,
     )
     return analyst, resolver, knowledge
 

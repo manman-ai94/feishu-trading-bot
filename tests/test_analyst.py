@@ -117,7 +117,7 @@ def test_group_prompt_with_a_shared_account():
     bot, client = analyst(beta=[message()])
     bot.answer("我的仓位风险大吗", "最新价：2,650.00", "账户权益 10,000.00 USD", in_group=True)
     prompt = client.beta.messages.calls[0]["messages"][0]["content"]
-    assert "账户权益 10,000.00 USD" in prompt and "同意在群里公开" in prompt
+    assert "账户权益 10,000.00 USD" in prompt and "账户和持仓可以在群里谈" in prompt
     assert "不要针对他们个人给建议" in prompt and "不要提及或推测" not in prompt
 
 
@@ -539,3 +539,17 @@ def test_a_greeting_is_its_own_kind_of_message():
     bot, _ = analyst(plain=[message("hello"), message("help")])
     assert bot.route_intent("今天辛苦了") == "hello"
     assert bot.route_intent("你到底能干什么") == "help"
+
+
+def test_the_instructions_keep_answers_off_a_template():
+    """What made the group answers read like a form: fixed sections, the context notes read back,
+    a statement of the bot's own limits, and a pitch for the order phrasing at the end."""
+    from bot.analyst import ANALYST_SYSTEM, ROUTER_SYSTEM, SMALL_TALK_SYSTEM
+    from bot.track import LEVELS_NOTE
+
+    assert "没有每次都要写的栏目" in ANALYST_SYSTEM and "不要在回答里复述或解释它们" in ANALYST_SYSTEM
+    assert "不要在开头声明你的做法" in ANALYST_SYSTEM and "不要主动推荐这些写法" in ANALYST_SYSTEM
+    assert "在群里 @交易助手 就是 @你" in ANALYST_SYSTEM and "程序自动回复的卡片" in ANALYST_SYSTEM
+    assert "有没有必要平仓" in ROUTER_SYSTEM and "这个我去跟 Claude 商量" in ROUTER_SYSTEM
+    assert "表了个态" in SMALL_TALK_SYSTEM
+    assert "不要为了写它而在正文里加情景" in LEVELS_NOTE

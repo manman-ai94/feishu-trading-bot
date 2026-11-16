@@ -369,6 +369,9 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("trading", help="打印下单功能的设置：模式、限额、这把 key 的权限（只读取，不下单）")
     record = commands.add_parser("record", help="打印成绩单：AI 给过的点位和事后的行情对照（只读取记录，不花钱）")
     record.add_argument("days", nargs="?", type=int, default=30)
+    commands.add_parser(
+        "replay", help="把 scripts/replay-group.txt 里群里问过的问题按主人在群里 @我 的样子重放，只打印回答（不发飞书、不下单，AI 调用照常计费）"
+    )
     args = parser.parse_args(argv)
 
     if args.command == "setenv":
@@ -394,6 +397,10 @@ def main(argv: list[str] | None = None) -> int:
         return print_trading(cfg)
     if args.command == "record":
         return print_record(cfg, max(1, min(365, args.days)))
+    if args.command == "replay":
+        from .replay import replay
+
+        return replay(cfg)
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:
         print("还没填飞书的 FEISHU_APP_ID 和 FEISHU_APP_SECRET，机器人无法启动。先运行：python -m bot selfcheck")

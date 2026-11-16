@@ -1,0 +1,11 @@
+# Questions peng asked the bot in the group on 2026-11-16, in order, without the order commands.
+# python -m bot replay sends them through the bot as he would, prints the answers, sends nothing to Feishu
+# and places no order. One question per line; lines starting with # are skipped.
+汇报目前持仓情况和风险点
+分析现在持仓的风险点
+我记得我们的账户被设置为止损的你再最后一次确认
+我解除了你很多的限制，你怎么判断现在黄金的走势？
+权益的百分之一是什么意思？总仓位一分盈亏？
+这个我去跟 Claude 商量
+问题是，群里就只有你一个机器人呀？我要@哪个机器人
+查看下现在的仓位情况，有没有必要平仓，还是可以再等一等

@@ -241,6 +241,7 @@ class Router:
         intent = self._intent(text)
         if intent == "help":
             self._feishu.reply_text(message.message_id, HELP_TEXT)
+            self._remember_fixed(message.chat_id, text, "", "（回了“帮助”里的功能清单）")
         elif intent == "hello":
             self._reply_hello(message, text)
         elif intent == "status":
@@ -296,6 +297,7 @@ class Router:
             self._feishu.reply_markdown(message.message_id, reply.title, reply.text, reply.template)
         else:
             self._feishu.reply_text(message.message_id, reply.text)
+        self._remember_fixed(message.chat_id, text, reply.title, reply.text)
         return True
 
     def _sounds_like_an_order(self, text: str) -> bool:
@@ -303,6 +305,8 @@ class Router:
         if not self._analyst.enabled or len(text) > ORDER_WORDS_MAX_CHARS or text.rstrip().endswith(("?", "？")):
             return False
         lowered = text.lower()
+        if any(word in text for word in QUESTION_WORDS):
+            return False  # "有没有必要平仓，还是再等等" asks for a view, it does not ask for a close
         return any(word in lowered for word in ORDER_WORDS)
 
     def _order_in_own_words(self, text: str, in_group: bool):
@@ -461,7 +465,12 @@ class Router:
         if lowered.startswith(DEEP_PREFIXES):
             return "analysis"
         if self._analyst.enabled:
-            return self._analyst.route_intent(text)
+            intent = self._analyst.route_intent(text)
+            # "查看下仓位，有没有必要平仓" is a question, not a request for the card: a fixed reply
+            # to a question is the answer that misses it, so anything that asks goes to the AI.
+            if intent in ("status", "help") and _asks_something(text):
+                return "analysis"
+            return intent
         return "analysis"
 
     def _quote_instruments(self, text: str) -> list[str]:
@@ -497,12 +506,17 @@ class Router:
             return
         risk = self._reporter.risk(state) if with_account else None
         body = status_markdown(state, self._reporter.day_change(state), private=with_account, risk=risk)
-        self._feishu.reply_markdown(message.message_id, "当前持仓", body, "blue", footer=None if message.is_private else DISCLAIMER)
+        # The owner's own numbers need no disclaimer; a friend looking at his stops may take them as a signal.
+        asked_by_owner = bool(self._cfg.owner_open_id) and message.sender_open_id == self._cfg.owner_open_id
+        footer = None if message.is_private or asked_by_owner else DISCLAIMER
+        self._feishu.reply_markdown(message.message_id, "当前持仓", body, "blue", footer=footer)
+        self._remember_fixed(message.chat_id, message.text.strip(), "当前持仓", body)
 
     def _reply_hello(self, message: IncomingMessage, text: str) -> None:
         """A greeting or a thank-you gets one line back, not the list of everything the bot can do."""
-        reply = self._analyst.small_talk(text) if self._analyst.enabled else ""
-        self._feishu.reply_text(message.message_id, reply.strip() or HELLO_TEXT)
+        reply = (self._analyst.small_talk(text) if self._analyst.enabled else "").strip() or HELLO_TEXT
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember(message.chat_id, text, reply)
 
     def _reply_analysis(self, message: IncomingMessage, text: str, is_owner: bool) -> None:
         in_group = not message.is_private
@@ -613,6 +627,13 @@ class Router:
         with self._lock:
             return [(question, answer) for when, question, answer in self._history.get(chat_id, ()) if when >= cutoff]
 
+    def _remember_fixed(self, chat_id: str, question: str, title: str, text: str) -> None:
+        """A reply the program wrote by itself (a preview, an executed order, the positions card), kept with
+        the AI's answers so that a follow-up to it makes sense: "我要 @ 哪个机器人" after a refusal. The
+        confirmation code is masked; it only ever counts when the owner types it."""
+        body = _CODE_IN_TEXT.sub(r"\1****", text.replace("**", ""))
+        self._remember(chat_id, question, f"[程序自动回复的卡片：{title}]\n{body}" if title else body)
+
     def _remember(self, chat_id: str, question: str, answer: str) -> None:
         if len(answer) > HISTORY_ANSWER_CHARS:
             answer = answer[:HISTORY_ANSWER_CHARS] + "……（后面略）"
@@ -688,3 +709,18 @@ def _note_body(text: str) -> str | None:
                 return None  # "记住了吗" is a question, not a note
             return rest.strip(" ：:，,\n\t")
     return None
+
+
+QUESTION_WORDS = ("?", "？", "吗", "要不要", "有没有", "是不是", "能不能", "该不该", "还是", "必要", "怎么样")
+
+_CODE_IN_TEXT = re.compile(r"(确认\s*)\d{4}")
+
+ASKING_WORDS = (
+    "?", "？", "吗", "呢", "要不要", "有没有", "是不是", "能不能", "该不该", "可不可以", "还是",
+    "怎么", "为啥", "哪", "风险", "必要", "确认", "判断", "分析", "建议", "看法",
+)
+
+
+def _asks_something(text: str) -> bool:
+    """Whether a message asks a question or for a judgment, beyond showing the numbers."""
+    return len(text) > 6 and any(word in text for word in ASKING_WORDS)

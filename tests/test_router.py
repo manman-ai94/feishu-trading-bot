@@ -1,5 +1,6 @@
 """The router decides who gets what. These tests pin down the privacy rules."""
 from __future__ import annotations
+import pytest
 
 from bot.analyst import AnalystUnavailable
 from bot.journal import Journal
@@ -114,7 +115,7 @@ def test_owner_in_the_group_sees_the_full_account():
     bench = Bench()
     [reply] = bench.say("仓位", sender=OWNER, private=False)
     assert "账户权益" in reply.body and "10,000.00 USD" in reply.body and "数量 2 张" in reply.body
-    assert reply.footer == DISCLAIMER
+    assert reply.footer is None  # numbers, not advice: no disclaimer under them
 
 
 def test_owner_question_in_the_group_gives_the_ai_the_account():
@@ -861,3 +862,63 @@ def test_a_greeting_without_the_ai_gets_a_short_fixed_line():
     bench.analyst.error = AnalystUnavailable("额度用完了")
     [reply] = bench.say("在吗")
     assert reply.body == HELLO_TEXT
+
+
+# ------------------------------------------------- answers that fit the question (v0.7.4)
+
+
+@pytest.mark.parametrize(
+    "intent, text",
+    [
+        ("status", "查看下现在的仓位情况，有没有必要平仓，还是可以再等一等"),
+        ("status", "汇报目前持仓情况和风险点"),
+        ("status", "我记得我们的账户被设置为止损的你再最后一次确认"),
+        ("help", "问题是，群里就只有你一个机器人呀？我要@哪个机器人"),
+    ],
+)
+def test_a_question_is_answered_by_the_ai_even_when_it_looks_like_a_card(intent, text):
+    """These got the positions card or the help list in the group, which did not answer them."""
+    bench = Bench()
+    bench.analyst.intent = intent
+    [reply] = bench.say(text, sender=OWNER, private=False)
+    assert reply.body == "AI:answer"
+    [call] = bench.analyst.named("answer")
+    assert "账户权益" in call["account_text"]
+
+
+def test_the_bots_own_cards_are_in_the_history_without_the_code():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.say("做多 XAU 100张 止损 3860", private=False)
+    bench.say("4821", private=False)
+    bench.say("刚才成交了吗？止损在哪", private=False)
+    history = bench.analyst.named("answer")[-1]["history"]
+    assert [question for question, _ in history] == ["做多 XAU 100张 止损 3860", "4821"]
+    preview, done = (answer for _, answer in history)
+    assert preview.startswith("[程序自动回复的卡片：下单预览 · 模拟盘]") and "4821" not in preview and "确认 ****" in preview
+    assert done.startswith("[程序自动回复的卡片：已执行 · 模拟盘]")
+
+
+def test_the_positions_card_and_small_talk_are_in_the_history():
+    bench = Bench()
+    bench.say("仓位", private=False)
+    bench.analyst.intent = "hello"
+    bench.say("这个我去跟 Claude 商量", private=False)
+    bench.analyst.intent = "analysis"
+    bench.say("那现在止损离现价多远", private=False)
+    history = bench.analyst.named("answer")[-1]["history"]
+    assert history[0][0] == "仓位" and history[0][1].startswith("[程序自动回复的卡片：当前持仓]")
+    assert history[1][0] == "这个我去跟 Claude 商量"
+
+
+def test_a_friend_looking_at_the_positions_still_gets_the_disclaimer():
+    bench = Bench(**OPEN_GROUP)
+    assert bench.say("仓位", sender=FRIEND, private=False)[0].footer == DISCLAIMER
+    assert Bench().say("仓位", sender=OWNER, private=False)[0].footer is None
+
+
+def test_a_question_about_closing_is_not_read_as_an_order():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.analyst.command = "平仓 XAU"
+    [reply] = bench.say("查看下现在的仓位情况，有没有必要平仓，还是可以再等一等", private=False)
+    assert bench.analyst.named("to_command") == [] and reply.body == "AI:answer"
+    assert bench.exchange.changes == []
