@@ -9,7 +9,17 @@ import threading
 
 import pytest
 
-from bot.okx_stream import DEMO_URL, LIVE_URL, OkxStream, login_message, stream_url, subscribe_message
+from bot.okx_stream import (
+    BUSINESS_CHANNELS,
+    DEMO_URL,
+    LIVE_URL,
+    OkxStream,
+    Streams,
+    business_url,
+    login_message,
+    stream_url,
+    subscribe_message,
+)
 
 from .helpers import Clock
 
@@ -19,6 +29,14 @@ def test_the_stream_address_follows_the_rest_host():
     assert stream_url("https://www.okx.com", demo=True) == DEMO_URL
     assert stream_url("https://my.okx.com", demo=False).startswith("wss://wseea.okx.com")
     assert stream_url("https://unknown.example.com", demo=False) == ""
+
+
+def test_stop_orders_come_from_the_business_address_next_to_the_private_one():
+    # OKX refuses orders-algo on /private (error 60018); it is served on /business.
+    assert business_url(LIVE_URL) == "wss://ws.okx.com:8443/ws/v5/business"
+    assert business_url(DEMO_URL) == "wss://wspap.okx.com:8443/ws/v5/business?brokerId=9999"
+    assert business_url(stream_url("https://my.okx.com", demo=False)) == "wss://wseea.okx.com:8443/ws/v5/business"
+    assert business_url("wss://example.com/somewhere") == ""
 
 
 def test_login_is_signed_like_okx_asks():
@@ -31,7 +49,8 @@ def test_login_is_signed_like_okx_asks():
 
 def test_it_subscribes_only_to_channels_that_read():
     channels = [arg["channel"] for arg in json.loads(subscribe_message())["args"]]
-    assert channels == ["positions", "orders-algo", "liquidation-warning"]
+    assert channels == ["positions", "liquidation-warning"]
+    assert [arg["channel"] for arg in json.loads(subscribe_message(BUSINESS_CHANNELS))["args"]] == ["orders-algo"]
 
 
 def make_stream(clock=None):
@@ -153,6 +172,36 @@ def test_the_status_line():
     assert stream.status() == "没连上，正在重连；期间照常定时读账户"
     stream.logged_in = stream.subscribed = True
     assert stream.status().startswith("已连上")
+
+
+def test_the_status_line_of_the_two_connections():
+    private, _ = make_stream()
+    business = OkxStream("key", "secret", "pass", business_url(LIVE_URL), lambda channel: None, channels=BUSINESS_CHANNELS)
+    both = Streams(private, business)
+    assert both.status() == "没连上，正在重连；期间照常定时读账户"
+    private.logged_in = private.subscribed = True
+    business.last_error = "ConnectionClosedError"
+    assert both.status() == (
+        "仓位和强平预警已连上；止盈止损单那一路没连上，正在重连（上次断开：ConnectionClosedError），期间照常定时读账户"
+    )
+    business.logged_in = business.subscribed = True
+    assert both.status().startswith("已连上，止损被打")
+    private.logged_in = False
+    assert both.status().startswith("止盈止损单已连上；仓位和强平预警那一路没连上")
+    private.logged_in = True
+    assert Streams(private).status() == "已连上仓位和强平预警，几秒内就提醒；止盈止损单的变化靠定时读账户"
+
+
+def test_the_business_connection_subscribes_to_stop_orders_only():
+    stop = threading.Event()
+    socket = FakeSocket([json.dumps({"event": "login", "code": "0"})], stop)
+    stream = OkxStream(
+        "key", "secret", "pass", business_url(LIVE_URL), lambda channel: None,
+        connect=lambda url, **kw: socket, channels=BUSINESS_CHANNELS, name="okx algo stream",
+    )  # fmt: skip
+    stream.run_forever(stop)
+    [subscribe] = [json.loads(sent) for sent in socket.sent if sent.startswith('{"op": "subscribe"')]
+    assert [arg["channel"] for arg in subscribe["args"]] == ["orders-algo"]
 
 
 def test_a_refused_connection_never_raises(monkeypatch):

@@ -14,7 +14,7 @@ from .analyst import Analyst, Usage
 from .config import Config
 from .crowd import Crowd
 from .macro import Macro
-from .okx_stream import OkxStream, stream_url
+from .okx_stream import BUSINESS_CHANNELS, OkxStream, Streams, business_url, stream_url
 from .risk import RiskGauge
 from .envfile import write_env_values
 from .feishu_client import FeishuClient, IncomingMessage
@@ -161,9 +161,9 @@ def build_ai(
     return analyst, resolver, knowledge
 
 
-def start_stream(cfg: Config, monitor: Monitor, stop: threading.Event) -> OkxStream | None:
-    """OKX's private WebSocket, which wakes the monitor the moment something changes. The regular
-    poll carries on regardless; without the stream an alert simply waits for the next tick."""
+def start_stream(cfg: Config, monitor: Monitor, stop: threading.Event) -> Streams | None:
+    """OKX's private WebSockets, which wake the monitor the moment something changes. The regular
+    poll carries on regardless; without them an alert simply waits for the next tick."""
     if not cfg.okx_stream:
         log.info("okx stream: off (OKX_STREAM=false); positions are read every %d seconds", cfg.poll_seconds)
         return None
@@ -171,9 +171,17 @@ def start_stream(cfg: Config, monitor: Monitor, stop: threading.Event) -> OkxStr
     if not url:
         log.warning("okx stream: no WebSocket address known for %s; set OKX_WS_URL to use it", cfg.okx_base_url)
         return None
-    stream = OkxStream(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, url, monitor.poke)
-    threading.Thread(target=stream.run_forever, args=(stop,), name="okx-stream", daemon=True).start()
-    return stream
+    keys = (cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase)
+    private = OkxStream(*keys, url, monitor.poke)
+    threading.Thread(target=private.run_forever, args=(stop,), name="okx-stream", daemon=True).start()
+    business = None
+    algo_url = business_url(url)
+    if algo_url:
+        business = OkxStream(*keys, algo_url, monitor.poke, channels=BUSINESS_CHANNELS, name="okx algo stream")
+        threading.Thread(target=business.run_forever, args=(stop,), name="okx-algo-stream", daemon=True).start()
+    else:
+        log.info("okx stream: no business address next to %s; stop orders are read on the regular poll", url)
+    return Streams(private, business)
 
 
 RESTART_DELAY_SECONDS = 2.0  # long enough for the "restarting" reply to leave
