@@ -16,6 +16,9 @@ Rules that matter:
     in .env on the server. No message can change them.
   * "停止交易" stops new positions at once. Closing, cancelling and moving
     stops stay possible, because they only ever reduce risk.
+  * The circuit breaker does the same on its own after losing stop-outs or
+    liquidations (TRADE_BREAKER_STOPS within TRADE_BREAKER_HOURS, read from
+    OKX's own records). Only "解除熔断" plus a code lifts it.
   * When the connection breaks while an order is on its way, the desk looks
     the order up. It never sends the same order twice on its own.
   * Only USDT/USDC-settled perpetual contracts. No leverage changes, no spot,
@@ -35,7 +38,8 @@ from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
 
-from .config import TRADE_ACTIONS, Config
+from .closes import Hit, hit_line, read_closed, read_triggers, stop_hits
+from .config import STOP_TRIGGERS, TRADE_ACTIONS, Config
 from .instruments import ALIASES, InstrumentResolver
 from .journal import Journal
 from .models import AccountConfig, AccountState, InstrumentSpec, OrderInfo, Position
@@ -46,6 +50,8 @@ log = logging.getLogger(__name__)
 
 MODE_LABELS = {"off": "已关闭", "demo": "模拟盘", "live": "实盘"}
 PAUSED_SETTING = "trading_paused"
+BREAKER_RESET_SETTING = "breaker_reset_at"  # stop-outs before this moment no longer count
+BREAKER_TOLD_SETTING = "breaker_told_at"  # the newest stop-out the owner has been told the breaker tripped on
 MAX_COMMAND_CHARS = 80
 MAX_WRONG_CODES = 3
 FAR_LIMIT_PCT = Decimal(30)  # a resting limit price further than this from the market is taken for a typo
@@ -99,6 +105,7 @@ ACTION_NAMES = {
 ABORT_WORDS = ("取消", "不要了", "算了", "取消下单", "/abort")
 PAUSE_WORDS = ("停止交易", "暂停交易", "停止下单", "暂停下单", "/stoptrading")
 RESUME_WORDS = ("恢复交易", "恢复下单", "/resumetrading")
+UNBREAK_WORDS = ("解除熔断", "恢复开仓", "/unbreak")
 SETTINGS_WORDS = ("交易设置", "交易状态", "下单设置", "下单状态", "/trading")
 HELP_WORDS = ("交易帮助", "下单帮助", "怎么下单", "下单指令", "/tradehelp")
 ORDERS_WORDS = ("查挂单", "当前挂单", "当前委托", "挂单", "委托", "/orders")
@@ -156,6 +163,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 每条指令我先回一张预览，你回复确认码才执行（“确认 4812”“4812”“确认4812执行”都行），回复“取消”作废；回复里只要带“取消、不要、别、先等等”这类话，即使有确认码也按作废处理；过期也作废
 - 不是标准写法也可以，例如“止损减两点”“把 3808 的止损挪到 3806”：我会先写出我理解成哪条指令，再出预览
 - “停止交易”：立刻不再接受开仓（平仓、撤单、改止损照常）。“恢复交易”解除
+- 熔断：24 小时内亏损的止损或强平满 2 次，我自动不再接受开仓（平仓、撤单、改止损照常），不动任何仓位。“解除熔断”再回确认码恢复
 - “交易设置”：看当前是模拟盘还是实盘、各项限额、这把 key 的权限
 - “模拟盘自测”：只在模拟盘。我用最小的数量把开仓、止盈止损、减仓、挂单、撤单、平仓各跑一遍，告诉你 OKX 每一步收没收
 - 限额和品种名单只能在服务器的 .env 里改，飞书里改不了。杠杆倍数请在 OKX 里设"""
@@ -175,7 +183,7 @@ def new_confirmation_code() -> str:
 class Command:
     """What the owner asked for, as far as the words alone say it."""
 
-    kind: str  # open | close | cancel | stop | orders | pause | resume | settings | help | selftest | confirm | abort | unclear
+    kind: str  # open | close | cancel | stop | orders | pause | resume | unbreak | settings | help | selftest | confirm | abort | unclear
     inst_id: str = ""
     direction: str = ""  # open: long | short | same (加仓). close: long | short | "" (whichever there is)
     ord_type: str = ""  # market | limit
@@ -252,7 +260,7 @@ class CommandParser:
         if confirm:
             return Command("confirm", code=confirm.group(1) or "")
         for words, kind in (
-            (ABORT_WORDS, "abort"), (PAUSE_WORDS, "pause"), (RESUME_WORDS, "resume"),
+            (ABORT_WORDS, "abort"), (PAUSE_WORDS, "pause"), (RESUME_WORDS, "resume"), (UNBREAK_WORDS, "unbreak"),
             (SETTINGS_WORDS, "settings"), (HELP_WORDS, "help"), (SELFTEST_WORDS, "selftest"),
         ):  # fmt: skip
             if lowered in words:
@@ -799,6 +807,8 @@ class TradeDesk:
         if kind == "unclear":
             where_now = self._stops_now() if command.note == STOP_PRICE_MISSING else ""
             return Reply(f"{command.note}{where_now}\n没有执行任何操作。发“交易帮助”可以看全部写法。", unclear=True)
+        if kind == "unbreak":
+            return self._ask_unbreak(command, in_group)
         if kind == "selftest":
             plan = self._selftest(command.inst_id).plan()
             return self._ask_to_confirm(
@@ -851,6 +861,8 @@ class TradeDesk:
                     return Reply("确认码连续错了三次，这个预览已作废，没有执行。请重新发指令。")
                 return Reply("确认码不对，没有执行。请核对预览卡片上的四位数。")
             self._pending = None  # a code works once
+        if pending.command.kind == "unbreak":
+            return self._unbreak()
         with self._sending:
             if pending.command.kind == "selftest":
                 try:
@@ -902,6 +914,102 @@ class TradeDesk:
     def _paused(self) -> bool:
         return self._journal.get_setting(PAUSED_SETTING, "0") == "1"
 
+    # ---------------------------------------------------------- circuit breaker
+
+    def _breaker_hits(self) -> list[Hit]:
+        """Losing stop-outs and liquidations that count now: within the window, and after the last time
+        the owner lifted the breaker. Raises OkxError / OkxNetworkError when OKX cannot be read."""
+        window_start = self._clock() - self._cfg.trade_breaker_hours * 3600
+        reset_at = float(self._journal.get_setting(BREAKER_RESET_SETTING, "0") or 0)
+        return stop_hits(read_closed(self._okx), read_triggers(self._okx), max(window_start, reset_at))
+
+    def _breaker_text(self, hits: list[Hit]) -> str:
+        cfg = self._cfg
+        lines = [f"过去 {cfg.trade_breaker_hours} 小时内止损或强平 {len(hits)} 次，你定的规则是满 {cfg.trade_breaker_stops} 次就暂停开仓："]
+        lines += [f"- {hit_line(hit, cfg.tz)}" for hit in hits]
+        return "\n".join(lines)
+
+    def _check_breaker(self) -> None:
+        """Refuses a new position while the breaker is tripped, or when it cannot be checked."""
+        if self._cfg.trade_breaker_stops <= 0:
+            return
+        try:
+            hits = self._breaker_hits()
+        except (OkxError, OkxNetworkError) as exc:
+            log.warning("circuit breaker: OKX's records could not be read (%s)", type(exc).__name__)
+            raise Refused("读不到 OKX 的止损和平仓记录，熔断规则没法核对，这次不开仓。请稍后再试。平仓、撤单、改止损不受影响。")
+        if len(hits) >= self._cfg.trade_breaker_stops:
+            log.info("circuit breaker: an opening order was refused (%d hits)", len(hits))
+            raise Refused(
+                "熔断中，不接受开仓指令。" + self._breaker_text(hits) + "\n"
+                "平仓、撤单、改止损照常可用。要恢复开仓，发“解除熔断”，再回确认码。"
+            )
+
+    def _ask_unbreak(self, command: Command, in_group: bool) -> Reply:
+        cfg = self._cfg
+        if cfg.trade_breaker_stops <= 0:
+            return Reply("熔断没有打开（TRADE_BREAKER_STOPS=0），不用解除。")
+        hits = self._breaker_hits()
+        if len(hits) < cfg.trade_breaker_stops:
+            return Reply(
+                f"熔断没有触发：过去 {cfg.trade_breaker_hours} 小时内止损或强平 {len(hits)} 次，"
+                f"满 {cfg.trade_breaker_stops} 次才会暂停开仓。不用解除。"
+            )
+        lines = (
+            *self._breaker_text(hits).splitlines(),
+            "解除以后可以照常开仓，上面这几次不再计入；之后再满次数，会再次暂停。",
+        )
+        plan = Plan("unbreak", "解除熔断", lines, ())
+        return self._ask_to_confirm(
+            command, plan, "解除熔断 · 预览", "回复 **确认 {code}** 解除，回复“取消”作废。{seconds} 秒内有效。", in_group
+        )
+
+    def _unbreak(self) -> Reply:
+        now = self._clock()
+        self._journal.set_setting(BREAKER_RESET_SETTING, f"{now:.3f}")
+        self._journal.set_setting(BREAKER_TOLD_SETTING, f"{now:.3f}")
+        log.info("the owner lifted the circuit breaker")
+        return Reply(
+            f"熔断已解除，可以开仓了。之前的止损不再计入；之后 {self._cfg.trade_breaker_hours} 小时内再止损或强平满 "
+            f"{self._cfg.trade_breaker_stops} 次，会再次暂停开仓。每张单仍然要你回确认码才执行。"
+        )
+
+    def breaker_alert(self) -> str:
+        """The owner's notice that the breaker has just tripped; "" when there is nothing new to say.
+        Called after a position closes or shrinks. Says nothing while opening is not possible anyway."""
+        cfg = self._cfg
+        if cfg.trade_breaker_stops <= 0 or self._mode == "off":
+            return ""
+        if "open" not in cfg.trade_actions and "limit" not in cfg.trade_actions:
+            return ""
+        try:
+            hits = self._breaker_hits()
+        except (OkxError, OkxNetworkError):
+            return ""  # the check before every opening order still refuses when OKX cannot be read
+        told = float(self._journal.get_setting(BREAKER_TOLD_SETTING, "0") or 0)
+        if len(hits) < cfg.trade_breaker_stops or hits[-1].at <= told:
+            return ""
+        self._journal.set_setting(BREAKER_TOLD_SETTING, f"{hits[-1].at:.3f}")
+        log.info("circuit breaker tripped (%d hits)", len(hits))
+        return (
+            self._breaker_text(hits) + "\n\n"
+            "从现在起不接受开仓指令，平仓、撤单、改止损照常可用。我没有动任何仓位和挂单。\n"
+            "要恢复开仓，发“解除熔断”，再回确认码。"
+        )
+
+    def _breaker_status(self) -> str:
+        cfg = self._cfg
+        if cfg.trade_breaker_stops <= 0:
+            return "- 熔断：没有打开（TRADE_BREAKER_STOPS=0）"
+        rule = f"{cfg.trade_breaker_hours} 小时内止损或强平满 {cfg.trade_breaker_stops} 次就暂停开仓"
+        try:
+            hits = self._breaker_hits()
+        except (OkxError, OkxNetworkError):
+            return f"- 熔断：{rule}；这次没读到 OKX 的记录"
+        if len(hits) >= cfg.trade_breaker_stops:
+            return f"- 熔断：**已触发**（{len(hits)} 次），不接受开仓，发“解除熔断”恢复。规则：{rule}"
+        return f"- 熔断：{rule}；现在 {len(hits)} 次"
+
     # --------------------------------------------------------------- settings
 
     def _mode_line(self) -> str:
@@ -937,6 +1045,9 @@ class TradeDesk:
             lines.append(f"- 配置有问题，所以保持关闭：{cfg.trading_blocked}")
         if self._mode != "off":
             lines.append("- 开仓已暂停（发“恢复交易”解除）" if self._paused() else "- 没有暂停")
+            lines.append(self._breaker_status())
+            if cfg.trade_stop_trigger != "last":
+                lines.append(f"- 机器人挂的止损止盈按{STOP_TRIGGERS[cfg.trade_stop_trigger]}触发")
         closed = [ACTION_NAMES[action] for action in TRADE_ACTIONS if action not in cfg.trade_actions]
         if closed:
             lines.append(f"**开放的操作**：{self._actions_line()}没有开放：{'、'.join(closed)}")
@@ -1201,6 +1312,7 @@ class TradeDesk:
         cfg = self._cfg
         if self._paused():
             raise Refused("交易已暂停（你发过“停止交易”），现在不接受开仓指令。发“恢复交易”解除。平仓、撤单、改止损不受影响。")
+        self._check_breaker()
         inst_id = cmd.inst_id
         base = inst_id.split("-")[0]
         spec = self._tradable(inst_id)
@@ -1343,7 +1455,11 @@ class TradeDesk:
             lines.append(f"现价 {_px(last, spec)}，限价比现价{where} {abs(gap):.2f}%，{waits}")
         coins = contracts * per_contract
         if sl is not None:
-            lines.append(f"止损 {_px(sl, spec)}（离{entry_name} {abs(sl - ref) / ref * 100:.2f}%，触发后大约亏 {_amt(abs(sl - ref) * coins)} {settle}）")
+            loss = abs(sl - ref) * coins
+            lines.append(
+                f"止损 {_px(sl, spec)}（离{entry_name} {abs(sl - ref) / ref * 100:.2f}%，触发后大约亏 {_amt(loss)} {settle}"
+                f"{self._risk_share(loss, state)}）"
+            )
         else:
             lines.append("止损 无（这张单不带止损）")
         if tp is not None:
@@ -1627,6 +1743,16 @@ class TradeDesk:
             result = (new - average) * coins * sign
             text += f"；从开仓均价算，这笔交易 {float(result):+,.2f} {ccy}"
         return text + "）"
+
+    def _risk_share(self, loss: Decimal, state: AccountState) -> str:
+        """", 占权益 x%, 你定的单笔风险是 y%" for an opening order's stop: the same yardstick as 算仓位."""
+        equity = _dec(state.snapshot.total_eq or 0)
+        if equity <= 0:
+            return ""
+        share = loss / equity * 100
+        rule = _dec(self._cfg.risk_per_trade_pct)
+        verdict = "超过了" if share > rule else "没超过"
+        return f"，占权益 {share:.1f}%，{verdict}你定的单笔风险 {float(rule):g}%"
 
     # -------------------------------------------------------------- execution
 

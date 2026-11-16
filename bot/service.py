@@ -55,6 +55,7 @@ class Reporter:
         self._clock = clock
         self._crowd = crowd  # crowd.Crowd, or None when CROWD_DATA is off
         self._macro = macro  # macro.Macro, or None when MACRO_DATA is off
+        self.breaker_alert: Callable[[], str] | None = None  # set by the app: the trade desk's circuit breaker notice
         self.monitor: Monitor | None = None  # set by the app once both exist
 
     # ----------------------------------------------------------- destinations
@@ -115,6 +116,17 @@ class Reporter:
         if self._cfg.group_chat_id and (event.to_group or (shared and event.kind in RISK_KINDS)):
             body = event_markdown(event, private=shared)
             self.to_group(event.title, body or "（无更多信息）", template, footer=DISCLAIMER)
+        if event.kind in ("closed", "reduced") and self.breaker_alert is not None:
+            self._tell_breaker()
+
+    def _tell_breaker(self) -> None:
+        """After a close: whether that stop-out tripped the circuit breaker. Only the owner hears it."""
+        try:
+            text = self.breaker_alert()
+            if text:
+                self.to_owner("熔断：开仓已暂停", text, "red")
+        except Exception:
+            log.exception("could not check the circuit breaker")
 
     def send_startup(self, downtime: tuple[float, float] | None = None) -> None:
         """`downtime` is (last seen running, now) when the bot was off long enough to matter."""

@@ -60,6 +60,9 @@ class FakeExchange:
         self.failures: dict[str, list[Exception]] = {}  # raised instead of doing the thing
         self.lost: set[str] = set()  # done, and then the connection breaks
         self.lookup_failures: list[Exception] = []
+        self.triggered: dict[str, list[dict]] = {}  # OKX's triggered TP/SL orders, by order type
+        self.closed: list[dict] = []  # OKX's position history
+        self.history_failures: list[Exception] = []
         self._next = 7000
 
     # ------------------------------------------------------------------ reads
@@ -92,6 +95,14 @@ class FakeExchange:
 
     def leverage(self, inst_id: str, mgn_mode: str) -> float:
         return self.lever
+
+    def algo_history(self, ord_type: str) -> list[dict]:
+        if self.history_failures:
+            raise self.history_failures.pop(0)
+        return list(self.triggered.get(ord_type, []))
+
+    def position_history(self) -> list[dict]:
+        return list(self.closed)
 
     # ---------------------------------------------------------------- changes
 
@@ -460,7 +471,7 @@ def test_a_market_order_is_previewed_and_sent_only_on_confirmation():
     assert "**市价做多 XAU-USDT-SWAP**" in preview.text
     assert "数量 100 张（合 0.1 XAU），按现价 3,880.0 约 388.00 USDT（名义价值）" in preview.text
     assert "杠杆 100 倍（在 OKX 里设的），大约占用保证金 3.88 USDT，全仓" in preview.text
-    assert "止损 3,860.0（离现价 0.52%，触发后大约亏 2.00 USDT）" in preview.text
+    assert "止损 3,860.0（离现价 0.52%，触发后大约亏 2.00 USDT，占权益 0.1%，没超过你定的单笔风险 1%）" in preview.text
     assert "止盈 3,950.0（离现价 1.80%，触发后大约赚 7.00 USDT）" in preview.text
     assert "下单后 XAU-USDT-SWAP 的多单约 388.00 USDT（上限 3,000）" in preview.text
     assert "回复 **确认 1111** 执行" in preview.text and "120 秒内有效" in preview.text
@@ -492,6 +503,11 @@ def test_a_live_preview_says_so_in_red():
     assert preview.title == "下单预览 · 实盘" and preview.template == "red"
     assert bench.say("确认 1111").title == "已执行 · 实盘"
     assert bench.journal.events_between(0, 2_000_000_000)[0]["summary"] == "市价做多 XAU-USDT-SWAP：已执行"
+
+
+def test_an_opening_preview_measures_its_stop_against_his_per_trade_rule():
+    text = Bench(risk_per_trade_pct=0.05).say("做多 XAU 100张 止损 3860").text
+    assert "触发后大约亏 2.00 USDT，占权益 0.1%，超过了你定的单笔风险 0.05%" in text
 
 
 def test_a_code_works_once():

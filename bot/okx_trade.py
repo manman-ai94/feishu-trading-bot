@@ -23,6 +23,8 @@ MARKET_PRICE = "-1"  # as the order price of a take-profit or stop-loss: close a
 
 
 class OkxTradeClient(OkxClient):
+    trigger_px_type = "last"  # what price fires the stops it places: last, mark or index (TRADE_STOP_TRIGGER)
+
     # ------------------------------------------------------------------ core
 
     def _post(self, path: str, body: dict | list, _retried: bool = False) -> list:
@@ -100,7 +102,7 @@ class OkxTradeClient(OkxClient):
             body["posSide"] = pos_side
         if reduce_only:
             body["reduceOnly"] = True
-        attached = _stop_fields(sl_trigger_px, tp_trigger_px, prefix="")
+        attached = _stop_fields(sl_trigger_px, tp_trigger_px, prefix="", px_type=self.trigger_px_type)
         if attached:
             body["attachAlgoOrds"] = [attached]
         data = self._post("/api/v5/trade/order", body)
@@ -155,14 +157,14 @@ class OkxTradeClient(OkxClient):
             body["posSide"] = pos_side
         else:
             body["reduceOnly"] = True  # OKX requires it with closeFraction in net mode
-        body.update(_stop_fields(sl_trigger_px, tp_trigger_px, prefix=""))
+        body.update(_stop_fields(sl_trigger_px, tp_trigger_px, prefix="", px_type=self.trigger_px_type))
         data = self._post("/api/v5/trade/order-algo", body)
         return str(data[0].get("algoId", "")) if data else ""
 
     def amend_stop(self, inst_id: str, algo_id: str, sl_trigger_px: str | None = None, tp_trigger_px: str | None = None) -> None:
         """Moves the trigger prices of an existing take-profit / stop-loss order."""
         body = {"instId": inst_id, "algoId": algo_id}
-        body.update(_stop_fields(sl_trigger_px, tp_trigger_px, prefix="new"))
+        body.update(_stop_fields(sl_trigger_px, tp_trigger_px, prefix="new", px_type=self.trigger_px_type))
         self._post("/api/v5/trade/amend-algos", body)
 
     def cancel_stops(self, items: list[tuple[str, str]]) -> None:
@@ -171,8 +173,9 @@ class OkxTradeClient(OkxClient):
             self._post("/api/v5/trade/cancel-algos", [{"instId": inst_id, "algoId": algo_id} for inst_id, algo_id in items])
 
 
-def _stop_fields(sl_trigger_px: str | None, tp_trigger_px: str | None, prefix: str) -> dict:
-    """The request fields of a stop-loss and/or take-profit that closes at market on the last price.
+def _stop_fields(sl_trigger_px: str | None, tp_trigger_px: str | None, prefix: str, px_type: str = "last") -> dict:
+    """The request fields of a stop-loss and/or take-profit that closes at market when `px_type`
+    (last, mark or index price) reaches it.
 
     With prefix "new" these are the fields of an amendment (newSlTriggerPx, ...).
     """
@@ -184,9 +187,9 @@ def _stop_fields(sl_trigger_px: str | None, tp_trigger_px: str | None, prefix: s
     if sl_trigger_px:
         fields[name("slTriggerPx")] = sl_trigger_px
         fields[name("slOrdPx")] = MARKET_PRICE
-        fields[name("slTriggerPxType")] = "last"
+        fields[name("slTriggerPxType")] = px_type
     if tp_trigger_px:
         fields[name("tpTriggerPx")] = tp_trigger_px
         fields[name("tpOrdPx")] = MARKET_PRICE
-        fields[name("tpTriggerPxType")] = "last"
+        fields[name("tpTriggerPxType")] = px_type
     return fields

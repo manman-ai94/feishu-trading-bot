@@ -59,14 +59,17 @@ def build_trader(cfg: Config) -> OkxTradeClient | None:
     OKX_DEMO=true). TRADING=live uses the main keys on the real account.
     """
     if cfg.trading == "live":
-        return OkxTradeClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, demo=False)
-    if cfg.trading == "demo":
-        if cfg.has_okx_demo_keys:
-            return OkxTradeClient(
-                cfg.okx_demo_api_key, cfg.okx_demo_secret_key, cfg.okx_demo_passphrase, cfg.okx_base_url, demo=True
-            )
-        return OkxTradeClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, demo=True)
-    return None
+        trader = OkxTradeClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, demo=False)
+    elif cfg.trading == "demo" and cfg.has_okx_demo_keys:
+        trader = OkxTradeClient(
+            cfg.okx_demo_api_key, cfg.okx_demo_secret_key, cfg.okx_demo_passphrase, cfg.okx_base_url, demo=True
+        )
+    elif cfg.trading == "demo":
+        trader = OkxTradeClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, demo=True)
+    else:
+        return None
+    trader.trigger_px_type = cfg.trade_stop_trigger
+    return trader
 
 
 def build_trade_desk(cfg: Config, journal: Journal, okx: OkxClient, resolver: InstrumentResolver, reporter=None) -> TradeDesk:
@@ -182,6 +185,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         threading.Timer(RESTART_DELAY_SECONDS, _exit_for_restart).start()
 
     desk = build_trade_desk(cfg, journal, okx, resolver, reporter)
+    reporter.breaker_alert = desk.breaker_alert
     router = Router(
         cfg, feishu, okx, analyst, reporter, bot_open_id, save_setting=save_setting, restart=restart,
         resolver=resolver, knowledge=knowledge, usage=journal.usage_between, trade=desk, journal=journal,

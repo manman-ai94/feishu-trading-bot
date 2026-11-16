@@ -128,6 +128,18 @@ class FakeOkx:
         self.error: Exception | None = None
         self.market_error: Exception | None = None
         self.account_reads = 0
+        self.triggered: dict[str, list[dict]] = {}  # OKX's triggered TP/SL orders, by order type
+        self.closed: list[dict] = []  # OKX's position history
+
+    def algo_history(self, ord_type: str) -> list[dict]:
+        if self.error:
+            raise self.error
+        return list(self.triggered.get(ord_type, []))
+
+    def position_history(self) -> list[dict]:
+        if self.error:
+            raise self.error
+        return list(self.closed)
 
     def account_state(self) -> AccountState:
         self.account_reads += 1

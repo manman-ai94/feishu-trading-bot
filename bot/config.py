@@ -28,6 +28,7 @@ TRADING_MODES = ("off", "demo", "live")
 # What an order command may do, from the least risk to the most. TRADE_ACTIONS
 # names the ones that are open, so the real account can be opened step by step.
 TRADE_ACTIONS = ("stops", "close", "cancel", "limit", "open")
+STOP_TRIGGERS = {"last": "最新成交价", "mark": "标记价", "index": "指数价"}
 MARGIN_MODES = ("cross", "isolated")
 
 
@@ -170,6 +171,9 @@ class Config:
     trade_margin_mode: str = "cross"  # for a new position; an existing one keeps its own
     trade_confirm_seconds: int = 120
     trade_require_stop: bool = False  # refuse an opening order that carries no stop-loss
+    trade_breaker_stops: int = 2  # circuit breaker: this many losing stop-outs or liquidations stop new positions; 0 is off
+    trade_breaker_hours: int = 24  # ... within this many hours
+    trade_stop_trigger: str = "last"  # what price fires a stop the bot places: last, mark or index
     trade_actions: tuple[str, ...] = TRADE_ACTIONS  # the kinds of command that are carried out; the rest are refused
 
     @property
@@ -324,6 +328,11 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         problems.append(f"TRADE_MARGIN_MODE 只能填 cross（全仓）或 isolated（逐仓），现在是 {margin_mode!r}")
         margin_mode = "cross"
 
+    stop_trigger = _get("TRADE_STOP_TRIGGER", "last").lower()
+    if stop_trigger not in STOP_TRIGGERS:
+        problems.append(f"TRADE_STOP_TRIGGER 只能填 last（最新成交价）、mark（标记价）或 index（指数价），现在是 {stop_trigger!r}")
+        stop_trigger = "last"
+
     def _positive(name: str, default: float) -> float:
         value = _get_float(name, default, problems)
         if value is None or value <= 0:
@@ -407,6 +416,9 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         trade_margin_mode=margin_mode,
         trade_confirm_seconds=max(20, _get_int("TRADE_CONFIRM_SECONDS", 120, problems)),
         trade_require_stop=_get_bool("TRADE_REQUIRE_STOP", False),
+        trade_breaker_stops=max(0, _get_int("TRADE_BREAKER_STOPS", 2, problems)),
+        trade_breaker_hours=min(168, max(1, _get_int("TRADE_BREAKER_HOURS", 24, problems))),
+        trade_stop_trigger=stop_trigger,
         trade_actions=trade_actions,
     )
 

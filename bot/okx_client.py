@@ -252,6 +252,18 @@ class OkxClient:
         """Open take-profit / stop-loss orders (conditional and OCO)."""
         return self._get("/api/v5/trade/orders-algo-pending", {"ordType": "conditional,oco"}, auth=True)
 
+    def algo_history(self, ord_type: str) -> list[dict]:
+        """Take-profit / stop-loss orders of one type ("conditional" or "oco") that went off, newest first:
+        the last 100 of the past three months. `actualSide` says which side fired ("sl" or "tp")."""
+        return self._get(
+            "/api/v5/trade/orders-algo-history", {"ordType": ord_type, "state": "effective", "limit": "100"}, auth=True
+        )
+
+    def position_history(self) -> list[dict]:
+        """Closed and partly closed positions, newest first: the last 100 of the past three months, each with
+        its open and close price, realised P&L with fees and funding, and how it closed (`type`)."""
+        return self._get("/api/v5/account/positions-history", {"limit": "100"}, auth=True)
+
     def account_config(self) -> AccountConfig:
         """What this API key is allowed to do, and the account's position mode."""
         data = self._get("/api/v5/account/config", auth=True)

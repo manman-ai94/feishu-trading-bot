@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable
 
+from .closes import close_lines, how_it_closed, read_closed, read_triggers
 from .config import Config
 from .journal import Journal
 from .models import AccountState, Position
@@ -21,6 +22,8 @@ log = logging.getLogger(__name__)
 QTY_TOLERANCE = 1e-9
 FAILURES_BEFORE_ALERT = 3
 NO_STOP_REPEAT_SECONDS = 24 * 3600  # a position left without a stop is pointed out again this often
+CLOSE_RECORD_SECONDS = 15 * 60  # a close OKX recorded this recently is the one just seen
+CLOSE_RECORD_WAIT_SECONDS = 2.0  # OKX may write the record a moment after the position goes
 NO_STOP_SETTING = "no_stop_alert:"  # in the journal: when each position was last pointed out, so a restart does not repeat it
 RISK_LEVELS_SETTING = "risk_levels"  # in the journal: the level each risk reading was last reported at
 
@@ -220,8 +223,10 @@ class Monitor:
         notify: Callable[[Event], None],
         clock: Callable[[], float] = time.time,
         gauge=None,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self._okx = okx
+        self._sleep = sleep
         self._cfg = cfg
         self._journal = journal
         self._notify = notify
@@ -275,7 +280,7 @@ class Monitor:
         if self._positions is None:
             log.info("baseline: %d open position(s)", len(current))
         else:
-            events.extend(diff_positions(self._positions, current))
+            events.extend(self._as_recorded(event) for event in diff_positions(self._positions, current))
         self._positions = current
         with self._lock:
             self._state = state
@@ -311,6 +316,45 @@ class Monitor:
             self._wake.clear()
 
     # ------------------------------------------------------------- internals
+
+    def _as_recorded(self, event: Event) -> Event:
+        """A close as OKX recorded it: the realised P&L with fees and funding, and whether a stop, a
+        take-profit or a liquidation did it. Keeps the last poll's numbers when there is no record."""
+        if event.kind != "closed":
+            return event
+        try:
+            record = self._close_record(event.inst_id)
+            if record is None:
+                return event
+            triggers = read_triggers(self._okx)
+        except Exception as exc:  # the alert goes out either way
+            log.info("close of %s: OKX's record could not be read (%s)", event.inst_id, type(exc).__name__)
+            return event
+        lines = close_lines(record, triggers)
+        size = tuple(line.split("，开仓均价")[0] for line in event.private_lines[:1])  # "原数量 ..." from the last poll
+        how = how_it_closed(record, triggers)
+        title = event.title
+        for start, label in (("止损", "止损触发"), ("止盈", "止盈触发"), ("强平", "强平")):
+            if how.startswith(start):
+                title = event.title.replace("平仓：", f"{label}：", 1)
+        return replace(
+            event,
+            title=title,
+            private_lines=(*lines, *size),
+            public_lines=tuple(line for line in lines if not line.startswith("已实现盈亏")),
+            warning=event.warning or record.close_type in ("3", "4"),
+        )
+
+    def _close_record(self, inst_id: str):
+        for attempt in range(2):
+            history = read_closed(self._okx)
+            recent = [c for c in history if c.inst_id == inst_id and c.closed_at >= self._clock() - CLOSE_RECORD_SECONDS]
+            if recent:
+                return recent[-1]
+            if not history or attempt:
+                return None  # no records at all: nothing to wait for
+            self._sleep(CLOSE_RECORD_WAIT_SECONDS)
+        return None
 
     def _measure(self, state: AccountState) -> AccountRisk | None:
         if self._gauge is None:
