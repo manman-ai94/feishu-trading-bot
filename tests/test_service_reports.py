@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 from bot.analyst import AnalystUnavailable
 from bot.journal import Journal
+from bot.models import CurrencyBalance
 from bot.monitor import Event, Monitor, diff_positions
 from bot.reports import DISCLAIMER, account_text, equity_text, event_markdown, journal_text, status_markdown
 from bot.service import Reporter
@@ -33,6 +34,41 @@ def test_private_status_has_everything():
     text = status_markdown(make_state(), day_change=-35.5, private=True)
     for expected in ("账户权益", "10,000.00 USD", "-35.50 USD", "保证金率 1250%", "数量 2 张", "杠杆 10 倍", "预估强平价 2,400.00", "止损 2,630.00"):
         assert expected in text
+
+
+def test_amounts_carry_the_currency_they_are_counted_in():
+    """A USDT-settled contract's PnL is USDT, the equity is USD, and the size says what the contracts add up to."""
+    position = make_position(qty=5000.0, coins=5.0, coin_ccy="XAU", ccy="USDT", upl=412.5, upl_ratio=1.0855, lever=50.0, notional_usd=19398.7)
+    currencies = (CurrencyBalance("USDT", eq=5024.4, eq_usd=5020.85, avail_eq=3100.25, upl=412.5, mgn_ratio=6.25), CurrencyBalance("BTC", eq=0.00001, eq_usd=0.65))
+    state = make_state([position], total_eq=5021.5, upl=None, mgn_ratio=6.25, currencies=currencies)
+    card = status_markdown(state, day_change=None, private=True)
+    for expected in (
+        "**账户权益** 5,021.50 USD",
+        "- USDT：权益 5,024.40，可用保证金 3,100.25，浮动盈亏 +412.50",
+        "保证金率 625%",
+        "数量 5000 张（合 5 XAU），杠杆 50 倍，名义价值 19,398.70 USD",
+        "浮动盈亏 +412.50 USDT（按保证金算 +108.55%）",
+    ):
+        assert expected in card
+    assert "BTC：" not in card  # dust is left out
+    assert "412.50 USD（" not in card and "412.50 USD\n" not in card  # never a USDT amount labelled USD
+
+    for_ai = account_text(state, None)
+    assert "USDT：权益 5,024.40" in for_ai and "5000 张（合 5 XAU）" in for_ai and "浮动盈亏 +412.50 USDT" in for_ai
+
+    public = status_markdown(state, None, private=False)
+    assert "5,021" not in public and "412" not in public and "5000" not in public and "USDT：" not in public
+
+
+def test_position_events_say_what_the_contracts_add_up_to():
+    before = make_position(qty=3000.0, coins=3.0, coin_ccy="XAU", ccy="USDT", upl=-120.0)
+    after = make_position(qty=5000.0, coins=5.0, coin_ccy="XAU", ccy="USDT")
+    [opened] = diff_positions({}, {after.key: after})
+    assert "数量 5000 张（合 5 XAU）" in opened.private_lines[0] and "5000" not in "".join(opened.public_lines)
+    [increased] = diff_positions({before.key: before}, {after.key: after})
+    assert increased.private_lines[0] == "3000 张变为 5000 张（合 5 XAU）"
+    [closed] = diff_positions({before.key: before}, {})
+    assert "原数量 3000 张（合 3 XAU）" in closed.private_lines[0] and "-120.00 USDT" in closed.private_lines[1]
 
 
 def test_public_status_has_levels_only():

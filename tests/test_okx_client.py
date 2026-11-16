@@ -40,6 +40,12 @@ def ok(data):
     return {"code": "0", "msg": "", "data": data}
 
 
+XAU_RULES = ok(
+    [{"instId": "XAU-USDT-SWAP", "instType": "SWAP", "ctVal": "0.001", "ctMult": "1", "ctValCcy": "XAU", "settleCcy": "USDT",
+      "ctType": "linear", "lotSz": "1", "minSz": "1", "tickSz": "0.1", "state": "live"}]
+)  # fmt: skip
+
+
 def client(routes, **kwargs) -> tuple[OkxClient, FakeSession]:
     session = FakeSession(routes)
     return OkxClient("key", "secret", "pass", "https://okx.test", session=session, **kwargs), session
@@ -155,19 +161,81 @@ def test_candles_come_back_oldest_first_with_the_confirm_flag():
 
 def test_account_state_attaches_pending_stops():
     position_row = {"instId": "XAU-USDT-SWAP", "instType": "SWAP", "posSide": "net", "mgnMode": "cross", "pos": "2", "avgPx": "2650"}
-    okx, _ = client(
+    okx, session = client(
         {
             "/api/v5/account/balance": [ok([{"totalEq": "10000", "mgnRatio": "12.5"}])],
             "/api/v5/account/positions": [ok([position_row])],
             "/api/v5/trade/orders-algo-pending": [
                 ok([{"instId": "XAU-USDT-SWAP", "side": "sell", "posSide": "net", "algoId": "9", "slTriggerPx": "2630", "tpTriggerPx": ""}])
             ],
+            "/api/v5/public/instruments": [XAU_RULES],
         }
     )
     state = okx.account_state()
     assert state.snapshot.total_eq == 10000.0
     assert state.positions[0].stop_loss == 2630.0
     assert state.positions[0].take_profit is None
+    assert state.positions[0].coins == 0.002 and state.positions[0].coin_ccy == "XAU"  # 2 contracts of 0.001 XAU
+    okx.account_state()
+    assert len([url for url, _ in session.requests if "/public/instruments" in url]) == 1  # the contract size is remembered
+
+
+def test_a_futures_mode_account_reports_margin_per_currency():
+    """An account that keeps one margin pool per currency leaves the account-level fields empty."""
+    balance = {
+        "totalEq": "5021.5", "adjEq": "", "upl": "", "mgnRatio": "", "imr": "",
+        "details": [
+            {"ccy": "BTC", "eq": "0.00001", "eqUsd": "0.65", "availEq": "0.00001", "upl": "0", "mgnRatio": ""},
+            {"ccy": "USDT", "eq": "5024.4", "eqUsd": "5020.85", "availEq": "3100.25", "upl": "412.5", "mgnRatio": "6.25"},
+        ],
+    }  # fmt: skip
+    position_row = {
+        "instId": "XAU-USDT-SWAP", "instType": "SWAP", "posSide": "net", "mgnMode": "cross", "pos": "5000", "avgPx": "3800",
+        "markPx": "3882.5", "upl": "412.5", "uplRatio": "1.0855", "lever": "50", "liqPx": "3100.4", "notionalUsd": "19398.7", "ccy": "USDT",
+    }  # fmt: skip
+    okx, _ = client(
+        {
+            "/api/v5/account/balance": [ok([balance])],
+            "/api/v5/account/positions": [ok([position_row])],
+            "/api/v5/trade/orders-algo-pending": [ok([])],
+            "/api/v5/public/instruments": [XAU_RULES],
+        }
+    )
+    state = okx.account_state()
+    snapshot = state.snapshot
+    assert snapshot.upl is None and snapshot.mgn_ratio == 6.25  # taken from the currency that has a position
+    assert [item.ccy for item in snapshot.currencies] == ["USDT", "BTC"]  # largest first
+    assert snapshot.currencies[0].avail_eq == 3100.25 and snapshot.currencies[0].upl == 412.5
+    [position] = state.positions
+    assert position.coins == 5.0 and position.coin_ccy == "XAU" and position.pnl_ccy == "USDT"
+
+
+def test_positions_survive_when_the_contract_size_cannot_be_read():
+    position_row = {"instId": "XAU-USDT-SWAP", "instType": "SWAP", "posSide": "net", "mgnMode": "cross", "pos": "3"}
+    okx, _ = client(
+        {
+            "/api/v5/account/balance": [ok([{}])],
+            "/api/v5/account/positions": [ok([position_row])],
+            "/api/v5/trade/orders-algo-pending": [ok([])],
+            "/api/v5/public/instruments": [{"code": "51001", "msg": "Instrument ID does not exist", "data": []}],
+        }
+    )
+    [position] = okx.account_state().positions
+    assert position.qty == 3.0 and position.coins is None
+
+
+def test_margin_ratio_falls_back_to_the_cross_position():
+    position_row = {"instId": "XAU-USDT-SWAP", "instType": "SWAP", "posSide": "net", "mgnMode": "cross", "pos": "3", "mgnRatio": "5.25"}
+    balance = {"totalEq": "900", "mgnRatio": "", "details": [{"ccy": "USDT", "eq": "900.5", "eqUsd": "900"}]}
+    okx, _ = client(
+        {
+            "/api/v5/account/balance": [ok([balance])],
+            "/api/v5/account/positions": [ok([position_row])],
+            "/api/v5/trade/orders-algo-pending": [ok([])],
+            "/api/v5/public/instruments": [XAU_RULES],
+        }
+    )
+    assert okx.account_state().snapshot.mgn_ratio == 5.25
 
 
 def test_account_state_keeps_positions_when_stops_cannot_be_read():

@@ -39,6 +39,7 @@ from .models import (
 log = logging.getLogger(__name__)
 
 TIMESTAMP_ERROR_CODES = {"50102", "50112"}  # request timestamp out of range / invalid
+SPEC_TTL_SECONDS = 6 * 3600
 
 
 class OkxError(Exception):
@@ -86,6 +87,7 @@ class OkxClient:
         self._session = session or requests.Session()
         self._timeout = timeout
         self._clock_offset = 0.0  # server time minus local time, seconds
+        self._specs: dict[str, tuple[float, InstrumentSpec]] = {}  # contract rules, kept for a few hours
 
     # ------------------------------------------------------------------ core
 
@@ -224,12 +226,16 @@ class OkxClient:
 
     def instrument_spec(self, inst_id: str) -> InstrumentSpec:
         """Contract size, size step and price step of one instrument."""
+        known = self._specs.get(inst_id)
+        if known is not None and time.time() - known[0] < SPEC_TTL_SECONDS:
+            return known[1]
         parts = inst_id.split("-")
         inst_type = "SPOT" if len(parts) == 2 else ("SWAP" if parts[-1] == "SWAP" else "FUTURES")
         data = self._get("/api/v5/public/instruments", {"instType": inst_type, "instId": inst_id})
         spec = InstrumentSpec.from_okx(data[0]) if data else None
         if spec is None:
             raise OkxError("no_data", f"OKX 没有返回 {inst_id} 的合约规格")
+        self._specs[inst_id] = (time.time(), spec)
         return spec
 
     def leverage(self, inst_id: str, mgn_mode: str) -> float | None:
@@ -259,7 +265,23 @@ class OkxClient:
             except (OkxError, OkxNetworkError) as exc:
                 # Stops are a nice-to-have; never lose the positions because of them.
                 log.warning("could not read pending stop orders: %s", exc)
-        return AccountState(snapshot=snapshot, positions=positions)
+        if snapshot.mgn_ratio is None:
+            # Still nothing at account or currency level: a cross position carries the ratio of its margin pool.
+            ratios = [p.mgn_ratio for p in positions if p.mgn_mode == "cross" and p.mgn_ratio is not None]
+            if ratios:
+                snapshot = replace(snapshot, mgn_ratio=min(ratios))
+        return AccountState(snapshot=snapshot, positions=[self._with_coins(position) for position in positions])
+
+    def _with_coins(self, position: Position) -> Position:
+        """Adds what the contracts add up to (10000 contracts of 0.001 XAU are 10 XAU)."""
+        if position.inst_type not in ("SWAP", "FUTURES"):
+            return position
+        try:
+            spec = self.instrument_spec(position.inst_id)
+        except (OkxError, OkxNetworkError) as exc:
+            log.warning("could not read the contract size of %s: %s", position.inst_id, exc)
+            return position
+        return replace(position, coins=float(position.qty * float(spec.coins_per_contract)), coin_ccy=spec.ct_val_ccy)
 
 
 def attach_stops(positions: list[Position], algo_orders: list[dict]) -> list[Position]:

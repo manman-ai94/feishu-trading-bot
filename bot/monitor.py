@@ -45,8 +45,15 @@ def _side(position: Position) -> str:
     return "多" if position.direction == "long" else "空"
 
 
-def _money(value: float | None) -> str:
-    return "未知" if value is None else f"{value:+,.2f} USD"
+def _money(value: float | None, ccy: str = "USD") -> str:
+    return "未知" if value is None else f"{value:+,.2f} {ccy}"
+
+
+def _size(position: Position) -> str:
+    text = f"{_qty(position.qty)} 张"
+    if position.coins is not None and position.coin_ccy:
+        text += f"（合 {position.coins:,.8g} {position.coin_ccy}）"
+    return text
 
 
 def diff_positions(previous: dict[tuple, Position], current: dict[tuple, Position]) -> list[Event]:
@@ -63,7 +70,7 @@ def diff_positions(previous: dict[tuple, Position], current: dict[tuple, Positio
                     title=f"开仓：{name}",
                     inst_id=position.inst_id,
                     private_lines=(
-                        f"数量 {_qty(position.qty)} 张，均价 {_px(position.avg_px)}",
+                        f"数量 {_size(position)}，均价 {_px(position.avg_px)}",
                         _stops_line(position),
                     ),
                     public_lines=(f"均价 {_px(position.avg_px)}", _stops_line(position)),
@@ -81,7 +88,7 @@ def diff_positions(previous: dict[tuple, Position], current: dict[tuple, Positio
                     title=f"{'加仓' if increased else '减仓'}：{name}",
                     inst_id=position.inst_id,
                     private_lines=(
-                        f"{_qty(before.qty)} 张变为 {_qty(position.qty)} 张",
+                        f"{_qty(before.qty)} 张变为 {_size(position)}",
                         f"均价 {_px(before.avg_px)} 变为 {_px(position.avg_px)}",
                     ),
                     public_lines=(f"现均价 {_px(position.avg_px)}，标记价 {_px(position.mark_px)}",),
@@ -116,8 +123,8 @@ def diff_positions(previous: dict[tuple, Position], current: dict[tuple, Positio
                 title=f"平仓：{name}",
                 inst_id=before.inst_id,
                 private_lines=(
-                    f"原数量 {_qty(before.qty)} 张，开仓均价 {_px(before.avg_px)}",
-                    f"平仓前标记价 {_px(before.mark_px)}，平仓前浮动盈亏 {_money(before.upl)}",
+                    f"原数量 {_size(before)}，开仓均价 {_px(before.avg_px)}",
+                    f"平仓前标记价 {_px(before.mark_px)}，平仓前浮动盈亏 {_money(before.upl, before.pnl_ccy)}",
                 ),
                 public_lines=(f"开仓均价 {_px(before.avg_px)}，平仓前标记价 {_px(before.mark_px)}",),
                 to_group=True,

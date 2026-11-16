@@ -27,8 +27,37 @@ def _money(value: float | None, signed: bool = False) -> str:
     return f"{value:+,.2f} USD" if signed else f"{value:,.2f} USD"
 
 
+def _amount(value: float | None, ccy: str, signed: bool = False) -> str:
+    """An amount in the currency it is counted in (a USDT contract's PnL is USDT, not USD)."""
+    if value is None:
+        return "未知"
+    return f"{value:+,.2f} {ccy}" if signed else f"{value:,.2f} {ccy}"
+
+
 def _side(position: Position) -> str:
     return "多" if position.direction == "long" else "空"
+
+
+def _size(position: Position) -> str:
+    text = f"{position.qty:g} 张"
+    if position.coins is not None and position.coin_ccy:
+        text += f"（合 {position.coins:,.8g} {position.coin_ccy}）"
+    return text
+
+
+def currency_lines(state: AccountState) -> list[str]:
+    """One line per currency that holds something: equity, what is free, and the open PnL."""
+    lines = []
+    for item in state.snapshot.currencies[:4]:
+        if item.eq is None or abs(item.eq_usd if item.eq_usd is not None else item.eq) < 1:
+            continue
+        parts = [f"权益 {item.eq:,.2f}"]
+        if item.avail_eq is not None:
+            parts.append(f"可用保证金 {item.avail_eq:,.2f}")
+        if item.upl:
+            parts.append(f"浮动盈亏 {item.upl:+,.2f}")
+        lines.append(f"{item.ccy}：" + "，".join(parts))
+    return lines
 
 
 def _stop(value: float | None) -> str:
@@ -38,7 +67,7 @@ def _stop(value: float | None) -> str:
 def position_lines(position: Position, with_amounts: bool) -> list[str]:
     lines = [f"**{position.inst_id} {_side(position)}单**"]
     if with_amounts:
-        size = f"- 数量 {position.qty:g} 张"
+        size = f"- 数量 {_size(position)}"
         if position.lever:
             size += f"，杠杆 {position.lever:g} 倍"
         if position.notional_usd is not None:
@@ -46,9 +75,9 @@ def position_lines(position: Position, with_amounts: bool) -> list[str]:
         lines.append(size)
     lines.append(f"- 均价 {_px(position.avg_px)}，标记价 {_px(position.mark_px)}")
     if with_amounts:
-        pnl = f"- 浮动盈亏 {_money(position.upl, signed=True)}"
+        pnl = f"- 浮动盈亏 {_amount(position.upl, position.pnl_ccy, signed=True)}"
         if position.upl_ratio is not None:
-            pnl += f"（{position.upl_ratio * 100:+.2f}%）"
+            pnl += f"（按保证金算 {position.upl_ratio * 100:+.2f}%）"
         lines.append(pnl)
         if position.liq_px:
             distance = position.liq_distance_pct
@@ -65,6 +94,7 @@ def status_markdown(state: AccountState, day_change: float | None, private: bool
     if with_amounts:
         snapshot = state.snapshot
         lines.append(f"**账户权益** {_money(snapshot.total_eq)}")
+        lines.extend(f"- {line}" for line in currency_lines(state))
         if snapshot.upl is not None:
             lines.append(f"- 浮动盈亏 {_money(snapshot.upl, signed=True)}")
         if day_change is not None:
@@ -84,6 +114,7 @@ def account_text(state: AccountState, day_change: float | None) -> str:
     """Plain-text account summary for the AI (owner-only prompts)."""
     snapshot = state.snapshot
     lines = [f"账户权益 {_money(snapshot.total_eq)}"]
+    lines.extend(currency_lines(state))
     if snapshot.mgn_ratio is not None:
         lines.append(f"保证金率 {snapshot.mgn_ratio * 100:.0f}%（到 100% 开始强平）")
     if day_change is not None:
@@ -92,11 +123,13 @@ def account_text(state: AccountState, day_change: float | None) -> str:
         lines.append("当前没有持仓。")
     for position in state.positions:
         parts = [
-            f"{position.inst_id} {_side(position)}单 {position.qty:g} 张",
+            f"{position.inst_id} {_side(position)}单 {_size(position)}",
             f"均价 {_px(position.avg_px)}",
             f"标记价 {_px(position.mark_px)}",
-            f"浮动盈亏 {_money(position.upl, signed=True)}",
+            f"浮动盈亏 {_amount(position.upl, position.pnl_ccy, signed=True)}",
         ]
+        if position.notional_usd is not None:
+            parts.append(f"名义价值 {_money(position.notional_usd)}")
         if position.lever:
             parts.append(f"杠杆 {position.lever:g} 倍")
         if position.liq_px:

@@ -54,6 +54,17 @@ class Position:
     pos_id: str = ""
     u_time: int = 0
     stops: tuple[StopOrder, ...] = ()
+    ccy: str = ""  # the currency the margin and the PnL are counted in, e.g. USDT
+    coins: float | None = None  # what the contracts add up to, e.g. 10 (XAU); filled in from the contract size
+    coin_ccy: str = ""
+
+    @property
+    def pnl_ccy(self) -> str:
+        """The unit of `upl`. OKX counts a USDT-settled contract's PnL in USDT, not USD."""
+        if self.ccy:
+            return self.ccy
+        parts = self.inst_id.split("-")
+        return parts[1] if len(parts) >= 2 and parts[1] in ("USDT", "USDC") else "USD"
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -118,6 +129,30 @@ class Position:
             pos_id=str(row.get("posId", "")),
             u_time=int(to_float(row.get("uTime")) or 0),
             stops=stops,
+            ccy=str(row.get("ccy", "") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class CurrencyBalance:
+    """One currency of the account. Every amount is in that currency, except eq_usd."""
+
+    ccy: str
+    eq: float | None = None
+    eq_usd: float | None = None
+    avail_eq: float | None = None  # free to open new positions with
+    upl: float | None = None
+    mgn_ratio: float | None = None
+
+    @classmethod
+    def from_okx(cls, row: dict) -> "CurrencyBalance":
+        return cls(
+            ccy=str(row.get("ccy", "")),
+            eq=to_float(row.get("eq")),
+            eq_usd=to_float(row.get("eqUsd")),
+            avail_eq=to_float(row.get("availEq")),
+            upl=to_float(row.get("upl")),
+            mgn_ratio=to_float(row.get("mgnRatio")),
         )
 
 
@@ -126,25 +161,37 @@ class AccountSnapshot:
     total_eq: float | None = None  # total equity in USD
     adj_eq: float | None = None
     avail_eq: float | None = None
-    upl: float | None = None
+    upl: float | None = None  # in USD; OKX leaves it empty for accounts that keep margin per currency
     mgn_ratio: float | None = None  # liquidation starts at <= 1.0 (OKX: adjEq / mmr)
     imr: float | None = None
     mmr: float | None = None
     notional_usd: float | None = None
     u_time: int = 0
+    currencies: tuple[CurrencyBalance, ...] = ()  # largest first
 
     @classmethod
     def from_okx(cls, row: dict) -> "AccountSnapshot":
+        currencies = sorted(
+            (CurrencyBalance.from_okx(item) for item in (row.get("details") or []) if item.get("ccy")),
+            key=lambda item: -(item.eq_usd or 0.0),
+        )
+        mgn_ratio = to_float(row.get("mgnRatio"))
+        if mgn_ratio is None:
+            # "Futures mode" accounts (one margin pool per currency) report the ratio
+            # per currency only. The lowest one is the one closest to liquidation.
+            ratios = [item.mgn_ratio for item in currencies if item.mgn_ratio is not None]
+            mgn_ratio = min(ratios) if ratios else None
         return cls(
             total_eq=to_float(row.get("totalEq")),
             adj_eq=to_float(row.get("adjEq")),
             avail_eq=to_float(row.get("availEq")),
             upl=to_float(row.get("upl")),
-            mgn_ratio=to_float(row.get("mgnRatio")),
+            mgn_ratio=mgn_ratio,
             imr=to_float(row.get("imr")),
             mmr=to_float(row.get("mmr")),
             notional_usd=to_float(row.get("notionalUsd")),
             u_time=int(to_float(row.get("uTime")) or 0),
+            currencies=tuple(currencies),
         )
 
 
