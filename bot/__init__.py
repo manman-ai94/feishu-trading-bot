@@ -3,4 +3,4 @@
 This version only reads the account. It cannot place, change or cancel orders.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"

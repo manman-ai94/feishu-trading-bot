@@ -7,9 +7,11 @@
 data/
 logs/
 
-# The owner's knowledge base (private notes and documents)
+# The owner's knowledge base (private notes and documents) stays on the server.
+# knowledge/library/ is different: reference material written up from public sources, shipped with the code.
 knowledge/*
 !knowledge/README.md
+!knowledge/library/
 
 # Python
 .venv/
