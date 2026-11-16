@@ -2,6 +2,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+
+
+def to_decimal(value) -> Decimal | None:
+    """Exact numbers for order sizes and prices, where a float's rounding would matter."""
+    if value is None or value == "":
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return number if number.is_finite() else None
 
 
 def to_float(value) -> float | None:
@@ -179,3 +191,112 @@ class AccountState:
 
     snapshot: AccountSnapshot
     positions: list[Position] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AccountConfig:
+    """What the API key may do and how the account is set up."""
+
+    pos_mode: str = ""  # "net_mode" (one position per instrument) or "long_short_mode" (hedge)
+    permissions: tuple[str, ...] = ()  # of "read_only", "trade", "withdraw"
+    ip: str = ""  # the addresses the key is bound to; empty when it is not bound
+    acct_lv: str = ""
+
+    @property
+    def hedge_mode(self) -> bool:
+        return self.pos_mode == "long_short_mode"
+
+    @property
+    def can_trade(self) -> bool:
+        return "trade" in self.permissions
+
+    @property
+    def can_withdraw(self) -> bool:
+        return "withdraw" in self.permissions
+
+    @classmethod
+    def from_okx(cls, row: dict) -> "AccountConfig":
+        permissions = tuple(item.strip() for item in str(row.get("perm", "")).split(",") if item.strip())
+        return cls(
+            pos_mode=str(row.get("posMode", "")),
+            permissions=permissions,
+            ip=str(row.get("ip", "") or ""),
+            acct_lv=str(row.get("acctLv", "")),
+        )
+
+
+@dataclass(frozen=True)
+class InstrumentSpec:
+    """The trading rules of one instrument: contract size, size step and price step."""
+
+    inst_id: str
+    inst_type: str
+    ct_val: Decimal  # coins per contract (before the multiplier)
+    ct_mult: Decimal
+    ct_val_ccy: str
+    settle_ccy: str
+    ct_type: str  # "linear" (settled in USDT/USDC) or "inverse"
+    lot_sz: Decimal  # size step, in contracts
+    min_sz: Decimal
+    tick_sz: Decimal  # price step
+    state: str = "live"
+
+    @property
+    def coins_per_contract(self) -> Decimal:
+        return self.ct_val * self.ct_mult
+
+    @classmethod
+    def from_okx(cls, row: dict) -> "InstrumentSpec | None":
+        numbers = {name: to_decimal(row.get(name)) for name in ("ctVal", "lotSz", "minSz", "tickSz")}
+        if any(value is None or value <= 0 for value in numbers.values()):
+            return None
+        return cls(
+            inst_id=str(row.get("instId", "")),
+            inst_type=str(row.get("instType", "")),
+            ct_val=numbers["ctVal"],
+            ct_mult=to_decimal(row.get("ctMult")) or Decimal(1),
+            ct_val_ccy=str(row.get("ctValCcy", "")),
+            settle_ccy=str(row.get("settleCcy", "")),
+            ct_type=str(row.get("ctType", "")),
+            lot_sz=numbers["lotSz"],
+            min_sz=numbers["minSz"],
+            tick_sz=numbers["tickSz"],
+            state=str(row.get("state", "live")),
+        )
+
+
+@dataclass(frozen=True)
+class OrderInfo:
+    """One order as OKX reports it."""
+
+    ord_id: str
+    inst_id: str
+    side: str  # "buy" or "sell"
+    pos_side: str = "net"
+    ord_type: str = ""
+    px: float | None = None
+    sz: float = 0.0
+    filled_sz: float = 0.0
+    avg_px: float | None = None
+    state: str = ""  # live | partially_filled | filled | canceled
+    reduce_only: bool = False
+    cl_ord_id: str = ""
+    c_time: int = 0
+
+    @classmethod
+    def from_okx(cls, row: dict) -> "OrderInfo":
+        return cls(
+            ord_id=str(row.get("ordId", "")),
+            inst_id=str(row.get("instId", "")),
+            side=str(row.get("side", "")),
+            pos_side=str(row.get("posSide") or "net"),
+            ord_type=str(row.get("ordType", "")),
+            px=to_float(row.get("px")),
+            sz=to_float(row.get("sz")) or 0.0,
+            filled_sz=to_float(row.get("accFillSz")) or 0.0,
+            avg_px=to_float(row.get("avgPx")) or None,
+            state=str(row.get("state", "")),
+            reduce_only=str(row.get("reduceOnly", "")).lower() == "true",
+            cl_ord_id=str(row.get("clOrdId", "")),
+            c_time=int(to_float(row.get("cTime")) or 0),
+        )

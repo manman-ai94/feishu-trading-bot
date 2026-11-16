@@ -1,7 +1,9 @@
 """A small OKX v5 REST client.
 
-This version only reads. There is deliberately no method that places,
-changes or cancels an order, and none that moves funds.
+This class only reads. There is deliberately no method here that places,
+changes or cancels an order, and none that moves funds. The few calls that
+do change something live in okx_trade.py, in a class the bot creates only
+when the owner has switched trading on.
 
 Signing follows the OKX docs: Base64(HMAC-SHA256(secret,
 timestamp + METHOD + requestPath + body)), where requestPath includes the
@@ -20,7 +22,19 @@ from urllib.parse import urlencode
 
 import requests
 
-from .models import AccountSnapshot, AccountState, Candle, OpenInterest, Position, StopOrder, Ticker, to_float
+from .models import (
+    AccountConfig,
+    AccountSnapshot,
+    AccountState,
+    Candle,
+    InstrumentSpec,
+    OpenInterest,
+    OrderInfo,
+    Position,
+    StopOrder,
+    Ticker,
+    to_float,
+)
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +89,7 @@ class OkxClient:
 
     # ------------------------------------------------------------------ core
 
-    def _headers(self, method: str, request_path: str, auth: bool) -> dict[str, str]:
+    def _headers(self, method: str, request_path: str, auth: bool, body: str = "") -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self._demo:
             headers["x-simulated-trading"] = "1"
@@ -86,7 +100,7 @@ class OkxClient:
             headers.update(
                 {
                     "OK-ACCESS-KEY": self._api_key,
-                    "OK-ACCESS-SIGN": sign(self._secret_key, timestamp, method, request_path),
+                    "OK-ACCESS-SIGN": sign(self._secret_key, timestamp, method, request_path, body),
                     "OK-ACCESS-TIMESTAMP": timestamp,
                     "OK-ACCESS-PASSPHRASE": self._passphrase,
                 }
@@ -202,6 +216,38 @@ class OkxClient:
     def pending_stops(self) -> list[dict]:
         """Open take-profit / stop-loss orders (conditional and OCO)."""
         return self._get("/api/v5/trade/orders-algo-pending", {"ordType": "conditional,oco"}, auth=True)
+
+    def account_config(self) -> AccountConfig:
+        """What this API key is allowed to do, and the account's position mode."""
+        data = self._get("/api/v5/account/config", auth=True)
+        return AccountConfig.from_okx(data[0]) if data else AccountConfig()
+
+    def instrument_spec(self, inst_id: str) -> InstrumentSpec:
+        """Contract size, size step and price step of one instrument."""
+        parts = inst_id.split("-")
+        inst_type = "SPOT" if len(parts) == 2 else ("SWAP" if parts[-1] == "SWAP" else "FUTURES")
+        data = self._get("/api/v5/public/instruments", {"instType": inst_type, "instId": inst_id})
+        spec = InstrumentSpec.from_okx(data[0]) if data else None
+        if spec is None:
+            raise OkxError("no_data", f"OKX 没有返回 {inst_id} 的合约规格")
+        return spec
+
+    def leverage(self, inst_id: str, mgn_mode: str) -> float | None:
+        """The leverage set on OKX for this instrument and margin mode."""
+        data = self._get("/api/v5/account/leverage-info", {"instId": inst_id, "mgnMode": mgn_mode}, auth=True)
+        return to_float(data[0].get("lever")) if data else None
+
+    def pending_orders(self, inst_id: str | None = None) -> list[OrderInfo]:
+        """Open orders on perpetual contracts that are waiting to be filled (not take-profit / stop-loss)."""
+        data = self._get("/api/v5/trade/orders-pending", {"instType": "SWAP", "instId": inst_id}, auth=True)
+        return [OrderInfo.from_okx(row) for row in data]
+
+    def order(self, inst_id: str, ord_id: str = "", cl_ord_id: str = "") -> OrderInfo:
+        """One order, by OKX's id or by the id the bot gave it."""
+        data = self._get("/api/v5/trade/order", {"instId": inst_id, "ordId": ord_id, "clOrdId": cl_ord_id}, auth=True)
+        if not data:
+            raise OkxError("no_data", "OKX 没有返回这张订单")
+        return OrderInfo.from_okx(data[0])
 
     def account_state(self) -> AccountState:
         """Balance + positions, with stop orders attached to their positions."""

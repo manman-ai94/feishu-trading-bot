@@ -208,10 +208,55 @@ def test_attach_stops_in_hedge_mode_matches_pos_side_and_skips_known_ids():
 
 
 def test_the_client_has_no_way_to_trade_or_move_funds():
-    forbidden = ("order", "cancel", "amend", "close", "withdraw", "transfer", "post")
-    public_names = [name for name in dir(OkxClient) if not name.startswith("_")]
+    look_ups = {"order", "pending_orders"}  # these two only read: see the test below
+    forbidden = ("order", "cancel", "amend", "close", "place", "withdraw", "transfer", "post")
+    public_names = [name for name in dir(OkxClient) if not name.startswith("_") and name not in look_ups]
     assert not [name for name in public_names if any(word in name.lower() for word in forbidden)]
     assert not hasattr(OkxClient, "_post")
+
+
+def test_orders_key_permissions_and_contract_rules_are_read_with_get():
+    # FakeSession has no post(): anything but a GET would fail here.
+    order_row = {
+        "ordId": "77", "clOrdId": "ftb1", "instId": "BTC-USDT-SWAP", "side": "buy", "posSide": "net", "ordType": "limit",
+        "px": "64000", "sz": "2", "accFillSz": "0.5", "avgPx": "", "state": "partially_filled", "reduceOnly": "false", "cTime": "1700000000000",
+    }  # fmt: skip
+    okx, session = client(
+        {
+            "/api/v5/trade/orders-pending": [ok([order_row])],
+            "/api/v5/trade/order": [ok([dict(order_row, state="filled", accFillSz="2", avgPx="63990.5")])],
+            "/api/v5/account/config": [ok([{"posMode": "net_mode", "perm": "read_only,trade", "ip": "203.0.113.7", "acctLv": "2"}])],
+            "/api/v5/account/leverage-info": [ok([{"lever": "10", "mgnMode": "cross"}])],
+            "/api/v5/public/instruments": [
+                ok([{"instId": "BTC-USDT-SWAP", "instType": "SWAP", "ctVal": "0.01", "ctMult": "1", "ctValCcy": "BTC",
+                     "settleCcy": "USDT", "ctType": "linear", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.1", "state": "live"}])
+            ],
+        }
+    )  # fmt: skip
+    [pending] = okx.pending_orders("BTC-USDT-SWAP")
+    assert (pending.ord_id, pending.side, pending.px, pending.sz, pending.filled_sz, pending.avg_px) == ("77", "buy", 64000.0, 2.0, 0.5, None)
+    assert session.requests[0][0] == "https://okx.test/api/v5/trade/orders-pending?instType=SWAP&instId=BTC-USDT-SWAP"
+    filled = okx.order("BTC-USDT-SWAP", cl_ord_id="ftb1")
+    assert filled.state == "filled" and filled.avg_px == 63990.5 and not filled.reduce_only
+    assert session.requests[1][0].endswith("/api/v5/trade/order?instId=BTC-USDT-SWAP&clOrdId=ftb1")
+
+    config = okx.account_config()
+    assert config.permissions == ("read_only", "trade") and config.can_trade and not config.can_withdraw
+    assert not config.hedge_mode and config.ip == "203.0.113.7"
+    assert okx.leverage("BTC-USDT-SWAP", "cross") == 10.0
+
+    spec = okx.instrument_spec("BTC-USDT-SWAP")
+    assert str(spec.coins_per_contract) == "0.01" and str(spec.lot_sz) == "0.01" and str(spec.tick_sz) == "0.1"
+    assert spec.ct_type == "linear" and spec.settle_ccy == "USDT"
+    assert "OK-ACCESS-KEY" not in session.requests[-1][1]  # the contract rules are public
+
+
+def test_missing_order_or_contract_rules_are_errors():
+    okx, _ = client({"/api/v5/trade/order": [ok([])], "/api/v5/public/instruments": [ok([{"instId": "X-USDT-SWAP", "ctVal": ""}])]})
+    with pytest.raises(OkxError):
+        okx.order("BTC-USDT-SWAP", ord_id="1")
+    with pytest.raises(OkxError, match="合约规格"):
+        okx.instrument_spec("X-USDT-SWAP")
 
 
 def test_instruments_and_open_interest_are_public_requests():
