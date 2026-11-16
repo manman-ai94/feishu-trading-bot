@@ -211,7 +211,7 @@ def ask(cfg: Config, question: str) -> int:
     """One market question, answered in the console exactly as the bot would in a group
     that does not see the account. A way to try the AI and its tools without Feishu."""
     from .analyst import AnalystUnavailable
-    from .app import build_ai, build_crowd, build_okx
+    from .app import build_ai, build_crowd, build_macro, build_okx
     from .journal import Journal
     from .market import build_market_context
     from .router import split_title
@@ -220,7 +220,7 @@ def ask(cfg: Config, question: str) -> int:
 
     okx = build_okx(cfg)
     journal = Journal(cfg.db_path)
-    analyst, resolver, _ = build_ai(cfg, okx, journal, build_crowd(cfg, okx))
+    analyst, resolver, _ = build_ai(cfg, okx, journal, build_crowd(cfg, okx), macro=build_macro(cfg))
     named = resolver.find_in_text(question, limit=2)
     market = "\n\n".join(build_market_context(okx, inst_id).to_text() for inst_id in named)
     started = time.time()
@@ -237,7 +237,7 @@ def ask(cfg: Config, question: str) -> int:
 
 
 def send_brief(cfg: Config, kind: str) -> int:
-    from .app import build_ai, build_crowd, build_okx, setup_logging
+    from .app import build_ai, build_crowd, build_macro, build_okx, setup_logging
     from .feishu_client import FeishuClient
     from .journal import Journal
     from .monitor import Monitor
@@ -247,9 +247,10 @@ def send_brief(cfg: Config, kind: str) -> int:
     journal = Journal(cfg.db_path)
     okx = build_okx(cfg)
     crowd = build_crowd(cfg, okx)
-    analyst, _, _ = build_ai(cfg, okx, journal, crowd)
+    macro = build_macro(cfg)
+    analyst, _, _ = build_ai(cfg, okx, journal, crowd, macro=macro)
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
-    reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd)
+    reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, macro=macro)
     reporter.monitor = Monitor(okx, cfg, journal, lambda event: None)
     if cfg.has_okx_keys:
         reporter.monitor.poll_once()

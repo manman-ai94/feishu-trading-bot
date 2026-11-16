@@ -50,7 +50,7 @@ def read_questions(path: Path = QUESTIONS_FILE) -> list[str]:
 
 
 def replay(cfg: Config, path: Path = QUESTIONS_FILE, out=print) -> int:
-    from .app import build_ai, build_crowd, build_okx
+    from .app import build_ai, build_crowd, build_macro, build_okx
     from .journal import Journal
     from .monitor import Monitor
     from .risk import RiskGauge
@@ -67,7 +67,7 @@ def replay(cfg: Config, path: Path = QUESTIONS_FILE, out=print) -> int:
 
     okx = build_okx(cfg)
     journal = Journal(cfg.db_path)  # the AI's use is metered with the rest of the month
-    analyst, resolver, _ = build_ai(cfg, okx, journal, build_crowd(cfg, okx), track=False)
+    analyst, resolver, _ = build_ai(cfg, okx, journal, build_crowd(cfg, okx), track=False, macro=build_macro(cfg))
     if not analyst.enabled:
         out("[X] 还没有配置 Claude 的 API key。")
         return 1

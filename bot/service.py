@@ -44,6 +44,7 @@ class Reporter:
         clock: Callable[[], float] = time.time,
         crowd=None,
         gauge=None,
+        macro=None,
     ):
         self._cfg = cfg
         self._gauge = gauge  # risk.RiskGauge, or None
@@ -53,6 +54,7 @@ class Reporter:
         self._journal = journal
         self._clock = clock
         self._crowd = crowd  # crowd.Crowd, or None when CROWD_DATA is off
+        self._macro = macro  # macro.Macro, or None when MACRO_DATA is off
         self.monitor: Monitor | None = None  # set by the app once both exist
 
     # ----------------------------------------------------------- destinations
@@ -131,14 +133,27 @@ class Reporter:
     # ----------------------------------------------------------------- briefs
 
     def market_text(self) -> str:
-        """What a brief or a review is written from: every watched instrument, and how the crowd stands in it."""
+        """What a brief or a review is written from: every watched instrument, how the crowd stands in it,
+        and US rates and the dollar."""
         blocks = []
         for inst_id in self._cfg.watch_instruments:
             blocks.append(build_market_context(self._okx, inst_id).to_text())
             crowd = self._crowd_text(inst_id)
             if crowd:
                 blocks.append(crowd)
+        macro = self._macro_text()
+        if macro:
+            blocks.append("美国利率和美元（FRED）：\n" + macro)
         return "\n\n".join(blocks)
+
+    def _macro_text(self) -> str:
+        if self._macro is None:
+            return ""
+        try:
+            return self._macro.text()
+        except Exception:  # background only, like the crowd
+            log.exception("could not read US rates and the dollar")
+            return ""
 
     def _crowd_text(self, inst_id: str) -> str:
         if self._crowd is None:

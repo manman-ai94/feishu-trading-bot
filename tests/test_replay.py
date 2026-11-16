@@ -23,12 +23,13 @@ def test_replay_prints_every_answer_and_sends_nothing(tmp_path, monkeypatch):
     okx = FakeOkx(make_state())
     built = {}
 
-    def fake_build_ai(cfg, okx, journal, crowd=None, track=True):
+    def fake_build_ai(cfg, okx, journal, crowd=None, track=True, macro=None):
         built["track"] = track
         return analyst, None, None
 
     monkeypatch.setattr(bot.app, "build_okx", lambda cfg: okx)
     monkeypatch.setattr(bot.app, "build_crowd", lambda cfg, okx: None)
+    monkeypatch.setattr(bot.app, "build_macro", lambda cfg: None)  # no FRED reads in a test
     monkeypatch.setattr(bot.app, "build_ai", fake_build_ai)
     monkeypatch.setattr(bot.risk, "RiskGauge", lambda okx: None)
     printed: list[str] = []

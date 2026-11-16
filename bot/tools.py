@@ -1,8 +1,8 @@
 """The tools the AI may call while it works on an answer.
 
 Client tools (run here, on the server): market data and candles from OKX, a
-search of the owner's knowledge base, and how the crowd is positioned
-(crowd.py). Server tools (run by Anthropic): web search and web fetch, for
+search of the owner's knowledge base, how the crowd is positioned (crowd.py),
+and US real rates and the dollar from FRED (macro.py). Server tools (run by Anthropic): web search and web fetch, for
 news and economic data.
 
 Every tool only reads. None of them touches the account or places an order.
@@ -96,9 +96,19 @@ CLIENT_TOOLS: tuple[dict, ...] = (
             "required": ["symbol"],
         },
     },
+    {
+        "name": "get_macro",
+        "description": (
+            "The US rates and dollar that drive gold, from FRED's daily data: the 10-year real yield (TIPS), the "
+            "10-year Treasury yield, 10-year breakeven inflation and the broad trade-weighted dollar index, each with "
+            "its date and its change over a week and a month. Background for gold (and risk appetite in general), "
+            "never the basis of a price level. FRED runs a day or two behind, so say the date of what you quote."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
 )
 # Offered only when the toolbox was given what the tool reads from.
-OPTIONAL_TOOLS = {"search_knowledge": "_knowledge", "get_positioning": "_crowd"}
+OPTIONAL_TOOLS = {"search_knowledge": "_knowledge", "get_positioning": "_crowd", "get_macro": "_macro"}
 
 
 class ToolError(Exception):
@@ -106,12 +116,15 @@ class ToolError(Exception):
 
 
 class Toolbox:
-    def __init__(self, okx, resolver: InstrumentResolver, knowledge: KnowledgeBase | None, tz: ZoneInfo, crowd=None):
+    def __init__(
+        self, okx, resolver: InstrumentResolver, knowledge: KnowledgeBase | None, tz: ZoneInfo, crowd=None, macro=None
+    ):
         self._okx = okx
         self._resolver = resolver
         self._knowledge = knowledge
         self._tz = tz
         self._crowd = crowd  # crowd.Crowd, or None when CROWD_DATA is off
+        self._macro = macro  # macro.Macro, or None when MACRO_DATA is off
 
     def definitions(self, web_level: int = 0, web_searches: int = WEB_SEARCHES) -> list[dict]:
         """Tool definitions in a fixed order, so the cached prompt prefix stays the same."""
@@ -140,6 +153,8 @@ class Toolbox:
                 return self._search(tool_input), False
             if name == "get_positioning":
                 return self._positioning(tool_input), False
+            if name == "get_macro":
+                return self._macro_text(), False
             raise ToolError(f"没有叫 {name} 的工具。")
         except ToolError as exc:
             return str(exc), True
@@ -193,4 +208,12 @@ class Toolbox:
         text = self._crowd.text(inst_id)
         if not text:
             raise ToolError(f"{inst_id} 没有群体持仓数据。OKX 只给合约提供大户多空比，CFTC 周报目前只接了黄金。")
+        return text
+
+    def _macro_text(self) -> str:
+        if self._macro is None:
+            raise ToolError("利率和美元数据没有打开。")
+        text = self._macro.text()
+        if not text:
+            raise ToolError("这次没有从 FRED 读到利率和美元数据。需要的话可以用联网搜索查，并说明数据时间。")
         return text

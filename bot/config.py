@@ -121,6 +121,7 @@ class Config:
     ai_monthly_budget_usd: float | None = 180.0  # above this the AI switches to its cheapest setting
     knowledge_dir: Path = Path("knowledge")
     crowd_data: bool = True  # show the AI how the crowd is positioned: OKX's top-trader ratios, the CFTC's weekly report
+    macro_data: bool = True  # show the AI US real rates, Treasury yields and the dollar, from FRED
     track_record: bool = True  # keep the levels the AI gives and score them against the market later
     track_window_hours: int = 72  # how long a scenario is watched
 
@@ -360,6 +361,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         ai_monthly_budget_usd=_get_float("AI_MONTHLY_BUDGET_USD", 180.0, problems),
         knowledge_dir=Path(_get("KNOWLEDGE_DIR", "knowledge")),
         crowd_data=_get_bool("CROWD_DATA", True),
+        macro_data=_get_bool("MACRO_DATA", True),
         track_record=_get_bool("TRACK_RECORD", True),
         track_window_hours=min(72, max(4, _get_int("TRACK_WINDOW_HOURS", 72, problems))),
         timezone=timezone,

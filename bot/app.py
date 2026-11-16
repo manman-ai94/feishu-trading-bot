@@ -13,6 +13,7 @@ from pathlib import Path
 from .analyst import Analyst, Usage
 from .config import Config
 from .crowd import Crowd
+from .macro import Macro
 from .okx_stream import OkxStream, stream_url
 from .risk import RiskGauge
 from .envfile import write_env_values
@@ -84,8 +85,18 @@ def build_crowd(cfg: Config, okx: OkxClient) -> Crowd | None:
     return Crowd(okx, cfg.tz) if cfg.crowd_data else None
 
 
+def build_macro(cfg: Config) -> Macro | None:
+    """Where US rates and the dollar are read from (FRED). None when the owner switched that off."""
+    return Macro() if cfg.macro_data else None
+
+
 def build_ai(
-    cfg: Config, okx: OkxClient, journal: Journal, crowd: Crowd | None = None, track: bool = True
+    cfg: Config,
+    okx: OkxClient,
+    journal: Journal,
+    crowd: Crowd | None = None,
+    track: bool = True,
+    macro: Macro | None = None,
 ) -> tuple[Analyst, InstrumentResolver, KnowledgeBase]:
     """The analyst with its tools, metered into the journal. `track=False` keeps the levels of its
     answers out of the track record (a rehearsal is not advice anyone was given)."""
@@ -112,7 +123,7 @@ def build_ai(
 
     analyst = Analyst(
         cfg,
-        toolbox=Toolbox(okx, resolver, knowledge, cfg.tz, crowd),
+        toolbox=Toolbox(okx, resolver, knowledge, cfg.tz, crowd, macro),
         on_usage=record,
         month_spend=month_spend,
         on_levels=keep_levels if track else None,
@@ -150,10 +161,11 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     journal = Journal(cfg.db_path)
     okx = build_okx(cfg)
     crowd = build_crowd(cfg, okx)
-    analyst, resolver, knowledge = build_ai(cfg, okx, journal, crowd)
+    macro = build_macro(cfg)
+    analyst, resolver, knowledge = build_ai(cfg, okx, journal, crowd, macro=macro)
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
     gauge = RiskGauge(okx)
-    reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, gauge=gauge)
+    reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, gauge=gauge, macro=macro)
     monitor = Monitor(okx, cfg, journal, reporter.notify_event, gauge=gauge)
     reporter.monitor = monitor
 
@@ -178,9 +190,10 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     if cfg.trading_blocked:
         log.warning("trading stays off: the TRADING setting in .env cannot be honoured")
     log.info(
-        "AI: questions on %s (%s), deep on %s (%s), web search %s, crowd data %s, %d knowledge file(s)",
+        "AI: questions on %s (%s), deep on %s (%s), web search %s, crowd data %s, macro data %s, %d knowledge file(s)",
         cfg.model_daily, cfg.effort_daily, cfg.model_deep, cfg.effort_deep,
-        "on" if cfg.web_search else "off", "on" if crowd is not None else "off", len(knowledge.summary()),
+        "on" if cfg.web_search else "off", "on" if crowd is not None else "off",
+        "on" if macro is not None else "off", len(knowledge.summary()),
     )  # fmt: skip
 
     stop = threading.Event()

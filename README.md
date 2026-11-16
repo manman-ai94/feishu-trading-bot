@@ -62,6 +62,8 @@ AI 回答问题和写简报时，可以自己决定调用下面这些工具，�
 
 群体持仓 (crowd positioning) 只当背景用：AI 可以拿它说明哪一边拥挤、追进去的风险多大，提示词里写明它不能当点位的依据，也不能单凭它判断方向，每个数字都带数据时间。两个来源都是公开数据，不用 key，不算联网搜索的次数：OKX 的大户多空比每小时更新；CFTC 的报告每周五公布，统计的是那个周二的持仓，读的是 `publicreporting.cftc.gov`，读不到时机器人照常工作，只是少这一段。每日简报的数据里也带这一段。不想用设 `CROWD_DATA=false`。
 
+利率和美元 (rates and the dollar) 也只当背景：AI 用 `get_macro` 看美国 10 年期实际利率（TIPS）、10 年期国债收益率、10 年期盈亏平衡通胀率和美元广义指数，每个数字带日期和一周、一个月的变化。数据来自 FRED（圣路易斯联储）的公开 CSV，不用 key，不算联网搜索的次数，通常晚一两个交易日；一小时内重复问不会重复读，读不到时 30 分钟后再试，机器人照常工作。每日简报的数据里也带这一段。不想用设 `MACRO_DATA=false`。
+
 同一个会话里两小时内的前五个来回，AI 会记得，所以可以追问“那 ETH 呢”。程序自己回的卡片（下单预览、已执行、当前持仓）也算在里面，确认码会被遮住，所以问“刚才改好了吗”“我要 @ 谁”时它知道刚发生了什么。
 
 哪些消息交给 AI：只想看数字的短消息（“仓位”“看下持仓”）回持仓卡片，只问功能的（“你能做什么”）回帮助；只要问了判断、风险、是非或要不要做什么（“有没有必要平仓”“止损设了没有”），一律由 AI 结合账户回答。只是表个态（“好的”“我去跟 Claude 商量”）回一句话。
@@ -414,6 +416,7 @@ Ubuntu 的 `setup.sh` 我在 Linux 上实际跑通过，生成的服务文件也
 ```
 bot/config.py         读取 .env，检查配置
 bot/okx_client.py     OKX 只读客户端（签名、行情、账户、持仓、止盈止损、查挂单）
+bot/okx_stream.py     OKX 私有推送：仓位、止损单或强平预警一变就叫监控马上读一次（只读，不下单）
 bot/okx_trade.py      会改动东西的 OKX 调用：下单、撤单、平仓、止盈止损。只有打开下单功能时才创建
 bot/trading.py        下单流程：读指令、对照限额检查、预览、确认码、执行、回报
 bot/selftest.py       模拟盘自测：用最小数量把每种指令在 OKX 模拟盘上真发一遍并核对
@@ -425,8 +428,9 @@ bot/indicators.py     EMA、RSI、ATR
 bot/instruments.py    把“BTC”“比特币”这样的说法对应到 OKX 的品种
 bot/market.py         把行情整理成给 AI 看的事实清单，以及不经过 AI 的报价
 bot/knowledge.py      资料库：存笔记、检索 knowledge 文件夹里的文档
-bot/tools.py          AI 可以调用的工具：行情、K 线、资料库、群体持仓、联网搜索
+bot/tools.py          AI 可以调用的工具：行情、K 线、资料库、群体持仓、利率和美元、联网搜索
 bot/crowd.py          群体持仓：OKX 大户多空比、CFTC 持仓周报（只作背景）
+bot/macro.py          利率和美元：FRED 的实际利率、国债收益率、通胀预期、美元指数（只作背景）
 bot/monitor.py        仓位变化检测和风险规则（纯规则，不用 AI）
 bot/journal.py        SQLite 交易日志、账户快照、AI 用量和下单记录
 bot/analyst.py        调用 Claude：给消息分类、带工具的问答和简报、用量统计和预算
@@ -436,7 +440,7 @@ bot/router.py         处理收到的消息，执行“只认主人”和账户�
 bot/scheduler.py      定时任务
 bot/feishu_client.py  飞书收发消息（长连接）
 bot/app.py            把各部分接起来
-bot/__main__.py       命令行入口：run、selfcheck、status、brief、quote、setenv、checkenv、clearenv、trading
+bot/__main__.py       命令行入口：run、selfcheck、status、brief、quote、setenv、checkenv、clearenv、trading、replay
 knowledge/            资料库文件夹（内容不进 GitHub）
 scripts/              Windows 的 .bat 和 Linux 的 .sh 安装、启动、更新脚本
 tests/                自动测试，运行方式：python -m pytest
