@@ -11,11 +11,13 @@
     python -m bot clearenv NAME empty the given lines of .env
     python -m bot trading       print how placing orders is set up: mode, limits, what the key may do
     python -m bot record        print the track record: the AI's levels against what the market did
+    python -m bot account       print the account, positions and waiting orders exactly as the AI is shown them
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 from .config import Config, load_config
 
@@ -152,6 +154,38 @@ def print_trading(cfg: Config) -> int:
     journal = Journal(cfg.db_path if cfg.db_path.exists() else ":memory:")
     desk = build_trade_desk(cfg, journal, okx, InstrumentResolver(okx))
     print("\n".join(desk.status_lines()).replace("**", ""))
+    return 0
+
+
+def print_account(cfg: Config, fields: bool = False) -> int:
+    """The account and every waiting order as the AI is shown them. Reads OKX, changes nothing, costs nothing.
+
+    With `fields`, also the names of the fields OKX sent for each waiting order (names only, no values), to
+    check that the bot reads the fields OKX really uses.
+    """
+    from .app import build_okx
+    from .book import book_text, read_book
+    from .closes import history_text, read_closed, read_triggers
+    from .okx_client import OkxError, OkxNetworkError
+    from .reports import account_text
+
+    okx = build_okx(cfg)
+    try:
+        state = okx.account_state()
+    except (OkxError, OkxNetworkError) as exc:
+        print(f"[X] 读不到账户：{exc}")
+        return 1
+    print(account_text(state, None, None, cfg.risk_per_trade_pct))
+    book = read_book(okx)
+    print(book_text(book, okx, state.snapshot.total_eq, cfg.tz))
+    if fields:
+        for row in book.orders + book.algos:
+            attached = [sorted(item) for item in row.get("attachAlgoOrds") or [] if isinstance(item, dict)]
+            print(f"[fields] {row.get('ordType', '?')}: {', '.join(sorted(row))}" + (f" | attachAlgoOrds: {attached}" if attached else ""))
+    try:
+        print(history_text(read_closed(okx), read_triggers(okx), cfg.tz, time.time() - 7 * 86400))
+    except (OkxError, OkxNetworkError) as exc:
+        print(f"[!] 读不到平仓记录：{exc}")
     return 0
 
 
@@ -368,6 +402,8 @@ def main(argv: list[str] | None = None) -> int:
     clear = commands.add_parser("clearenv", help="把 .env 里指定的几项清空")
     clear.add_argument("names", nargs="+", metavar="NAME")
     commands.add_parser("trading", help="打印下单功能的设置：模式、限额、这把 key 的权限（只读取，不下单）")
+    account = commands.add_parser("account", help="打印 AI 看到的账户、持仓、所有挂着的委托和最近 7 天的平仓（只读取，不下单，不花钱）")
+    account.add_argument("--fields", action="store_true", help="另外列出 OKX 每张挂单返回的字段名（只有名字，没有值）")
     record = commands.add_parser("record", help="打印成绩单：AI 给过的点位和事后的行情对照（只读取记录，不花钱）")
     record.add_argument("days", nargs="?", type=int, default=30)
     commands.add_parser(
@@ -398,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
         return print_trading(cfg)
     if args.command == "record":
         return print_record(cfg, max(1, min(365, args.days)))
+    if args.command == "account":
+        return print_account(cfg, args.fields)
     if args.command == "replay":
         from .replay import replay
 

@@ -8,13 +8,15 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from .analyst import Analyst, AnalystUnavailable
+from .book import book_text, read_book
+from .closes import history_text, read_closed, read_triggers
 from .config import Config
 from .feishu_client import FeishuClient
 from .journal import Journal
 from .market import build_market_context
 from .models import AccountState
 from .monitor import Event, Monitor, position_brief
-from .okx_client import OkxClient
+from .okx_client import OkxClient, OkxError, OkxNetworkError
 from .reports import DISCLAIMER, account_text, equity_text, event_markdown, journal_text, status_markdown
 from .risk import AccountRisk, weekend_lines
 from .track import scorecard_markdown
@@ -108,6 +110,35 @@ class Reporter:
             log.exception("could not measure the positions' risk")
             return None
 
+    def account_for_ai(self, fresh: bool = False) -> str | None:
+        """The account, the positions and every order waiting on it (the bot's and those placed by hand),
+        as the AI reads them. `fresh` reads the account from OKX instead of taking the monitor's last read."""
+        state = None
+        if fresh:
+            try:
+                state = self._okx.account_state()
+            except (OkxError, OkxNetworkError) as exc:
+                log.warning("could not read the account for the AI: %s", exc)
+        if state is None:
+            state = self.current_state()
+        if state is None:
+            return None
+        text = account_text(state, self.day_change(state), self.risk(state), self._cfg.risk_per_trade_pct)
+        try:
+            orders = book_text(read_book(self._okx), self._okx, state.snapshot.total_eq, self._cfg.tz)
+        except Exception:  # the orders sit beside the account: an answer is never held up for them
+            log.exception("could not write out the waiting orders for the AI")
+            orders = "挂着的委托：这次没读到，不要猜，直接说没读到。"
+        return text + "\n" + orders
+
+    def history_for_ai(self, days: int) -> str:
+        """Positions closed in the last `days` days: how each closed and what it made, from OKX's own records."""
+        try:
+            closed, triggers = read_closed(self._okx), read_triggers(self._okx)
+        except (OkxError, OkxNetworkError) as exc:
+            return f"这次没读到 OKX 的平仓记录：{exc}"
+        return history_text(closed, triggers, self._cfg.tz, self._clock() - days * 86400)
+
     # ----------------------------------------------------------------- events
 
     def notify_event(self, event: Event) -> None:
@@ -199,7 +230,7 @@ class Reporter:
         title = ("盘前简报" if kind == "morning" else "收盘小结") + " · " + self.now_local().strftime("%m月%d日")
         market = self.market_text()
         state = self.current_state()
-        account = account_text(state, self.day_change(state), self.risk(state), self._cfg.risk_per_trade_pct) if state else None
+        account = self.account_for_ai() if state else None
         today = self.now_local().replace(hour=0, minute=0, second=0, microsecond=0)
         journal = journal_text(self._journal.events_between(today.timestamp(), self._clock() + 1), self._cfg.tz)
         shared = self.group_shares_account

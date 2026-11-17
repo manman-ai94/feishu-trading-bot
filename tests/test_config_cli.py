@@ -428,3 +428,19 @@ def test_a_misspelt_order_action_opens_nothing(tmp_path):
     assert actions == ("stops",) and "看不懂的词：opne、everything" in problems[0]
     actions, problems = actions_from(tmp_path, "TRADE_ACTIONS=stop\n")  # the word is "stops"
     assert actions == () and len(problems) == 1
+
+
+def test_account_command_prints_what_the_ai_sees_and_the_field_names_only(tmp_path, monkeypatch, capsys):
+    from .helpers import make_state
+    from .test_book import MANUAL_LIMIT, MANUAL_TRIGGER, Gold
+
+    okx = Gold(make_state())
+    okx.open_orders, okx.algos = [MANUAL_LIMIT], {"trigger": [MANUAL_TRIGGER]}
+    monkeypatch.setattr("bot.app.build_okx", lambda cfg: okx)
+    monkeypatch.chdir(tmp_path)
+    assert main(["--env", str(write_env(tmp_path, LIVE_KEYS)), "account", "--fields"]) == 0
+    output = capsys.readouterr().out
+    assert output.startswith("账户权益") and "限价单 买入 5 XAU" in output and "计划委托 买入 2 XAU" in output
+    assert "[fields] limit: accFillSz, attachAlgoOrds, cTime" in output and "| attachAlgoOrds: [['slOrdPx'" in output
+    assert "[fields] trigger: algoClOrdId, algoId" in output and "3905" not in output.split("[fields]", 1)[1]
+    assert "这段时间没有平仓记录" in output and not (tmp_path / "data").exists()

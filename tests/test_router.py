@@ -922,3 +922,17 @@ def test_a_question_about_closing_is_not_read_as_an_order():
     [reply] = bench.say("查看下现在的仓位情况，有没有必要平仓，还是可以再等一等", private=False)
     assert bench.analyst.named("to_command") == [] and reply.body == "AI:answer"
     assert bench.exchange.changes == []
+
+
+def test_asking_to_look_at_or_analyse_the_orders_reaches_the_ai_with_every_waiting_order():
+    from .test_book import MANUAL_LIMIT
+
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.okx.open_orders = [MANUAL_LIMIT]  # placed by hand in OKX, not by the bot
+    bench.analyst.command = ""  # the AI's rewrite: looking is not an order
+    for text in ("查询我现在的仓位和挂单情况", "帮我分析一下自己的挂单仓位", "看下挂单情况"):
+        assert bench.say(text, private=False)[-1].body == "AI:answer", text
+    calls = bench.analyst.named("answer")
+    assert len(calls) == 3 and all("限价单 买入" in call["account_text"] and "在 OKX 里手动下的" in call["account_text"] for call in calls)
+    assert bench.exchange.changes == []
+    assert bench.say("挂单")[-1].title != ""  # the bare word still shows the fixed list

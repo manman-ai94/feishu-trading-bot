@@ -76,6 +76,7 @@ def replay(cfg: Config, path: Path = QUESTIONS_FILE, out=print) -> int:
     gauge = RiskGauge(okx)
     reporter = Reporter(cfg, feishu, okx, analyst, scratch, crowd=None, gauge=gauge)
     reporter.monitor = Monitor(okx, cfg, scratch, lambda event: None, gauge=gauge)
+    analyst.attach_account(lambda: reporter.account_for_ai(fresh=True), reporter.history_for_ai)
     reporter.monitor.poll_once()
     router = Router(
         cfg, feishu, okx, analyst, reporter, BOT_ID, resolver=resolver, trade=None,

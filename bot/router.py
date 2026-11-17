@@ -37,7 +37,7 @@ from .instruments import ALIASES, InstrumentResolver
 from .knowledge import KnowledgeBase
 from .market import build_market_context, quote_line
 from .okx_client import OkxError, OkxNetworkError
-from .reports import DISCLAIMER, account_text, status_markdown
+from .reports import DISCLAIMER, status_markdown
 from .service import Reporter
 from .track import scorecard_markdown
 
@@ -460,8 +460,8 @@ class Router:
             return "hello"
         # Short messages like "仓位" or "我的持仓" are a status request; longer
         # ones ("我的仓位风险大吗") go to the AI router below.
-        if len(text) <= 6 and any(word in lowered for word in STATUS_WORDS):
-            return "status"
+        if len(text) <= 6 and any(word in lowered for word in STATUS_WORDS) and not any(word in text for word in ("挂单", "委托")):
+            return "status"  # the card shows positions, not orders: "仓位挂单" goes to the AI, which sees both
         if lowered.startswith(DEEP_PREFIXES):
             return "analysis"
         if self._analyst.enabled:
@@ -538,11 +538,7 @@ class Router:
             named = self._resolver.find_in_text(text, limit=2)
             market = self._market_text(named)
 
-            account = None
-            if self._shows_account(message):
-                state = self._reporter.current_state()
-                if state is not None:
-                    account = account_text(state, self._reporter.day_change(state), self._reporter.risk(state), self._cfg.risk_per_trade_pct)
+            account = self._reporter.account_for_ai() if self._shows_account(message) else None
             try:
                 answer = self._analyst.answer(
                     text, market, account, in_group=in_group, deep=deep, history=self._recent(message.chat_id)
@@ -711,7 +707,10 @@ def _note_body(text: str) -> str | None:
     return None
 
 
-QUESTION_WORDS = ("?", "？", "吗", "要不要", "有没有", "是不是", "能不能", "该不该", "还是", "必要", "怎么样")
+QUESTION_WORDS = (
+    "?", "？", "吗", "要不要", "有没有", "是不是", "能不能", "该不该", "还是", "必要", "怎么样",
+    "分析", "怎么看", "建议", "判断",
+)  # fmt: skip  # "看下挂单情况" still reaches the AI's rewrite, which leaves a request to look alone
 
 _CODE_IN_TEXT = re.compile(r"(确认\s*)\d{4}")
 

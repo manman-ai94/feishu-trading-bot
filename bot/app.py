@@ -204,6 +204,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
     gauge = RiskGauge(okx)
     reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, gauge=gauge, macro=macro)
+    analyst.attach_account(lambda: reporter.account_for_ai(fresh=True), reporter.history_for_ai)
     monitor = Monitor(okx, cfg, journal, reporter.notify_event, gauge=gauge)
     reporter.monitor = monitor
 

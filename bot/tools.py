@@ -5,11 +5,15 @@ search of the owner's knowledge base, how the crowd is positioned (crowd.py),
 and US real rates and the dollar from FRED (macro.py). Server tools (run by Anthropic): web search and web fetch, for
 news and economic data.
 
+When the answer may show the trader's account (his private chat, or the group when he shares it),
+two more: the account with every waiting order read fresh from OKX, and the positions he closed.
+
 Every tool only reads. None of them touches the account or places an order.
 """
 from __future__ import annotations
 
 import logging
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .instruments import InstrumentResolver
@@ -107,6 +111,33 @@ CLIENT_TOOLS: tuple[dict, ...] = (
         "input_schema": {"type": "object", "properties": {}},
     },
 )
+# Offered only for an answer that may show the trader's account, and only once the toolbox has a way to read it.
+ACCOUNT_TOOLS: tuple[dict, ...] = (
+    {
+        "name": "get_account",
+        "description": (
+            "The trader's own OKX account, read fresh: equity and margin, every position with its stop-loss, "
+            "take-profit and risk figures, and every order waiting on the account (limit orders, take-profit / "
+            "stop-loss orders, trigger orders, trailing stops), whether the bot placed it or he placed it by hand "
+            "in the OKX app, each with its distance from the market and what its stop would cost. The message "
+            "already carries a copy read moments ago; call this when fresher numbers matter, for example after "
+            "he says he just changed something."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_trade_history",
+        "description": (
+            "Positions the trader closed recently, from OKX's own records, newest first: when, which instrument "
+            "and side, open and close price, how it closed (stop-loss, take-profit, his own close, liquidation) and "
+            "the realised P&L with fees and funding. Use it for questions about his recent trades, results or habits."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"days": {"type": "integer", "description": "How many days back, 1 to 90. Default 7."}},
+        },
+    },
+)
 # Offered only when the toolbox was given what the tool reads from.
 OPTIONAL_TOOLS = {"search_knowledge": "_knowledge", "get_positioning": "_crowd", "get_macro": "_macro"}
 
@@ -125,14 +156,24 @@ class Toolbox:
         self._tz = tz
         self._crowd = crowd  # crowd.Crowd, or None when CROWD_DATA is off
         self._macro = macro  # macro.Macro, or None when MACRO_DATA is off
+        self._account: Callable[[], str | None] | None = None
+        self._history: Callable[[int], str] | None = None
 
-    def definitions(self, web_level: int = 0, web_searches: int = WEB_SEARCHES) -> list[dict]:
-        """Tool definitions in a fixed order, so the cached prompt prefix stays the same."""
+    def attach_account(self, account: Callable[[], str | None], history: Callable[[int], str]) -> None:
+        """How the account tools read: `account()` the account and its orders, fresh; `history(days)` the closes.
+        Given once the reporter that owns the account reads exists."""
+        self._account, self._history = account, history
+
+    def definitions(self, web_level: int = 0, web_searches: int = WEB_SEARCHES, account: bool = False) -> list[dict]:
+        """Tool definitions in a fixed order, so the cached prompt prefix stays the same.
+        `account`: this answer may show the trader's account, so the account tools are offered."""
         tools = [
             tool
             for tool in CLIENT_TOOLS
             if tool["name"] not in OPTIONAL_TOOLS or getattr(self, OPTIONAL_TOOLS[tool["name"]]) is not None
         ]
+        if account and self._account is not None:
+            tools.extend(ACCOUNT_TOOLS)
         for tool in WEB_TOOL_SETS[min(web_level, len(WEB_TOOL_SETS) - 1)]:
             if tool["name"] == "web_search":
                 tools.append({**tool, "max_uses": web_searches})
@@ -140,11 +181,18 @@ class Toolbox:
                 tools.append({**tool, "max_uses": WEB_FETCHES, "max_content_tokens": WEB_FETCH_TOKENS})
         return tools
 
-    def run(self, name: str, tool_input) -> tuple[str, bool]:
-        """Runs one client tool. Returns (text for the AI, whether it is an error)."""
+    def run(self, name: str, tool_input, account: bool = False) -> tuple[str, bool]:
+        """Runs one client tool. Returns (text for the AI, whether it is an error).
+        `account` as for `definitions`: the account tools run only when they were offered."""
         try:
             if not isinstance(tool_input, dict):
                 raise ToolError("工具参数格式不对。")
+            if name in ("get_account", "get_trade_history"):
+                if not account or self._account is None or self._history is None:
+                    raise ToolError("这次不能看交易员的账户。")
+                if name == "get_account":
+                    return self._account() or "这次没读到账户。", False
+                return self._history(self._days(tool_input)), False
             if name == "get_market":
                 return self._market(tool_input), False
             if name == "get_candles":
@@ -165,6 +213,13 @@ class Toolbox:
             return "这个工具出了点问题，这次没有取到数据。", True
 
     # ------------------------------------------------------------------ tools
+
+    @staticmethod
+    def _days(tool_input: dict) -> int:
+        days = tool_input.get("days", 7)
+        if isinstance(days, bool) or not isinstance(days, int):
+            raise ToolError("days 要是整数。")
+        return max(1, min(days, 90))
 
     def _instrument(self, tool_input: dict) -> str:
         symbol = tool_input.get("symbol")

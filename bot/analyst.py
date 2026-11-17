@@ -6,8 +6,9 @@ Three tiers:
   deep  -> MODEL_DEEP at EFFORT_DEEP          (weekly review, "深度" requests from the owner)
 
 For daily and deep work the AI is given tools (see tools.py): OKX market data
-for any instrument, raw candles, the owner's knowledge base, and web search
-for news and economic data. It calls them as it sees fit and this module runs
+for any instrument, raw candles, the owner's knowledge base, web search for
+news and economic data, and, when the answer may show the account, the
+account with every waiting order and the recent closes. It calls them as it sees fit and this module runs
 the loop until it has an answer. Every piece of work is metered, so the owner
 can see what it costs and a monthly budget can hold it back.
 """
@@ -54,6 +55,7 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 - 搜索要精，每搜一次都有费用。先想清楚要查什么，一般一到两次就够，例如一次查这个品种当天的重要消息，一次查近期的经济数据日程。不要为同一件事换着说法反复搜索；只问价位、指标或概念、用不到消息面的问题，不用搜索。
 - 交易员自己的交易规则、笔记，以及他收集的投资人理念和方法，在资料库里，用 search_knowledge 查。问题涉及他的规则和方法、某位投资人的做法，或者值得拿他自己的规则来对照时，先查一下，引用时说明出自资料库。投资人的观点只用来对照纪律和风险，一两句带过，并说明出自他哪一次公开发言；它不是价位的依据，也不要替他们对眼下的行情表态。
 - 别人怎么站队（OKX 大户的多空比；黄金另有 CFTC 每周的持仓报告）用 get_positioning 查，简报的数据里有时已经带上。它只是背景：可以用来说明哪一边拥挤、追进去的风险有多大，不能当作点位的依据，也不能单凭它判断方向。提到时带上数据的时间；CFTC 的数字是上周二的，隔了几天。没有这个工具时就不提。
+- 交易员的账户：消息里附了“交易员当前的账户和持仓”时，里面有权益、每个持仓和它的止盈止损，以及账户上所有挂着的委托：限价单、止盈止损单、计划委托、移动止损，机器人下的和他在 OKX 里手动下的都在，并注明了是谁下的。要最新的数字用 get_account 重新读；问到最近做过的交易、平过的仓、赚了亏了多少，用 get_trade_history 查。没有附账户时这两个工具也没有，不要谈任何人的账户。
 - 所有价位、数据和新闻都必须来自上面这些来源。没取到的就说没取到，不要凭印象写价格、新闻或数据结果。
 
 怎么回答：
@@ -63,6 +65,7 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 - 问一个决定（要不要平仓、能不能再等等、止损放哪），第一句就给出你从数据里得出的看法和最主要的理由（例如“结构还没坏，还能拿”），再给出关键的价位和条件：守住哪里还能拿、跌破哪里说明看法错了、保本位或结构失效位在哪。决定留给他：不要写“把止损提到 X”“减到 Y 个”“先平一半”这样替他拍板的话。不要先把持仓数字从头念一遍。
 - 追问上一条回答里的某一点，只答这一点，前面说过的不要再重复。
 - 他只是说了一句话、表个态（例如“我去跟 Claude 商量”“好的”），一句话回应就够了，不要再把数字列一遍。
+- 让你看或分析他的仓位和挂单：逐张说清楚它挂在哪里、离现价多远、对着的是哪个关键位，成交后仓位多大、打到止损亏多少占权益多少，和已有仓位叠在一起是什么风险。直接点出挂得好的和有问题的（例如挂在支撑正下方、止损和他的规则对不上、同方向重复挂、止盈止损和委托互相打架），给出你从数据里看到的价位作参考，改不改由他定。
 - 问某个品种“怎么看”，才写完整一点的判断。也只写今天真正要紧的两三件事：方向和最主要的依据、最关键的一两个价位、值得做计划的那一种情景（触发位、目标位、失效位）。只有一边值得做计划就只写一边；没有新东西的部分不写。
 不管是哪一种，这几条不变：
 - 价位写精确数字，并说明依据，例如 4H 前高、日线 EMA50、昨天的低点。
@@ -103,10 +106,10 @@ COMMAND_SYSTEM = """交易员在飞书里给交易机器人发了一句话。机
 - 做多 XAU 100张、做空 XAU 0.5个、做多 XAU 500U（数量一定带单位：张、个、U）
 - 限价做多 XAU 100张 3850
 - 做多 XAU 止损 3816、限价做多 XAU 3850 止损 3820（不写数量，机器人按他定的单笔风险算数量。只在他说了按风险、按规则、按仓位规则开这类话时用）
-- 挂单（查看现在的挂单）
 
 规则：
 - 只有他明确要机器人现在去做一件事时才改写。提问、讨论、征求意见、说已经发生的事、假设，一律输出 NONE。
+- 要看、查或分析持仓、挂单、账户，不是下单，输出 NONE（会交给分析）。
 - 相对的说法按“现在的持仓”换算成具体价格。例如止损在 3808 时，“止损减两点”“止损往下挪 2”就是“止损 XAU 3806”，“止损上移 5 个点”就是“止损 XAU 3813”。一个“点”按 1 个价格单位算。
 - 他没说品种、而现在只有一个持仓时，用那个持仓的品种。
 - 缺少必要的信息（品种不明、价格既没给也换算不出、数量不明）时输出 NONE。不要编造他没说的价格或数量。"""
@@ -229,6 +232,11 @@ class Analyst:
             "deep": Tier(cfg.model_deep, cfg.effort_deep, 32000, tools=True, web_searches=WEB_SEARCHES_DEEP),
         }
 
+    def attach_account(self, account, history) -> None:
+        """Lets the AI read the trader's account and closes with its tools, in answers that may show them."""
+        if self._toolbox is not None:
+            self._toolbox.attach_account(account, history)
+
     @property
     def enabled(self) -> bool:
         return self._client is not None or bool(self._cfg.anthropic_api_key)
@@ -257,12 +265,14 @@ class Analyst:
     def _ask(self, tier_name: str, system: str, user: str, purpose: str = "", history=None) -> str:
         return self._ask_with_levels(tier_name, system, user, purpose, history)[0]
 
-    def _analyse(self, tier_name: str, user: str, purpose: str, question: str = "", history=None, record: bool = True) -> str:
+    def _analyse(
+        self, tier_name: str, user: str, purpose: str, question: str = "", history=None, record: bool = True, account: bool = False
+    ) -> str:
         """An analysis in the analyst's voice. When the track record is kept, the AI adds
         its levels in a block for the program, which is cut off here and passed on."""
         keep = record and self._on_levels is not None
         system = ANALYST_SYSTEM + LEVELS_NOTE if keep else ANALYST_SYSTEM
-        text, levels = self._ask_with_levels(tier_name, system, user, purpose, history)
+        text, levels = self._ask_with_levels(tier_name, system, user, purpose, history, account)
         if keep and levels is not None:
             try:
                 self._on_levels(purpose, question, levels)
@@ -270,7 +280,10 @@ class Analyst:
                 log.exception("could not keep the levels of this analysis")
         return text
 
-    def _ask_with_levels(self, tier_name: str, system: str, user: str, purpose: str = "", history=None) -> tuple[str, Levels | None]:
+    def _ask_with_levels(
+        self, tier_name: str, system: str, user: str, purpose: str = "", history=None, account: bool = False
+    ) -> tuple[str, Levels | None]:
+        """`account`: the answer may show the trader's account, so the AI may read it with its tools."""
         if not self.enabled:
             raise AnalystUnavailable("还没有配置 Claude 的 API key，AI 分析暂时用不了。")
         tier = self._tiers[tier_name]
@@ -286,7 +299,7 @@ class Analyst:
         usage = Usage(tier.model)
         web_before = self.can_search_web
         try:
-            message = self._converse(tier, system, messages, usage)
+            message = self._converse(tier, system, messages, usage, account)
         except anthropic.AuthenticationError as exc:
             raise AnalystUnavailable("Claude 的 API key 无效，请检查 .env 里的 ANTHROPIC_API_KEY。") from exc
         except anthropic.PermissionDeniedError as exc:
@@ -330,7 +343,7 @@ class Analyst:
             except Exception:
                 log.exception("could not record AI usage")
 
-    def _converse(self, tier: Tier, system: str, messages: list[dict], usage: Usage):
+    def _converse(self, tier: Tier, system: str, messages: list[dict], usage: Usage, account: bool = False):
         """Sends the conversation, runs the tools the AI asks for, and returns its final message."""
         toolbox = self._toolbox if tier.tools else None
         if toolbox is None:
@@ -354,7 +367,7 @@ class Analyst:
                     max_tokens=tier.max_tokens,
                     system=system_blocks,
                     messages=messages,
-                    tools=toolbox.definitions(self._web_level, tier.web_searches),
+                    tools=toolbox.definitions(self._web_level, tier.web_searches, account),
                     output_config={"effort": tier.effort},
                     cache_control={"type": "ephemeral"},
                 )
@@ -380,7 +393,7 @@ class Analyst:
             for block in message.content:
                 if block.type != "tool_use":
                     continue
-                text, is_error = toolbox.run(block.name, block.input)
+                text, is_error = toolbox.run(block.name, block.input, account)
                 result = {"type": "tool_result", "tool_use_id": block.id, "content": text}
                 if is_error:
                     result["is_error"] = True
@@ -493,7 +506,9 @@ class Analyst:
         parts.append(TITLE_NOTE)
         parts.append(f"问题：{question}")
         tier = "deep" if deep else "daily"
-        return self._analyse(tier, "\n\n".join(parts), "deep question" if deep else "question", question, history)
+        return self._analyse(
+            tier, "\n\n".join(parts), "deep question" if deep else "question", question, history, account=account_text is not None
+        )
 
     def brief(
         self,
@@ -539,7 +554,7 @@ class Analyst:
             parts.append(note)
         parts.append(task)
         # Two versions of one brief may be written (owner and group): only the owner's is kept, so it counts once.
-        return self._analyse("daily", "\n\n".join(parts), f"{kind} brief", record=for_owner)
+        return self._analyse("daily", "\n\n".join(parts), f"{kind} brief", record=for_owner, account=for_owner)
 
     def weekly_review(self, market_text: str, journal_text: str, equity_text: str, shared_with_group: bool = False) -> str:
         task = (

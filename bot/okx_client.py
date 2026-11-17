@@ -293,6 +293,15 @@ class OkxClient:
         data = self._get("/api/v5/trade/orders-pending", {"instType": "SWAP", "instId": inst_id}, auth=True)
         return [OrderInfo.from_okx(row) for row in data]
 
+    def pending_orders_raw(self) -> list[dict]:
+        """Every open order on the account, on any kind of instrument and whoever placed it, as OKX sends it."""
+        return self._get("/api/v5/trade/orders-pending", auth=True)
+
+    def pending_algos(self, ord_type: str) -> list[dict]:
+        """Algo orders waiting to trigger, of one type ("conditional,oco", "trigger", "move_order_stop"), as OKX
+        sends them: take-profit / stop-loss, trigger orders and trailing stops, whoever placed them."""
+        return self._get("/api/v5/trade/orders-algo-pending", {"ordType": ord_type}, auth=True)
+
     def order(self, inst_id: str, ord_id: str = "", cl_ord_id: str = "") -> OrderInfo:
         """One order, by OKX's id or by the id the bot gave it."""
         data = self._get("/api/v5/trade/order", {"instId": inst_id, "ordId": ord_id, "clOrdId": cl_ord_id}, auth=True)

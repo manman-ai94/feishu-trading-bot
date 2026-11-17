@@ -185,6 +185,20 @@ def hit_line(hit: Hit, tz: ZoneInfo) -> str:
     return f"{when} {hit.inst_id} {hit.kind}{money}"
 
 
+def history_text(closed: list[Closed], triggers: list[Trigger], tz: ZoneInfo, since: float, limit: int = 20) -> str:
+    """The positions closed since `since`, newest first, for the AI: when, what, how it closed, what it made."""
+    rows = sorted((c for c in closed if c.closed_at >= since), key=lambda c: c.closed_at, reverse=True)
+    if not rows:
+        return "这段时间没有平仓记录（OKX 只保留最近三个月、最多 100 条）。"
+    lines = [f"平仓记录（新的在前，共 {len(rows)} 条{f'，只列前 {limit} 条' if len(rows) > limit else ''}）："]
+    for c in rows[:limit]:
+        when = datetime.fromtimestamp(c.closed_at, tz).strftime("%m-%d %H:%M")
+        side = "多" if c.direction == "long" else "空"
+        size = f"，平了 {c.closed_size:,.10g} 张" if c.closed_size else ""
+        lines.append(f"- {when} {c.inst_id} {side}单{size}；" + "；".join(close_lines(c, triggers)))
+    return "\n".join(lines)
+
+
 def close_lines(closed: Closed, triggers: list[Trigger]) -> tuple[str, ...]:
     """What a close really made, for the owner's alert. Amounts in the position's settlement currency."""
     lines = [f"平仓方式：{how_it_closed(closed, triggers)}（{CLOSE_TYPES.get(closed.close_type, '平仓')}）"]

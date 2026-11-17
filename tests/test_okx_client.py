@@ -296,7 +296,7 @@ def test_attach_stops_in_hedge_mode_matches_pos_side_and_skips_known_ids():
 
 
 def test_the_client_has_no_way_to_trade_or_move_funds():
-    look_ups = {"order", "pending_orders"}  # these two only read: see the test below
+    look_ups = {"order", "pending_orders", "pending_orders_raw"}  # these only read: see the test below
     forbidden = ("order", "cancel", "amend", "close", "place", "withdraw", "transfer", "post")
     public_names = [name for name in dir(OkxClient) if not name.startswith("_") and name not in look_ups]
     assert not [name for name in public_names if any(word in name.lower() for word in forbidden)]

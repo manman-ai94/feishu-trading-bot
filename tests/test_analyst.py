@@ -232,13 +232,15 @@ class FakeToolbox:
         self.runs: list[tuple[str, dict]] = []
         self.results = {"get_market": ("品种：BTC-USDT-SWAP\n最新价：67,000.00", False)}
 
-    def definitions(self, web_level=0, web_searches=3):
-        client_tools = [{"name": "get_market"}, {"name": "search_knowledge"}]
+    def definitions(self, web_level=0, web_searches=3, account=False):
+        client_tools = [{"name": "get_market"}, {"name": "search_knowledge"}] + ([{"name": "get_account"}] if account else [])
         web = [["web_search_20260209"], ["web_search_20250305"], []][min(web_level, 2)]
         return client_tools + [{"type": kind, "name": "web_search", "max_uses": web_searches} for kind in web]
 
-    def run(self, name, tool_input):
+    def run(self, name, tool_input, account=False):
         self.runs.append((name, tool_input))
+        if name == "get_account" and not account:
+            return "这次不能看交易员的账户。", True
         return self.results.get(name, ("没有这个工具", True))
 
 

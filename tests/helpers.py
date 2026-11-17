@@ -130,6 +130,8 @@ class FakeOkx:
         self.account_reads = 0
         self.triggered: dict[str, list[dict]] = {}  # OKX's triggered TP/SL orders, by order type
         self.closed: list[dict] = []  # OKX's position history
+        self.open_orders: list[dict] = []  # OKX's orders-pending rows, whoever placed them
+        self.algos: dict[str, list[dict]] = {}  # OKX's orders-algo-pending rows, by the ordType asked for
 
     def algo_history(self, ord_type: str) -> list[dict]:
         if self.error:
@@ -154,6 +156,16 @@ class FakeOkx:
 
     def pending_orders(self, inst_id: str | None = None) -> list:
         return []
+
+    def pending_orders_raw(self) -> list[dict]:
+        if self.error:
+            raise self.error
+        return list(self.open_orders)
+
+    def pending_algos(self, ord_type: str) -> list[dict]:
+        if self.error:
+            raise self.error
+        return list(self.algos.get(ord_type, []))
 
     def ticker(self, inst_id: str) -> Ticker:
         if self.market_error:
@@ -208,6 +220,9 @@ class FakeAnalyst:
 
     def named(self, name: str) -> list[dict]:
         return [details for call, details in self.calls if call == name]
+
+    def attach_account(self, account, history):
+        self.account_reader, self.history_reader = account, history
 
     def route_intent(self, text):
         self.calls.append(("route", {"text": text}))
