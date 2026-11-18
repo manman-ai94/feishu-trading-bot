@@ -134,6 +134,9 @@ _BREAKOUT = re.compile(
     r"(?:就|再|后|之后|以后|的时候|时|的话)?\s*[,，]?\s*(?:我)?\s*(?:就|再)?\s*"
     r"(限价|市价|挂单)?\s*(做多|开多|买入|买多|做空|开空|卖空)(.*)$"
 )
+MAX_TIERS = 5
+_LADDER = re.compile(r"^分\s*(\d)?\s*档\s*")
+_RANGE = re.compile(rf"^({NUM})\s*(?:到|至|-|~)\s*({NUM})$")
 _CLOSE_ALL_VERBS = ("全部平仓", "平掉全部", "平掉所有", "全平", "清仓", "/closeall")
 _CLOSE_VERBS = (("平多", "long"), ("平空", "short"), ("平仓", ""), ("平掉", ""), ("/close", ""))
 _CANCEL_VERBS = ("撤单", "撤销挂单", "取消挂单", "撤掉挂单", "撤销委托", "取消委托", "/cancel")
@@ -152,6 +155,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 只写止损不写数量：“做多 XAU 止损 3816”“限价做多 XAU 3850 止损 3820”，我按你定的单笔风险算数量，预览里写出怎么算的；算出来超过单笔上限或持仓上限时，自动减到上限以内
 - “加仓 XAU 100张”：按现有仓位的方向再开。市价加仓带止损时，整个仓位合成一张止损（先挂新的再撤旧的）
 - 突破单：“涨破 3900 做多 XAU 止损 3870”“跌破 3800 做空 XAU 止损 3830”，价格到了按市价进场，没到一直挂着
+- 分档挂单：“分档做多 XAU 3850 3830 3810 止损 3790”“分3档做多 XAU 3850到3810 止损 3790”，最多 5 档，每档一样多、各带同一个止损；不写数量时，几档全部成交再打到止损合计亏你定的单笔风险
 - 账户总风险：所有止损都打到合计最多亏多少（TRADE_MAX_TOTAL_RISK_PCT），每张开仓预览都写；超了就不执行，只写止损的自动减到放得下
 
 **平仓**（都按市价）
@@ -216,6 +220,7 @@ class Command:
     reduce: bool = False  # 减仓: a part of the position, never all of it by default
     code: str = ""
     note: str = ""  # unclear: what to tell the owner
+    tiers: tuple[Decimal, ...] = ()  # open: the prices of a ladder of limit orders (分档挂单), as written
     source: str = ""  # where the order came from (sources.SOURCE_NAMES); set by the desk, not by the parser
 
 
@@ -305,10 +310,17 @@ class CommandParser:
             if lowered.startswith(word):
                 return self._sizing(text[len(word) :])
         ord_type = ""
+        ladder: int | None = None  # "分3档……": a ladder of that many tiers (0: as many as the prices given)
+        found = _LADDER.match(text)
+        if found:
+            ladder, text = int(found.group(1) or 0), text[found.end() :]
+            ord_type = "limit"
         for word, kind in _TYPE_PREFIXES:
             if text.startswith(word):
                 ord_type, text = kind, text[len(word) :].lstrip()
                 break
+        if ladder is not None and ord_type != "limit":
+            raise _Unclear("分档挂单都是限价单，不能写“市价”。")
         lowered = text.lower()
         if not ord_type:
             for word, clear_sl, clear_tp in _CLEAR_STOP_VERBS:
@@ -325,7 +337,9 @@ class CommandParser:
             return self._breakout(breakout)
         for word, direction, forced in _OPEN_VERBS:
             if lowered.startswith(word):
-                return self._open(direction, forced or ord_type, text[len(word) :])
+                return self._open(direction, forced or ord_type, text[len(word) :], ladder)
+        if ladder is not None:
+            raise _Unclear("分档挂单请这样写：分档做多 XAU 3850 3830 3810 止损 3790，或 分3档做多 XAU 3850到3810 止损 3790。")
         for word in _CLOSE_ALL_VERBS:
             if lowered.startswith(word):
                 return self._close(text[len(word) :], "", ord_type, everything=True)
@@ -340,7 +354,7 @@ class CommandParser:
             raise _Unclear("反手请分两步：先发“平仓 品种”，平完再发开反方向的单。")
         return None
 
-    def _open(self, direction: str, ord_type: str, rest: str) -> Command | None:
+    def _open(self, direction: str, ord_type: str, rest: str, ladder: int | None = None) -> Command | None:
         _, ids = self._without_instruments(rest)
         if not re.search(r"\d", rest):
             # "做多情绪很浓" is talk. "做多 BTC" is an order with the size left out.
@@ -368,6 +382,11 @@ class CommandParser:
                     raise _Unclear("这条指令里既有“市价”又有“限价”，请只写一种。")
                 ord_type, work = "limit", work.replace(word, " ")
         leftover = _FILLER.sub(" ", work).strip()
+        tiers = self._tiers(leftover, px, ladder) if ord_type == "limit" or ladder is not None or px is not None or _RANGE.match(leftover) else ()
+        if tiers:
+            px, leftover = None, ""
+            if sl is None:
+                raise _Unclear("分档挂单要带止损，例如：分档做多 XAU 3850 3830 3810 止损 3790。")
         if leftover and ord_type == "limit" and px is None and _BARE_NUMBER.fullmatch(leftover):
             px, leftover = Decimal(leftover), ""
         if leftover:
@@ -387,12 +406,42 @@ class CommandParser:
             raise _Unclear("价格要大于 0。")
         if ord_type == "market" and px is not None:
             raise _Unclear("市价单不用写价格。想挂在某个价位，请用“限价做多 品种 数量 价格”。")
+        if tiers:
+            return Command("open", inst_id=inst_id, direction=direction, ord_type="limit", size=size, unit=unit, sl=sl, tp=tp, tiers=tiers)
+        if ladder is not None:
+            raise _Unclear("分档挂单要写两个以上的价格（最多 5 档），例如：分档做多 XAU 3850 3830 3810 止损 3790。")
         if ord_type == "limit" and px is None:
             raise _Unclear("限价单要写价格，例如：限价做多 XAU 100张 3850。")
         return Command(
             "open", inst_id=inst_id, direction=direction, ord_type=ord_type or ("limit" if px is not None else "market"),
             size=size, unit=unit, px=px, sl=sl, tp=tp,
         )  # fmt: skip
+
+    @staticmethod
+    def _tiers(leftover: str, px: Decimal | None, ladder: int | None) -> tuple[Decimal, ...]:
+        """The prices of a ladder in what is left of a limit order: "3850 3830 3810", or "3850到3810" with 分3档."""
+        found = _RANGE.match(leftover)
+        if found:
+            if not ladder or ladder < 2:
+                raise _Unclear("写了价格区间，要说分几档，例如：分3档做多 XAU 3850到3810 止损 3790。")
+            if ladder > MAX_TIERS:
+                raise _Unclear(f"最多分 {MAX_TIERS} 档。")
+            top, bottom = Decimal(found.group(1)), Decimal(found.group(2))
+            step = (bottom - top) / (ladder - 1)
+            return tuple(top + step * i for i in range(ladder))
+        parts = leftover.split()
+        if px is not None:
+            parts = [str(px), *parts] if parts else []
+        if len(parts) < 2 or not all(_BARE_NUMBER.fullmatch(part) for part in parts):
+            return ()
+        if len(parts) > MAX_TIERS:
+            raise _Unclear(f"最多分 {MAX_TIERS} 档，你写了 {len(parts)} 个价格。")
+        prices = tuple(Decimal(part) for part in parts)
+        if len(set(prices)) < len(prices) or any(price <= 0 for price in prices):
+            raise _Unclear("分档的价格要各不相同，而且大于 0。")
+        if ladder and ladder != len(prices):
+            raise _Unclear(f"说了分 {ladder} 档，写的是 {len(prices)} 个价格。")
+        return prices
 
     def _breakout(self, found: re.Match) -> Command | None:
         """"涨破 3900 做多 XAU 止损 3870": a trigger order (计划委托) that opens at market once the price gets there."""
@@ -1412,8 +1461,9 @@ class TradeDesk:
 
     # ------------------------------------------------------------------- open
 
-    def _plan_open(self, cmd: Command, previous: Plan | None) -> Plan:
-        cfg = self._cfg
+    def _opening(self, cmd: Command, previous: Plan | None) -> tuple[InstrumentSpec, AccountConfig, AccountState, list[Position], list[Position], str]:
+        """The checks every opening order goes through first. Returns (spec, account, state, held, the held
+        positions on the order's side, the order's direction)."""
         if self._paused():
             raise Refused("交易已暂停（你发过“停止交易”），现在不接受开仓指令。发“恢复交易”解除。平仓、撤单、改止损不受影响。")
         self._check_breaker()
@@ -1442,7 +1492,17 @@ class TradeDesk:
                 f"{inst_id} 上现在有{other}单。账户是单向持仓，这时候开{word}单只会先把{other}单减掉。"
                 f"要平仓请发“平仓 {base}”，平完再开{word}单。"
             )
+        return spec, account, state, held, same, direction
 
+    def _plan_open(self, cmd: Command, previous: Plan | None) -> Plan:
+        if cmd.tiers:
+            return self._plan_ladder(cmd, previous)
+        cfg = self._cfg
+        spec, account, state, held, same, direction = self._opening(cmd, previous)
+        inst_id = cmd.inst_id
+        base = inst_id.split("-")[0]
+        long = direction == "long"
+        word = _side_word(direction)
         last = _dec(self._okx.ticker(inst_id).last)
         settle = spec.settle_ccy or "USDT"
         px: Decimal | None = None
@@ -1512,19 +1572,7 @@ class TradeDesk:
 
         side = "buy" if long else "sell"
         held_value = sum((self._value(p, spec) for p in same), Decimal(0))
-        queued = Decimal(0)
-        for order in self._okx.pending_orders(inst_id):
-            if order.side != side or order.reduce_only or order.px is None:
-                continue
-            if account.hedge_mode and order.pos_side != direction:
-                continue
-            queued += _dec(order.remaining) * per_contract * _dec(order.px)
-        for row in self._pending_triggers(inst_id):
-            if row.get("side") != side or str(row.get("reduceOnly", "")).lower() == "true":
-                continue
-            if account.hedge_mode and row.get("posSide") != direction:
-                continue
-            queued += _dec(row.get("sz") or 0) * per_contract * _dec(row.get("triggerPx") or 0)
+        queued = self._queued(inst_id, direction, account, per_contract)
         max_order, max_position = _dec(cfg.trade_max_order_usd), _dec(cfg.trade_max_position_usd)
         if cmd.unit == "risk" and previous is None:
             # Sized from the stop: when that comes to more than the limits allow, take as much as they allow.
@@ -1577,20 +1625,7 @@ class TradeDesk:
                 f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。可以写一个更小的数量。"
                 "上限在服务器 .env 的 TRADE_MAX_POSITION_USD，飞书里改不了。"
             )
-        opens = self._journal.count_opens(self._day_start(), self._clock() + 1, self._mode)
-        if opens >= cfg.trade_max_opens_per_day:
-            raise Refused(
-                f"今天已经开仓 {opens} 次，到了每天 {cfg.trade_max_opens_per_day} 次的上限（TRADE_MAX_OPENS_PER_DAY）。"
-                "平仓、撤单、改止损不受影响。"
-            )
-        loss_limit = cfg.trade_daily_loss_limit_usd
-        if loss_limit is not None and self._mode == "live" and self._day_change is not None:
-            change = self._day_change()
-            if change is not None and change <= -loss_limit:
-                raise Refused(
-                    f"今天账户权益已经少了 {abs(change):,.2f} USD，到了你设的每日亏损线 {loss_limit:,.0f} USD，今天不再开新仓。"
-                    "平仓、撤单、改止损不受影响。"
-                )
+        self._check_daily()
 
         if cfg.trade_require_stop and sl is None:
             raise Refused("按你的设置（TRADE_REQUIRE_STOP=true），开仓必须带止损。请在指令后面加上“止损 价格”。")
@@ -1684,6 +1719,242 @@ class TradeDesk:
         if sized:
             data["sized"] = sized
         return Plan("open", title, tuple(lines), tuple(steps), inst_id, data)
+
+    def _plan_ladder(self, cmd: Command, previous: Plan | None) -> Plan:
+        """分档挂单: limit orders at several prices on one side, the same size each, each carrying the same stop.
+        If they all fill and the stop is hit, the loss is the per-trade risk: the tiers share it, they do not
+        each take it. The limits and the account's total risk are measured with every tier filled."""
+        cfg = self._cfg
+        spec, account, state, held, same, direction = self._opening(cmd, previous)
+        inst_id = cmd.inst_id
+        base = inst_id.split("-")[0]
+        long = direction == "long"
+        word = _side_word(direction)
+        last = _dec(self._okx.ticker(inst_id).last)
+        settle = spec.settle_ccy or "USDT"
+        per_contract = spec.coins_per_contract
+        equity = _dec(state.snapshot.total_eq or 0)
+
+        prices = sorted({_round_to(p, spec.tick_sz) for p in cmd.tiers}, reverse=long)  # nearest the market first
+        if len(prices) < len(cmd.tiers):
+            raise Refused(f"有几档按 {inst_id} 的最小价格单位 {_plain(spec.tick_sz)} 取整后成了同一个价，请把档位拉开一点。")
+        for price in prices:
+            gap = (price - last) / last * 100
+            crossing = gap if long else -gap
+            if crossing > _dec(cfg.trade_max_deviation_pct):
+                raise Refused(
+                    f"有一档 {_px(price, spec)} 比现价 {_px(last, spec)} {'高' if long else '低'}了 {abs(gap):.2f}%，会立刻按市价附近成交。"
+                    f"分档挂单是等价格{'回落' if long else '反弹'}，{word}单的每一档都要{'低' if long else '高'}于现价。"
+                )
+            if -crossing > FAR_LIMIT_PCT:
+                raise Refused(f"有一档 {_px(price, spec)} 离现价 {_px(last, spec)} 有 {abs(gap):.1f}% 远，像是输错了。请核对后重发。")
+        sl = _round_to(cmd.sl, spec.tick_sz)
+        tp = _round_to(cmd.tp, spec.tick_sz) if cmd.tp is not None else None
+        self._check_stop_sides(direction, prices[-1], sl, None, "最远一档", spec)
+        self._check_stop_sides(direction, prices[0], None, tp, "最近一档", spec)
+        count = Decimal(len(prices))
+        price_sum = sum(prices, Decimal(0))
+        gap_sum = sum((abs(price - sl) for price in prices), Decimal(0))  # the loss of one coin in every tier
+        average = price_sum / count
+
+        held_value = sum((self._value(p, spec) for p in same), Decimal(0))
+        queued = self._queued(inst_id, direction, account, per_contract)
+        max_order, max_position = _dec(cfg.trade_max_order_usd), _dec(cfg.trade_max_position_usd)
+        exposure = self._exposure(state)
+        total_cap = cfg.trade_max_total_risk_pct
+        risk_room = None
+        if total_cap is not None and equity > 0:
+            risk_room = equity * _dec(total_cap) / 100 * (CONFIRM_RISK_SLACK if previous is not None else 1) - exposure.loss
+
+        sized = ""
+        if previous is not None:
+            sizes = [Decimal(size) for size in previous.data["sizes"]]
+            each = sizes[0]
+            sized = previous.data.get("sized", "")
+        else:
+            if cmd.unit == "risk":
+                if equity <= 0:
+                    raise Refused("读不到账户权益，没法按单笔风险算数量。请写明数量。")
+                pct = _dec(cfg.risk_per_trade_pct)
+                budget = equity * pct / 100
+                each = _floor_to(budget / gap_sum / per_contract, spec.lot_sz)
+                sized = (
+                    f"数量按你定的单笔风险算：权益 {_amt(equity)} USD 的 {float(pct):g}% 是 {_amt(budget)} {settle}，"
+                    f"{len(prices)} 档全部成交再打到止损才亏这么多，每档 {_contracts_text(each, spec)}"
+                )
+                caps = [
+                    (_floor_to(max_order * CAP_SHARE / (max(prices) * per_contract), spec.lot_sz), f"单笔上限 {max_order:,.0f}"),
+                    (_floor_to((max_position - held_value - queued) * CAP_SHARE / (price_sum * per_contract), spec.lot_sz), f"持仓上限 {max_position:,.0f} 还剩的额度"),
+                ]
+                if risk_room is not None:
+                    caps.append((_floor_to(max(risk_room, Decimal(0)) / gap_sum / per_contract, spec.lot_sz), f"账户总风险上限 {total_cap:g}% 还剩的额度"))
+                for most, which in caps:
+                    if each > most:
+                        each = most
+                        sized += f"；这超过了{which}，减到每档 {_contracts_text(most, spec)}"
+            elif cmd.unit == "contracts":
+                each = _floor_to(cmd.size / count, spec.lot_sz)
+            elif cmd.unit == "coins":
+                each = _floor_to(cmd.size / count / per_contract, spec.lot_sz)
+            else:
+                each = _floor_to(cmd.size / (price_sum * per_contract), spec.lot_sz)
+            if cmd.unit in ("contracts", "coins") and each * count * (per_contract if cmd.unit == "coins" else 1) != cmd.size:
+                said = f"{_plain(cmd.size)} 张" if cmd.unit == "contracts" else f"{_plain(cmd.size)} {spec.ct_val_ccy}"
+                sized = f"一共 {said} 平分成 {len(prices)} 档，按最小单位取整后每档 {_contracts_text(each, spec)}"
+            if each < spec.min_sz or each <= 0:
+                least = spec.min_sz * per_contract
+                raise Refused(
+                    (f"{sized}。" if sized else "")
+                    + f"每档最少 {_plain(spec.min_sz)} 张（{_plain(least)} {spec.ct_val_ccy}），分 {len(prices)} 档放不下。"
+                    "少分几档，或者把止损放近一点。"
+                )
+            sizes = [each] * len(prices)
+
+        coins = each * count * per_contract
+        values = [each * per_contract * price for price in prices]
+        value = sum(values, Decimal(0))
+        loss = gap_sum * each * per_contract
+        if max(values) > max_order:
+            raise Refused(
+                (f"{sized}。" if sized else "")
+                + f"最大的一档约 {_amt(max(values))} {settle}，超过了单笔上限 {cfg.trade_max_order_usd:,.0f}。"
+                "上限在服务器 .env 的 TRADE_MAX_ORDER_USD，飞书里改不了。"
+            )
+        total = held_value + queued + value
+        if total > max_position:
+            raise Refused(
+                (f"{sized}。" if sized else "")
+                + f"{len(prices)} 档都成交的话，{inst_id} 的{word}单会到约 {_amt(total)} {settle}"
+                f"（现有 {_amt(held_value)}，挂单 {_amt(queued)}，这几档 {_amt(value)}），"
+                f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。可以写一个更小的数量。"
+                "上限在服务器 .env 的 TRADE_MAX_POSITION_USD，飞书里改不了。"
+            )
+        if risk_room is not None and loss > risk_room:
+            fits = _floor_to(max(risk_room, Decimal(0)) / gap_sum / per_contract, spec.lot_sz)
+            most = f"按这个止损每档最多 {_contracts_text(fits, spec)}" if fits >= spec.min_sz and fits > 0 else "按这个止损已经放不下了"
+            raise Refused(
+                f"账户现在所有止损都打到要亏约 {_amt(exposure.loss)}，占权益 {exposure.loss / equity * 100:.1f}%；"
+                f"这 {len(prices)} 档都成交再打到止损还要亏约 {_amt(loss)}，合起来超过你定的账户总风险 {total_cap:g}%（TRADE_MAX_TOTAL_RISK_PCT）。{most}。"
+                "可以先平掉或减掉别的仓位、撤掉挂单，或者把止损放近一点。"
+            )
+        cap = cfg.trade_max_risk_pct
+        if cap is not None:
+            if equity <= 0:
+                raise Refused("读不到账户权益，没法核对单笔止损上限，这次不开仓。请稍后再试。")
+            line = equity * _dec(cap) / 100
+            if loss > line * (CONFIRM_RISK_SLACK if previous is not None else 1):
+                fits = _floor_to(line / gap_sum / per_contract, spec.lot_sz)
+                most = f"按这个止损每档最多 {_contracts_text(fits, spec)}" if fits >= spec.min_sz else "按这个止损，每档最小的数量也超了"
+                raise Refused(
+                    f"{len(prices)} 档都成交再打到止损大约亏 {_amt(loss)} {settle}，占权益 {loss / equity * 100:.1f}%，"
+                    f"超过了你设的单笔上限 {cap:g}%（TRADE_MAX_RISK_PCT）。{most}；不写数量的话，我按单笔风险算。"
+                )
+        self._check_daily()
+
+        td_mode = (same or held)[0].mgn_mode if held else cfg.trade_margin_mode
+        pos_side = direction if account.hedge_mode else None
+        lever = None
+        try:
+            lever = self._okx.leverage(inst_id, td_mode)
+        except (OkxError, OkxNetworkError) as exc:
+            log.warning("could not read the leverage of %s: %s", inst_id, exc)
+
+        lines = [
+            f"{len(prices)} 档限价{word}单，每档 {_contracts_text(each, spec)}，合计 {_contracts_text(each * count, spec)}，"
+            f"约 {_amt(value)} {settle}（名义价值），全部成交的均价 {_px(average, spec)}"
+        ]
+        if sized:
+            lines.append(sized)
+        mode_word = "全仓" if td_mode == "cross" else "逐仓"
+        if lever:
+            margin = value / _dec(lever)
+            lines.append(f"杠杆 {lever:g} 倍（在 OKX 里设的），挂着就会冻结保证金，合计约 {_amt(margin)} {settle}，{mode_word}")
+            available = next((c.avail_eq for c in state.snapshot.currencies if c.ccy == settle), None)
+            if available is not None and margin > _dec(available):
+                lines.append(f"注意：可用保证金只有 {_amt(available)} {settle}，可能不够，OKX 会拒掉后面几档")
+        else:
+            lines.append(f"{mode_word}，杠杆按 OKX 里的设置")
+        near, far = (abs(prices[0] - last) / last * 100), (abs(prices[-1] - last) / last * 100)
+        lines.append(f"现价 {_px(last, spec)}，最近一档离现价 {near:.2f}%，最远一档 {far:.2f}%，价格到了才成交")
+        for number, price in enumerate(prices, 1):
+            lines.append(f"第 {number} 档 限价 {_px(price, spec)}：{_contracts_text(each, spec)}，打到止损亏约 {_amt(abs(price - sl) * each * per_contract)} {settle}")
+        lines.append(
+            f"止损 {_px(sl, spec)}（每档成交后各自带上；全部成交再打到止损，合计大约亏 {_amt(loss)} {settle}"
+            f"{self._risk_share(loss, state)}）"
+        )
+        if tp is not None:
+            gain = sum((abs(tp - price) for price in prices), Decimal(0)) * each * per_contract
+            lines.append(f"止盈 {_px(tp, spec)}（每档各自带上；全部成交再打到止盈，合计大约赚 {_amt(gain)} {settle}）")
+        else:
+            lines.append("止盈 无")
+        lines.append(f"全部成交后 {inst_id} 的{word}单约 {_amt(total)} {settle}（上限 {cfg.trade_max_position_usd:,.0f}）")
+        lines.extend(self._total_risk_lines(exposure, Decimal(0), loss, equity, settle))
+        held_coins = sum((_dec(p.qty) for p in same), Decimal(0)) * per_contract
+        mark = _dec(same[0].mark_px or last) if same else last
+        liq = self._liquidation_estimate(state, inst_id, direction, td_mode, lever, held_coins, mark, average, coins, equity, value)
+        if liq is not None and td_mode == "cross":
+            lines.append(f"全部成交后粗估强平价约 {_px(liq, spec)}（全仓，按账户权益亏光算；实际强平会早一点，以 OKX 显示为准）")
+            if (long and sl <= liq) or (not long and sl >= liq):
+                lines.append("**注意：止损在粗估强平价外面，价格到止损之前可能先强平**")
+        lines.append(f"每档成交后各带一张止损，几档都成交后想合成一张整仓止损，发“止损 {base} {_plain(sl)}”")
+        track = self._source_line(cmd.source) if previous is None else ""
+        if track:
+            lines.append(track)
+
+        side = "buy" if long else "sell"
+        steps = []
+        for number, (price, size) in enumerate(zip(prices, sizes), 1):
+            args = {"inst_id": inst_id, "td_mode": td_mode, "side": side, "ord_type": "limit", "sz": _plain(size), "px": _plain(price)}
+            if pos_side:
+                args["pos_side"] = pos_side
+            args["sl_trigger_px"] = _plain(sl)
+            if tp is not None:
+                args["tp_trigger_px"] = _plain(tp)
+            steps.append(Step("place_order", args, f"第 {number} 档 {_plain(price)}", independent=True))
+        title = f"分档限价{'加' if same else '做'}{word} {inst_id}（{len(prices)} 档）"
+        data = {
+            "sizes": [_plain(size) for size in sizes], "tiers": [_plain(price) for price in prices], "ref": _plain(last),
+            "positions": self._fingerprint(held),
+        }  # fmt: skip
+        if sized:
+            data["sized"] = sized
+        return Plan("open", title, tuple(lines), tuple(steps), inst_id, data)
+
+    def _queued(self, inst_id: str, direction: str, account: AccountConfig, per_contract: Decimal) -> Decimal:
+        """What the orders waiting to open or add on this side are worth: limit orders and trigger orders."""
+        side = "buy" if direction == "long" else "sell"
+        queued = Decimal(0)
+        for order in self._okx.pending_orders(inst_id):
+            if order.side != side or order.reduce_only or order.px is None:
+                continue
+            if account.hedge_mode and order.pos_side != direction:
+                continue
+            queued += _dec(order.remaining) * per_contract * _dec(order.px)
+        for row in self._pending_triggers(inst_id):
+            if row.get("side") != side or str(row.get("reduceOnly", "")).lower() == "true":
+                continue
+            if account.hedge_mode and row.get("posSide") != direction:
+                continue
+            queued += _dec(row.get("sz") or 0) * per_contract * _dec(row.get("triggerPx") or 0)
+        return queued
+
+    def _check_daily(self) -> None:
+        """TRADE_MAX_OPENS_PER_DAY and TRADE_DAILY_LOSS_LIMIT_USD."""
+        cfg = self._cfg
+        opens = self._journal.count_opens(self._day_start(), self._clock() + 1, self._mode)
+        if opens >= cfg.trade_max_opens_per_day:
+            raise Refused(
+                f"今天已经开仓 {opens} 次，到了每天 {cfg.trade_max_opens_per_day} 次的上限（TRADE_MAX_OPENS_PER_DAY）。"
+                "平仓、撤单、改止损不受影响。"
+            )
+        loss_limit = cfg.trade_daily_loss_limit_usd
+        if loss_limit is not None and self._mode == "live" and self._day_change is not None:
+            change = self._day_change()
+            if change is not None and change <= -loss_limit:
+                raise Refused(
+                    f"今天账户权益已经少了 {abs(change):,.2f} USD，到了你设的每日亏损线 {loss_limit:,.0f} USD，今天不再开新仓。"
+                    "平仓、撤单、改止损不受影响。"
+                )
 
     def _merged_stop(
         self, position: Position, sl: Decimal, tp: Decimal | None, td_mode: str, pos_side: str | None, spec: InstrumentSpec,
@@ -2265,9 +2536,11 @@ class TradeDesk:
         lines: list[str] = []
         done = failed = 0
         unknown = False
+        ladder = bool(plan.data.get("tiers"))
         for step in plan.steps:
             try:
-                lines.extend(self._run(step))
+                said = self._run(step)
+                lines.extend([f"{step.label}：{said[0]}", *said[1:]] if ladder and said else said)
                 done += 1
             except OkxError as exc:
                 failed += 1
@@ -2289,7 +2562,7 @@ class TradeDesk:
             result, heading, template = "ok", "已执行", "green"
         if plan.action == "stop" and result != "ok" and done and plan.steps[0].call == "cancel_stops" and len(plan.steps) > 1:
             lines.append("**注意：原来的止盈止损已经撤掉，新的没有挂上。现在这个仓位没有止盈止损，请马上重新设一次。**")
-        if plan.action == "open" and result in ("partial", "unknown") and done and len(plan.steps) > 1:
+        if plan.action == "open" and result in ("partial", "unknown") and done and len(plan.steps) > 1 and not ladder:
             lines.append("**注意：加仓单已经下了，但整仓止损没有全部做完。请马上发“仓位”看止损，再发“止损 品种 价格”补上。**")
         if result in ("unknown", "partial"):
             lines.append("请发“仓位”和“挂单”核对实际情况。我不会自动重试。")

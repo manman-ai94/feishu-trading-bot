@@ -1678,3 +1678,115 @@ def test_a_waiting_breakout_counts_in_the_position_limit_and_the_total_risk():
     bench = Bench(exchange, **roomy(trade_max_position_usd=40000.0))
     refusal = bench.say("限价做多 XAU 1个 3850 止损 3820").text
     assert "挂单 39,000.00" in refusal and "超过了单个品种的持仓上限 40,000" in refusal
+
+
+# ------------------------------------------------------------------ ladders
+
+
+@pytest.mark.parametrize(
+    "text, tiers, size, unit, sl",
+    [
+        ("分档做多 XAU 3850 3830 3810 止损 3790", (3850, 3830, 3810), None, "risk", 3790),
+        ("分3档做多 XAU 3850到3810 止损 3790", (3850, 3830, 3810), None, "risk", 3790),
+        ("分 2 档做空 黄金 3900-3920 止损 3950", (3900, 3920), None, "risk", 3950),
+        ("分档做多 XAU 3个 3850 3830 3810 止损 3790", (3850, 3830, 3810), Decimal(3), "coins", 3790),
+        ("限价做多 XAU 3850 3830 止损 3800", (3850, 3830), None, "risk", 3800),
+    ],
+)
+def test_a_ladder_is_read_with_its_prices(text, tiers, size, unit, sl):
+    command = parser().parse(text)
+    assert command.kind == "open" and command.ord_type == "limit", command
+    assert command.tiers == tuple(Decimal(t) for t in tiers) and command.px is None
+    assert (command.size, command.unit, command.sl) == (size, unit, Decimal(sl))
+
+
+@pytest.mark.parametrize(
+    "text, hint",
+    [
+        ("分档做多 XAU 3850 3830 3810", "分档挂单要带止损"),
+        ("分档做多 XAU 3850 止损 3790", "要写两个以上的价格"),
+        ("分6档做多 XAU 3850到3800 止损 3790", "最多分 5 档"),
+        ("分档做多 XAU 3850 3850 止损 3790", "价格要各不相同"),
+        ("分3档做多 XAU 3850 3830 止损 3790", "说了分 3 档，写的是 2 个价格"),
+        ("做多 XAU 3850到3810 止损 3790", "要说分几档"),
+    ],
+)
+def test_a_ladder_that_is_not_complete_is_explained(text, hint):
+    command = parser().parse(text)
+    assert command.kind == "unclear" and hint in command.note, command
+
+
+def test_a_ladder_shares_the_per_trade_risk_and_goes_out_as_one_limit_order_per_tier():
+    bench = Bench(**roomy())
+    preview = bench.say("分档做多 XAU 3850 3830 3810 止损 3790").text
+    # 500 USDT over 60 + 40 + 20 = 120 per XAU in every tier: 4.166 XAU a tier
+    assert "**分档限价做多 XAU-USDT-SWAP（3 档）**" in preview
+    assert "3 档限价多单，每档 4166 张（合 4.166 XAU），合计 12498 张（合 12.498 XAU），约 47,867.34 USDT（名义价值），全部成交的均价 3,830.0" in preview
+    assert "3 档全部成交再打到止损才亏这么多，每档 4166 张（合 4.166 XAU）" in preview
+    assert "第 1 档 限价 3,850.0：4166 张（合 4.166 XAU），打到止损亏约 249.96 USDT" in preview
+    assert "第 3 档 限价 3,810.0：4166 张（合 4.166 XAU），打到止损亏约 83.32 USDT" in preview
+    assert "全部成交再打到止损，合计大约亏 499.92 USDT，占权益 25.0%，没超过你定的单笔风险 25%" in preview
+    assert "几档都成交后想合成一张整仓止损，发“止损 XAU 3790”" in preview
+    bench.exchange.last[XAU] = 3875.0  # the sizes stay as previewed
+    reply = bench.say("确认 1111")
+    assert reply.title.startswith("已执行")
+    sent = [(args["ord_type"], args["px"], args["sz"], args["sl_trigger_px"]) for call, args in bench.sent if call == "place_order"]
+    assert sent == [("limit", "3850", "4166", "3790"), ("limit", "3830", "4166", "3790"), ("limit", "3810", "4166", "3790")]
+    assert "第 1 档 3850：" in reply.text and "第 3 档 3810：" in reply.text
+    assert len(bench.exchange.pending) == 3
+    [row] = bench.rows()
+    assert row["action"] == "open" and row["result"] == "ok" and row["summary"].startswith("分档限价做多")
+
+
+def test_a_short_ladder_rests_above_the_market_nearest_first():
+    bench = Bench(**roomy())
+    preview = bench.say("分3档做空 XAU 3940到3900 止损 3960").text
+    assert "第 1 档 限价 3,900.0" in preview and "第 3 档 限价 3,940.0" in preview
+    bench.say("确认 1111")
+    assert [args["px"] for _, args in bench.sent] == ["3900", "3920", "3940"]
+    assert all(args["side"] == "sell" for _, args in bench.sent)
+
+
+def test_a_stated_ladder_size_is_split_evenly():
+    bench = Bench(**roomy())
+    preview = bench.say("分档做多 XAU 10个 3850 3830 3810 止损 3790").text
+    assert "一共 10 XAU 平分成 3 档，按最小单位取整后每档 3333 张（合 3.333 XAU）" in preview
+    assert "合计大约亏 399.96 USDT" in preview
+
+
+def test_a_ladder_with_a_tier_through_the_market_or_a_stop_inside_it_is_refused():
+    bench = Bench(**roomy())
+    assert "有一档 3,950.0 比现价 3,880.0 高了 1.80%" in bench.say("分档做多 XAU 3950 3850 止损 3800").text
+    assert "多单的止损要低于最远一档 3,830.0" in bench.say("分档做多 XAU 3850 3830 止损 3840").text
+    assert "多单的止盈要高于最近一档 3,850.0" in bench.say("分档做多 XAU 3850 3830 止损 3800 止盈 3840").text
+    assert bench.sent == []
+
+
+def test_a_ladder_is_cut_to_the_position_limit_and_the_total_risk():
+    exchange = FakeExchange([gold(stops=(StopOrder("w1", 3840.8, None),))])  # 10 XAU, 400 at risk
+    bench = Bench(exchange, **roomy(trade_max_total_risk_pct=25.0))
+    preview = bench.say("分档做多 XAU 3850 3830 3810 止损 3790").text
+    assert "**分档限价加多 XAU-USDT-SWAP（3 档）**" in preview
+    # 80,000 less the 38,808 held, 99% of it, over 11.49 XAU of price: 3,549 a tier
+    assert "这超过了持仓上限 80,000 还剩的额度，减到每档 3549 张（合 3.549 XAU）" in preview
+    assert "这超过了账户总风险上限 25% 还剩的额度，减到每档 833 张（合 0.833 XAU）" in preview
+    assert "账户总风险（所有止损都打到）：现有约 400.00，加上这张约 99.96，合计约 499.96 USDT，占权益 25.0%" in preview
+
+
+def test_a_stated_ladder_over_the_total_risk_is_refused():
+    exchange = FakeExchange([gold(stops=(StopOrder("w1", 3840.8, None),))])
+    bench = Bench(exchange, **roomy(trade_max_total_risk_pct=25.0))
+    refusal = bench.say("分档做多 XAU 3个 3850 3830 3810 止损 3790").text
+    assert "合起来超过你定的账户总风险 25%（TRADE_MAX_TOTAL_RISK_PCT）。按这个止损每档最多 833 张（合 0.833 XAU）" in refusal
+    assert bench.sent == []
+
+
+def test_a_tier_okx_refuses_does_not_stop_the_others():
+    bench = Bench(**roomy())
+    bench.exchange.failures["place_order"] = [OkxError("51008", "Insufficient margin")]
+    bench.say("分档做多 XAU 3850 3830 3810 止损 3790")
+    reply = bench.say("确认 1111")
+    assert reply.title.startswith("只执行了一部分")
+    assert "第 1 档 3850：OKX 拒绝了，Insufficient margin（代码 51008）" in reply.text
+    assert len(bench.exchange.pending) == 2
+    assert "整仓止损没有全部做完" not in reply.text
