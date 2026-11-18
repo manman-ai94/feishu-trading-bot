@@ -235,8 +235,8 @@ class FakeAnalyst:
         )  # fmt: skip
         return text if self.reply is None else self.reply
 
-    def to_command(self, text, positions_text):
-        self.calls.append(("to_command", {"text": text, "positions_text": positions_text}))
+    def to_command(self, text, positions_text, earlier=None):
+        self.calls.append(("to_command", {"text": text, "positions_text": positions_text, "earlier": list(earlier or [])}))
         return "" if self.error else self.command
 
     def small_talk(self, text):

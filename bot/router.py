@@ -70,9 +70,10 @@ TRADE_OTHER_GROUP_TEXT = "这个群没有登记，下单类指令只在私聊和
 # Words that make a message from the owner worth reading as an order, when no fixed pattern matched it.
 ORDER_WORDS = (
     "止损", "止盈", "平仓", "平掉", "平一半", "减仓", "加仓", "开仓", "做多", "做空", "开多", "开空", "平多", "平空",
-    "撤单", "撤掉", "挂单", "清仓", "sl", "tp",
-)  # fmt: skip
+    "撤单", "撤掉", "挂", "清仓", "下单", "按你说的", "照你说的", "按刚才", "按计划", "照计划", "sl", "tp",
+)  # fmt: skip  # "按刚才的情景一挂上": the AI's rewrite takes the prices from the earlier answer
 ORDER_WORDS_MAX_CHARS = 80
+COMMAND_HISTORY_TURNS = 3  # earlier answers the AI may take an order's prices from
 
 HELLO_TEXT = "在。直接问就行，例如“黄金现在怎么看”；发“帮助”可以看我能做什么。"
 HELLO_WORDS = ("你好", "您好", "hi", "hello", "在吗", "在不在", "谢谢", "多谢", "辛苦了", "早", "早上好", "晚上好")
@@ -237,7 +238,7 @@ class Router:
 
         quoted = self._quote_instruments(text)
         if quoted:
-            self._reply_quote(message, quoted)
+            self._reply_quote(message, text, quoted)
             return
 
         intent = self._intent(text)
@@ -292,7 +293,7 @@ class Router:
         if (reply is None or reply.unclear) and not refused_here and self._sounds_like_an_order(text):
             # "止损减两点": an order the patterns could not read in full. The AI may make it out from the
             # current stop; when it cannot either, the desk's own question stands.
-            reply = self._order_in_own_words(text, in_group=not message.is_private) or reply
+            reply = self._order_in_own_words(text, message.chat_id, in_group=not message.is_private) or reply
         if reply is None:
             return False
         if reply.title:
@@ -311,10 +312,12 @@ class Router:
             return False  # "有没有必要平仓，还是再等等" asks for a view, it does not ask for a close
         return any(word in lowered for word in ORDER_WORDS)
 
-    def _order_in_own_words(self, text: str, in_group: bool):
+    def _order_in_own_words(self, text: str, chat_id: str, in_group: bool):
         """The AI writes the owner's words out as a fixed-pattern command; the trade desk reads, checks and
-        previews it like any other, and nothing is sent without his code. None when they are not an order."""
-        command_text = self._analyst.to_command(text, self._trade.positions_text())
+        previews it like any other, and nothing is sent without his code. None when they are not an order.
+        The last few answers of the chat go along, so "按刚才的情景一挂上" can take its prices from them."""
+        earlier = self._recent(chat_id)[-COMMAND_HISTORY_TURNS:]
+        command_text = self._analyst.to_command(text, self._trade.positions_text(), earlier)
         if not command_text:
             return None
         return self._trade.handle_understood(text, command_text, in_group=in_group)
@@ -472,6 +475,8 @@ class Router:
             # to a question is the answer that misses it, so anything that asks goes to the AI.
             if intent in ("status", "help") and _asks_something(text):
                 return "analysis"
+            if intent == "status" and any(word in text for word in ("挂单", "委托")):
+                return "analysis"  # "查询我现在的仓位和挂单情况": the card would leave the orders out
             return intent
         return "analysis"
 
@@ -487,7 +492,7 @@ class Router:
             return []  # there is a real question in there: let the AI answer it
         return self._resolver.find_in_text(text, limit=4)
 
-    def _reply_quote(self, message: IncomingMessage, inst_ids: list[str]) -> None:
+    def _reply_quote(self, message: IncomingMessage, text: str, inst_ids: list[str]) -> None:
         lines = []
         for inst_id in inst_ids:
             try:
@@ -496,6 +501,7 @@ class Router:
                 lines.append(f"**{inst_id}** 暂时取不到：{exc}")
         footer = None if message.is_private else DISCLAIMER
         self._feishu.reply_markdown(message.message_id, "OKX 实时报价", "\n".join(lines), "wathet", footer=footer)
+        self._remember_fixed(message.chat_id, text, "OKX 实时报价", "\n".join(lines))  # so that "那白银呢" follows on
 
     def _reply_status(self, message: IncomingMessage) -> None:
         state = self._reporter.current_state()
@@ -560,8 +566,9 @@ class Router:
             else:
                 self._feishu.reply_text(message.message_id, body)
             return
-        if not title:
-            title = ("深度分析" if deep else "行情分析") + (f" · {'、'.join(named)}" if named else "")
+        if not title and deep:
+            title = "深度分析" + (f" · {'、'.join(named)}" if named else "")
+        # Without a title of its own the answer goes without a header: "行情分析" on a reply about R multiples misleads.
         self._feishu.reply_markdown(message.message_id, title, body, "indigo", footer=footer)
 
     def _show_working(self, message: IncomingMessage, deep: bool = False, slow_text: str = "") -> Callable[[], None]:

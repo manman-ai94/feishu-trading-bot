@@ -233,7 +233,7 @@ def test_group_question_gets_market_only_analysis():
     [call] = bench.analyst.named("answer")
     assert call["in_group"] is True and call["account_text"] is None and call["deep"] is False
     assert "最新价：2,650.00" in call["market_text"]
-    assert reply.title == "行情分析 · XAU-USDT-SWAP" and reply.footer == DISCLAIMER
+    assert reply.title == "" and reply.footer == DISCLAIMER  # no header of the program's own: the AI gave none
 
 
 def test_owner_question_in_a_levels_only_group_never_carries_the_account():
@@ -294,7 +294,7 @@ def test_any_instrument_named_in_the_question_is_fetched_first():
     bench.say("btc 和 ETH 哪个强")
     bench.say("今天行情如何")
     titles = [item.title for item in bench.feishu.sent if item.how == "reply_markdown"]
-    assert titles == ["行情分析 · BTC-USDT-SWAP", "行情分析 · BTC-USDT-SWAP、ETH-USDT-SWAP", "行情分析"]
+    assert titles == ["", "", ""]  # without a title from the AI the answer has no header
     first, second, third = (call["market_text"] for call in bench.analyst.named("answer"))
     assert "品种：BTC-USDT-SWAP" in first and "XAU" not in first
     assert "品种：BTC-USDT-SWAP" in second and "品种：ETH-USDT-SWAP" in second
@@ -819,9 +819,11 @@ def test_a_longer_answer_is_a_card_under_the_title_the_ai_gave_it():
     bench.say("那止损放哪")  # the title is not part of what the AI is shown as its earlier answer
     assert bench.analyst.named("answer")[-1]["history"] == [("现在黄金怎么看", LONG_ANSWER)]
 
-    bench.analyst.reply = LONG_ANSWER  # no title given: the old one stands in
+    bench.analyst.reply = LONG_ANSWER  # no title given: no header, not a stock "行情分析" over any answer
     [reply] = bench.say("黄金再看一次")
-    assert reply.title == "行情分析 · XAU-USDT-SWAP"
+    assert reply.title == ""
+    [reply] = bench.say("深度 黄金这周怎么看")  # a deep answer keeps its own header
+    assert reply.title == "深度分析 · XAU-USDT-SWAP"
 
 
 def test_a_title_on_a_short_answer_is_dropped():
@@ -951,3 +953,54 @@ def test_asking_to_look_at_or_analyse_the_orders_reaches_the_ai_with_every_waiti
     assert len(calls) == 3 and all("限价单 买入" in call["account_text"] and "在 OKX 里手动下的" in call["account_text"] for call in calls)
     assert bench.exchange.changes == []
     assert bench.say("挂单")[-1].title != ""  # the bare word still shows the fixed list
+
+
+# ------------------------------------------------- what the first eval run showed (v0.12.1)
+
+
+def test_asking_for_positions_and_orders_is_answered_by_the_ai_even_when_routed_to_the_card():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.analyst.intent = "status"  # what the router model said for this one in the eval
+    [reply] = bench.say("查询我现在的仓位和挂单情况", private=False)
+    assert reply.title != "当前持仓" and len(bench.analyst.named("answer")) == 1
+    bench.say("仓位情况", private=False)  # the card still answers a plain look at the positions
+    assert bench.feishu.sent[-1].title == "当前持仓"
+
+
+def test_a_follow_up_to_a_price_quote_sees_the_quote():
+    bench = Bench()
+    [quote] = bench.say("黄金报价")
+    assert quote.title == "OKX 实时报价"
+    bench.say("那白银怎么看")
+    [(question, answer)] = bench.analyst.named("answer")[-1]["history"]
+    assert question == "黄金报价" and answer.startswith("[程序自动回复的卡片：OKX 实时报价]") and "XAU" in answer
+
+
+def test_an_order_from_the_plan_just_discussed_gets_the_earlier_answers():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.analyst.reply = "情景一：回踩 3850 做多，止损 3820，目标 3950，把握约 55%。"
+    bench.say("黄金现在怎么挂单比较好")
+    bench.analyst.command = "限价做多 XAU 1张 3850 止损 3820 止盈 3950"
+    [preview] = bench.say("就按你刚才说的情景一挂上")
+    call = bench.analyst.named("to_command")[-1]
+    assert call["earlier"] == [("黄金现在怎么挂单比较好", "情景一：回踩 3850 做多，止损 3820，目标 3950，把握约 55%。")]
+    assert preview.title.startswith("下单预览") and "理解为：**限价做多 XAU 1张 3850 止损 3820 止盈 3950**" in preview.body
+    assert bench.exchange.changes == []  # nothing goes to OKX before his code
+
+
+def test_the_order_reader_is_shown_the_earlier_answers():
+    from bot.analyst import COMMAND_SYSTEM, Analyst
+
+    assert "限价做多 XAU 100张 3850 止损 3820 止盈 3950" in COMMAND_SYSTEM and "照前面的计划下单" in COMMAND_SYSTEM
+    seen = {}
+
+    def fake_ask(self, tier, system, user, purpose=""):
+        seen.update(tier=tier, system=system, user=user)
+        return "限价做多 XAU 3850 止损 3820 止盈 3950"
+
+    analyst = Analyst.__new__(Analyst)
+    analyst._ask = fake_ask.__get__(analyst)
+    command = analyst.to_command("按你说的挂", "（没有持仓）", [("怎么挂", "情景一：回踩 3850 做多，止损 3820，目标 3950")])
+    assert command == "限价做多 XAU 3850 止损 3820 止盈 3950"
+    assert seen["tier"] == "quick" and "前面的对话" in seen["user"] and "交易助手答：情景一" in seen["user"]
+    assert seen["user"].index("前面的对话") < seen["user"].index("他发的话：按你说的挂")
