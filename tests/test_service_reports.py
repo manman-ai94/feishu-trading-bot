@@ -217,6 +217,16 @@ def test_startup_message_says_when_the_bot_was_not_running():
     assert "开始监控" in sent.body and sent.template == "orange"
 
 
+def test_startup_message_names_the_version_and_says_why_it_restarted_and_what_is_new():
+    from bot import __version__
+
+    reporter, feishu, *_ = build()
+    reporter.send_startup(restarted="08:06 我发现和飞书的长连接断了（6 分钟），自己重启了一次。", news="**已更新到 v9**\n- 新东西")
+    [sent] = feishu.sent
+    assert sent.body.startswith("08:06 我发现和飞书的长连接断了") and f"机器人已启动（v{__version__}）" in sent.body
+    assert sent.body.endswith("**已更新到 v9**\n- 新东西") and sent.template == "orange"
+
+
 def test_brief_is_written_once_and_shared_in_full_by_default():
     reporter, feishu, analyst, *_ = build()
     reporter.send_brief("morning")

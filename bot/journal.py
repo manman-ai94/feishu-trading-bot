@@ -139,7 +139,11 @@ CREATE TABLE IF NOT EXISTS wishes (
 """
 
 # Columns added after a table was first created: (table, column, declaration).
-ADDED_COLUMNS = (("calls", "confidence", "INTEGER"),)
+ADDED_COLUMNS = (
+    ("calls", "confidence", "INTEGER"),
+    ("orders", "source", "TEXT NOT NULL DEFAULT ''"),  # where an order came from: see trading.SOURCE_NAMES
+    ("reviews", "source", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 class Journal:
@@ -272,22 +276,25 @@ class Journal:
         request: dict | list | None = None,
         detail: str = "",
         ts: float | None = None,
+        source: str = "",
     ) -> None:
         """One row per instruction the bot sent to OKX on the owner's confirmation.
 
         `mode` is "demo" or "live"; `action` is open | close | cancel | stop;
-        `result` is ok | rejected | unknown (the request may or may not have arrived).
+        `result` is ok | rejected | unknown (the request may or may not have arrived);
+        `source` is where the order came from (trading.SOURCE_NAMES).
         """
         with self._lock:
             self._db.execute(
-                "INSERT INTO orders (ts, mode, action, inst_id, summary, request, result, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO orders (ts, mode, action, inst_id, summary, request, result, detail, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (int(ts or time.time()), mode, action, inst_id, summary,
-                 json.dumps(request or {}, ensure_ascii=False), result, detail),
+                 json.dumps(request or {}, ensure_ascii=False), result, detail, source),
             )  # fmt: skip
             self._db.commit()
 
     def orders_between(self, start: float, end: float, mode: str | None = None) -> list[dict]:
-        query = "SELECT ts, mode, action, inst_id, summary, result, detail FROM orders WHERE ts >= ? AND ts < ?"
+        query = "SELECT ts, mode, action, inst_id, summary, result, detail, source FROM orders WHERE ts >= ? AND ts < ?"
         values: list = [int(start), int(end)]
         if mode:
             query += " AND mode = ?"
@@ -401,7 +408,7 @@ class Journal:
 
     REVIEW_FIELDS = (
         "inst_id", "direction", "opened_at", "closed_at", "open_px", "close_px", "realized", "ccy", "how",
-        "first_stop", "stop_moves", "risk_pct", "r_multiple", "mae_r", "mfe_r", "facts", "text", "lesson",
+        "first_stop", "stop_moves", "risk_pct", "r_multiple", "mae_r", "mfe_r", "facts", "text", "lesson", "source",
     )  # fmt: skip
 
     def record_review(self, ts: float | None = None, **fields) -> int:
@@ -524,6 +531,11 @@ class Journal:
                 (int(start), int(end)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def wish(self, wish_id: int) -> dict | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM wishes WHERE id = ?", (int(wish_id),)).fetchone()
+        return dict(row) if row else None
 
     def set_wish_status(self, wish_id: int, status: str, note: str = "") -> bool:
         with self._lock:

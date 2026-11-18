@@ -78,7 +78,7 @@ def bench(reply="和计划比：按计划走。\n教训：**突破单等 15 分�
 def test_the_figures_come_from_the_records_and_the_lesson_is_kept():
     reviewer, journal, analyst, sent, okx = bench()
     journal.record_analysis("question", XAU, "long", 3848.0, [{"side": "long", "trigger": 3850, "target": 3900, "invalid": 3820}], "黄金怎么看", ts=OPEN - 3600)
-    journal.record_order("live", "open", "限价做多 XAU 5 个 3850 止损 3820", "ok", inst_id=XAU, ts=OPEN - 60)
+    journal.record_order("live", "open", "限价做多 XAU 5 个 3850 止损 3820", "ok", inst_id=XAU, ts=OPEN - 60, source="plan")
     assert reviewer.review(XAU, CLOSE + 10) is True
     [(title, body)] = sent
     assert title == f"复盘：{XAU} 多单"
@@ -91,7 +91,7 @@ def test_the_figures_come_from_the_records_and_the_lesson_is_kept():
         "结果 +1.00R",
         "持仓期间最多逆向 15.00（0.50R），最多顺向 45.00（1.50R）（按 15m K 线估算",
         "开仓前最后一次带点位的分析：01-15 07:00，问题“黄金怎么看”，偏多；情景：多头 触发 3,850.00 目标 3,900.00 失效 3,820.00",
-        "机器人下的开仓单：限价做多 XAU 5 个 3850 止损 3820",
+        "机器人下的开仓单：限价做多 XAU 5 个 3850 止损 3820（来源：AI 情景）",
         "教训：**突破单等 15 分钟收盘确认再进。**",
     ):
         assert expected in body, expected
@@ -101,6 +101,7 @@ def test_the_figures_come_from_the_records_and_the_lesson_is_kept():
     [row] = journal.reviews_between(0, CLOSE + 1)
     assert (row["r_multiple"], row["mae_r"], row["mfe_r"], row["stop_moves"]) == (1.0, 0.5, 1.5, 1)
     assert row["lesson"] == "突破单等 15 分钟收盘确认再进。" and row["risk_pct"] == 7.5
+    assert row["source"] == "plan"
     assert reviewer.review(XAU, CLOSE + 20) is False and len(sent) == 1  # the same close is reviewed once
 
 
@@ -129,6 +130,7 @@ def test_a_position_never_seen_with_a_stop_has_no_r_and_says_so():
     body = sent[0][1]
     assert "止损：机器人的记录里这个仓位一直没有止损" in body and "R" not in body.split("持仓期间")[0].split("已实现")[1]
     assert "开仓前 48 小时里，AI 没有给过这个品种带点位的分析" in body and "开仓单不是机器人下的" in body
+    assert journal2.reviews_between(0, CLOSE + 1)[0]["source"] == "manual"
 
 
 def test_the_pieces():
@@ -174,6 +176,9 @@ def test_the_week_in_figures():
     assert "有 R 的 2 笔：平均 +0.00R（这就是期望值 expectancy），最好 +1.00R，最差 -1.00R" in text
     assert "平均最多逆向 0.75R，平均最多顺向 0.85R" in text and "止损动过的 1 笔，记录里没有止损的 1 笔" in text
     assert "按开仓时段（UTC）：欧洲盘 1 笔 +130.00；亚洲盘 1 笔 -60.00" in text and "周五 1 笔 +130.00" in text
+    assert "按下单来源" not in text  # none of them tagged
+    rows[0]["source"], rows[1]["source"] = "plan", "manual"
+    assert "按下单来源：AI 情景 1 笔，赚 1 笔，合计 +130.00 USDT，平均 +1.00R；OKX 里手动下的 1 笔，赚 0 笔，合计 -60.00 USDT，平均 -1.00R；没有来源记录的 1 笔" in week_text(rows)
     assert week_text([]) == "本周没有复盘过的平仓。"
 
 
@@ -212,3 +217,16 @@ def test_an_older_database_gets_the_new_column(tmp_path):
     journal.record_analysis("question", XAU, "long", 1.0, [{"side": "long", "trigger": 2, "target": 3, "invalid": 1, "confidence": 70}])
     assert journal.open_calls()[0]["confidence"] == 70
     Journal(path)  # opening it again changes nothing
+
+
+def test_an_older_database_gets_the_source_columns(tmp_path):
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE orders (ts INTEGER NOT NULL, mode TEXT NOT NULL, action TEXT NOT NULL, inst_id TEXT NOT NULL DEFAULT '',"
+               " summary TEXT NOT NULL, request TEXT NOT NULL DEFAULT '{}', result TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')")
+    db.execute("INSERT INTO orders (ts, mode, action, summary, result) VALUES (1, 'live', 'open', 'old', 'ok')")
+    db.commit()
+    db.close()
+    journal = Journal(path)
+    journal.record_order("live", "open", "new", "ok", ts=2, source="own")
+    assert [(row["summary"], row["source"]) for row in journal.orders_between(0, 3)] == [("old", ""), ("new", "own")]

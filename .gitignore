@@ -6,6 +6,7 @@
 # Local data and logs (contain account history)
 data/
 logs/
+rollback/
 
 # The owner's knowledge base (private notes and documents) stays on the server.
 # knowledge/library/ is different: reference material written up from public sources, shipped with the code.

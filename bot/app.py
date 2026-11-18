@@ -10,10 +10,12 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from . import wishes
 from .alerts import AlertWatcher, PriceAlerts
 from .analyst import Analyst, Usage
 from .config import Config
 from .crowd import Crowd
+from .econ import ReleaseWatcher
 from .macro import Macro
 from .okx_stream import BUSINESS_CHANNELS, OkxStream, Streams, business_url, stream_url
 from .risk import RiskGauge
@@ -32,7 +34,8 @@ from .tools import Toolbox
 from .review import LESSONS_DAYS, LESSONS_SHOWN, Reviewer, lessons_text
 from .track import Levels, Scorer, track_text_for_ai
 from .trading import TradeDesk
-from .upkeep import Upkeep
+from .releases import news_text, told
+from .upkeep import Health, Upkeep, going_round, restart_text
 
 log = logging.getLogger(__name__)
 
@@ -284,18 +287,33 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     watcher = AlertWatcher(journal, okx, reporter.send_alert, tz=cfg.tz)
     threading.Thread(target=watcher.run_forever, args=(stop,), name="alerts", daemon=True).start()
     log.info("price alerts: %d active", len(journal.alerts("active")))
+    if cfg.has_okx_keys:
+        release_watcher = ReleaseWatcher(
+            journal, okx, reporter.current_state, reporter.send_alert, cfg.tz,
+            note_wish=lambda text: wishes.record(journal, text, "auto", "", time.time()),
+        )  # fmt: skip
+        threading.Thread(target=release_watcher.run_forever, args=(stop,), name="releases", daemon=True).start()
     if cfg.track_record:
         scorer = Scorer(journal, okx, cfg.track_window_hours)
         threading.Thread(target=scorer.run_forever, args=(stop,), name="track", daemon=True).start()
 
-    upkeep = Upkeep(cfg, journal)
+    health = Health(journal, lambda: threading.Timer(RESTART_DELAY_SECONDS, _exit_for_restart).start())
+    if cfg.has_okx_keys:
+        health.watch("monitor", going_round(lambda: monitor.cycles), limit=3 * cfg.poll_seconds)
+    health.watch("feishu", feishu.connected)
+    upkeep = Upkeep(cfg, journal, health=health)
     downtime = upkeep.downtime()  # read before this run's first heartbeat overwrites it
     if downtime is not None:
         log.warning("the bot was not running for about %d minute(s)", (downtime[1] - downtime[0]) // 60)
     threading.Thread(target=upkeep.run_forever, args=(stop,), name="upkeep", daemon=True).start()
 
     try:
-        reporter.send_startup(downtime)
+        restarted = restart_text(journal, time.time(), cfg.tz)
+        news = news_text(journal)
+        if news:
+            log.info("first run of this version: the start-up card says what changed")
+        reporter.send_startup(downtime, restarted=restarted, news=news)
+        told(journal)
     except Exception:
         log.exception("could not send the start-up message")
 

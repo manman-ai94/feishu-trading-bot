@@ -5,7 +5,7 @@ import sqlite3
 from zoneinfo import ZoneInfo
 
 from bot.journal import Journal
-from bot.upkeep import HEARTBEAT_SETTING, Upkeep, downtime_text
+from bot.upkeep import HEALTH_RESTART_AT, HEARTBEAT_SETTING, Health, Upkeep, downtime_text, going_round, restart_text
 
 from .helpers import Clock, make_cfg
 
@@ -13,7 +13,7 @@ NOW = 1_800_000_000.0
 UTC = ZoneInfo("UTC")
 
 
-def upkeep(tmp_path, journal=None, clock=None, pings=None, **cfg):
+def upkeep(tmp_path, journal=None, clock=None, pings=None, health=None, **cfg):
     cfg.setdefault("db_path", tmp_path / "data" / "bot.db")
     cfg.setdefault("knowledge_dir", tmp_path / "knowledge")
     cfg.setdefault("timezone", "UTC")
@@ -25,7 +25,7 @@ def upkeep(tmp_path, journal=None, clock=None, pings=None, **cfg):
         if pings is not None:
             pings.append(url)
 
-    return Upkeep(config, journal, clock, fetch), journal, clock
+    return Upkeep(config, journal, clock, fetch, health=health), journal, clock
 
 
 # ------------------------------------------------------------------ heartbeat
@@ -124,3 +124,83 @@ def test_old_copies_are_removed_and_other_files_left_alone(tmp_path):
 def test_backups_can_be_switched_off(tmp_path):
     keeper, _, _ = upkeep(tmp_path, backup_keep_days=0)
     assert keeper.backup_if_due() is None and not (tmp_path / "data" / "backups").exists()
+
+
+# ------------------------------------------------------------------- health
+
+
+class Parts:
+    """A monitor that goes round, and a Feishu connection that is up, until a test says otherwise."""
+
+    def __init__(self):
+        self.rounds = 0
+        self.monitor_stuck = False
+        self.feishu_up = True
+        self.restarts = 0
+
+    def tick(self):
+        if not self.monitor_stuck:
+            self.rounds += 1
+
+
+def watched(journal, clock):
+    parts = Parts()
+    health = Health(journal, lambda: setattr(parts, "restarts", parts.restarts + 1), clock)
+    health.watch("monitor", going_round(lambda: parts.rounds), limit=90)
+    health.watch("feishu", lambda: parts.feishu_up)
+    return parts, health
+
+
+def run_minutes(keeper, parts, clock, minutes):
+    for _ in range(minutes):
+        clock.advance(60)
+        parts.tick()
+        keeper.beat()
+
+
+def test_a_stuck_monitor_restarts_the_bot_once_and_the_watcher_outside_is_not_pinged(tmp_path):
+    pings: list[str] = []
+    clock = Clock(NOW)
+    journal = Journal(tmp_path / "bot.db")
+    parts, health = watched(journal, clock)
+    keeper, _, _ = upkeep(tmp_path, journal=journal, clock=clock, pings=pings, health=health, heartbeat_url="https://hc.example/p")
+    run_minutes(keeper, parts, clock, 10)
+    assert parts.restarts == 0 and len(pings) == 2
+    parts.monitor_stuck = True
+    run_minutes(keeper, parts, clock, 5)
+    assert parts.restarts == 0  # not yet five minutes
+    run_minutes(keeper, parts, clock, 2)
+    assert parts.restarts == 1 and len(pings) == 3  # the last one while it was still under five minutes
+    assert journal.get_setting(HEALTH_RESTART_AT) == str(int(NOW + 16 * 60))  # six minutes after the last round
+    run_minutes(keeper, parts, clock, 20)
+    assert parts.restarts == 1  # the restart did not help: not again within half an hour, and no ping meanwhile
+    assert len(pings) == 3
+    run_minutes(keeper, parts, clock, 15)
+    assert parts.restarts == 2
+
+
+def test_feishu_gone_for_five_minutes_restarts_and_the_card_after_says_why(tmp_path):
+    clock = Clock(NOW)
+    journal = Journal(tmp_path / "bot.db")
+    parts, health = watched(journal, clock)
+    keeper, _, _ = upkeep(tmp_path, journal=journal, clock=clock, health=health)
+    parts.feishu_up = False
+    run_minutes(keeper, parts, clock, 6)
+    assert parts.restarts == 1
+    clock.advance(20)  # the new process starts
+    text = restart_text(journal, clock(), UTC)
+    assert text == "08:06 我发现和飞书的长连接断了（6 分钟），自己重启了一次。"
+    assert restart_text(journal, clock(), UTC) == ""  # told once
+
+
+def test_a_part_that_comes_back_in_time_is_fine(tmp_path):
+    clock = Clock(NOW)
+    journal = Journal(tmp_path / "bot.db")
+    parts, health = watched(journal, clock)
+    keeper, _, _ = upkeep(tmp_path, journal=journal, clock=clock, health=health)
+    for _ in range(3):
+        parts.feishu_up = False
+        run_minutes(keeper, parts, clock, 4)
+        parts.feishu_up = True
+        run_minutes(keeper, parts, clock, 1)
+    assert parts.restarts == 0

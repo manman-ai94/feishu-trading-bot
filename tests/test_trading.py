@@ -1485,3 +1485,31 @@ def test_cancelling_the_order_at_a_price():
     assert "没有找到挂在 3700 的单" in refusal and "限价 3,788.0" in refusal
     assert "订单号 590908157585625333" in bench.say("撤单 卖单").text
     assert "590908157585625111" in bench.say("撤单 3788").text  # a short number is tried as a price too
+
+
+# ------------------------------------------------------------------ where an order came from
+
+
+def test_every_order_is_tagged_with_where_it_came_from():
+    bench = Bench()
+    bench.run("做多 XAU 0.1个 止损 3850")
+    bench.say("算仓位 XAU 止损 3850")
+    bench.run("做多 XAU 0.1个 止损 3850", code="2222")
+    bench.clock.advance(31 * 60)
+    bench.run("做多 XAU 0.1个 止损 3850", code="3333")  # the sizing was too long ago
+    bench.desk.handle_understood("按刚才说的情景开多", "做多 XAU 0.1个 止损 3850")
+    bench.say("4444")
+    bench.desk.handle_understood("帮我买一个黄金，止损3850", "做多 XAU 0.1个 止损 3850")
+    bench.say("5555")
+    assert [row["source"] for row in bench.rows()] == ["own", "sized", "own", "plan", "words"]
+
+
+def test_an_opening_preview_shows_how_orders_of_the_kind_have_done_once_there_are_enough():
+    bench = Bench()
+    for n, r in enumerate((1.5, -1.0, 2.0, -1.0)):
+        bench.journal.record_review(inst_id=XAU, direction="long", closed_at=bench.clock() - 86400 * (n + 1), r_multiple=r, source="own")
+    assert "这类单" not in bench.say("做多 XAU 0.1个 止损 3850").text
+    bench.say("取消")
+    bench.journal.record_review(inst_id=XAU, direction="long", closed_at=bench.clock() - 3600, r_multiple=0.5, source="own")
+    bench.journal.record_review(inst_id=XAU, direction="long", closed_at=bench.clock() - 3600, r_multiple=-1.0, source="plan")
+    assert "这类单（自己写的指令）最近 180 天平仓 5 笔，平均 +0.40R，赚 3 笔" in bench.say("做多 XAU 0.1个 止损 3850").text

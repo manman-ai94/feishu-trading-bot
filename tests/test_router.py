@@ -728,6 +728,13 @@ def test_the_owner_can_ask_for_the_track_record():
     [reply] = bench.say("成绩单 BTC 90")
     assert "最近 90 天 · BTC-USDT-SWAP" in reply.body and "记录了 1 次带点位的分析，共 0 个情景" in reply.body
     assert bench.analyst.calls == []  # read from the journal; the AI is not asked
+    assert "按下单来源" not in reply.body  # no closed trades yet
+    bench.journal.record_review(inst_id="XAU-USDT-SWAP", direction="long", closed_at=now - 86400, realized=50.0, ccy="USDT", r_multiple=1.0, source="plan")
+    bench.journal.record_review(inst_id="XAU-USDT-SWAP", direction="long", closed_at=now - 2 * 86400, realized=-20.0, ccy="USDT", r_multiple=-1.0)
+    [reply] = bench.say("成绩单", message_id="again")
+    assert "**最近 30 天平仓的单，按下单来源**" in reply.body
+    assert "- AI 情景：1 笔，赚 1 笔，合计 +50.00 USDT，平均 +1.00R" in reply.body and "没有来源记录（v0.14.1 之前的单）：1 笔" in reply.body
+    assert "按下单来源" not in bench.say("成绩单 BTC", message_id="btc")[0].body
 
 
 def test_a_question_about_the_track_record_goes_to_the_ai():
@@ -1113,6 +1120,13 @@ def test_the_owner_records_a_request_and_lists_them():
     assert bench.analyst.calls == []
     assert bench.say("建议止损放哪")  # asks for advice: the AI answers it
     assert bench.analyst.named("answer")
+    [reply] = bench.say("诉求 2 做好了", message_id="done")
+    assert reply.body == "已标成做好了：#2 盘前简报再短一点"
+    assert bench.journal.wish(2)["status"] == "done" and bench.journal.wish(2)["note"] == "你标的"
+    friend = Bench(group_owner_only=False)
+    friend.say("记个诉求：分档")
+    friend.say("诉求 1 做好了", sender=FRIEND, private=False)
+    assert friend.journal.wish(1)["status"] == "open"  # only the owner marks his requests
 
 
 def test_what_the_ai_says_it_cannot_do_goes_into_the_requests():

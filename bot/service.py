@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Callable
 
+from . import __version__
 from .analyst import Analyst, AnalystUnavailable
 from .book import book_text, read_book
 from .closes import history_text, read_closed, read_triggers
@@ -213,26 +214,32 @@ class Reporter:
         except Exception:
             log.exception("could not check the circuit breaker")
 
-    def send_startup(self, downtime: tuple[float, float] | None = None) -> None:
-        """`downtime` is (last seen running, now) when the bot was off long enough to matter."""
+    def send_startup(self, downtime: tuple[float, float] | None = None, restarted: str = "", news: str = "") -> None:
+        """`downtime` is (last seen running, now) when the bot was off long enough to matter; `restarted` says
+        why the health check restarted it; `news` is what this version changed, on its first run."""
         state = self.current_state()
+        version = f"（v{__version__}）"
         if state is None:
-            body = "机器人已启动，但还没读到 OKX 账户。稍后如果连续失败，我会再提醒你。"
+            body = f"机器人已启动{version}，但还没读到 OKX 账户。稍后如果连续失败，我会再提醒你。"
         else:
             # Short: a restart is not news. The positions in one line each; the full card is one word away.
-            lines = ["机器人已启动，开始监控。", "", f"**账户权益** {_usd(state.snapshot.total_eq)}"]
+            lines = [f"机器人已启动{version}，开始监控。", "", f"**账户权益** {_usd(state.snapshot.total_eq)}"]
             lines.extend(f"- {position_brief(position)}" for position in state.positions)
             if not state.positions:
                 lines.append("- 当前没有持仓")
             lines.append("")
             lines.append("完整的账户和风险读数发“仓位”。")
             body = "\n".join(lines)
+        if restarted:
+            body = restarted + "\n\n" + body
         if downtime is not None:
             body = downtime_text(downtime, self._cfg.tz) + "\n\n" + body
         if self._cfg.trading_on:
             where = "模拟盘" if self._cfg.trading == "demo" else "实盘"
             body += f"\n下单功能开着（{where}），每条指令回确认码才执行，发“停止交易”随时叫停。"
-        self.to_owner("交易助手已上线", body, "orange" if downtime is not None else "green")
+        if news:
+            body += "\n\n" + news
+        self.to_owner("交易助手已上线", body, "orange" if downtime is not None or restarted else "green")
 
     # ----------------------------------------------------------------- briefs
 

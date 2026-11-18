@@ -30,7 +30,7 @@ import time
 from collections import OrderedDict, deque
 from typing import Callable
 
-from . import wishes
+from . import sources, wishes
 from .alerts import PriceAlerts
 from .analyst import Analyst, AnalystUnavailable
 from .config import Config
@@ -56,7 +56,7 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 下单、平仓、撤单、设止盈止损：私聊里，或者在登记的群里 @我。每条指令我先回预览，你回复确认码才执行。发“交易帮助”看写法
 - 发“算仓位 XAU 止损 3768”：按你定的单笔风险算最多开多大，只算数不下单
 - 价格提醒：发“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了我马上告诉你（只提醒，不下单）。发“提醒”看已设的，“取消提醒 编号”取消
-- 发“记个诉求：……”，把想让我做到的事记下来；我做不到的事也会自动记。发“诉求清单”看记了什么
+- 发“记个诉求：……”，把想让我做到的事记下来；我做不到的事也会自动记。发“诉求清单”看记了什么，发“诉求 3 做好了”或“诉求 3 不做了”标掉一条
 - 问题前面加“深度”，我会多查几轮、分析得更细
 - 发“记住：……”，把交易规则、心得或资料存进资料库，以后回答时我会参考。发“资料”看资料库里有什么
 - 发“用量”，看今天和本月 AI 大约花了多少钱
@@ -283,6 +283,8 @@ class Router:
             self._reply_record(message, *self._record_request(text))
         elif wishes.is_list_request(text):
             self._reply_wishes(message)
+        elif wishes.status_request(text) is not None:
+            self._mark_wishes(message, *wishes.status_request(text))
         elif wishes.wish_body(text) is not None:
             self._record_wish(message, wishes.wish_body(text))
         elif _note_body(text) is not None:
@@ -317,6 +319,15 @@ class Router:
         )
         self._feishu.reply_text(message.message_id, reply)
         self._remember_fixed(message.chat_id, f"记个诉求：{body}", "", reply)
+
+    def _mark_wishes(self, message: IncomingMessage, ids: list[int], status: str) -> None:
+        if self._journal is None:
+            self._feishu.reply_text(message.message_id, "这种运行方式没有记录诉求的地方。")
+            return
+        marked, missing = wishes.mark(self._journal, ids, status, "你标的")
+        reply = wishes.status_reply(marked, missing, status)
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember_fixed(message.chat_id, message.text.strip(), "", reply)
 
     def _reply_wishes(self, message: IncomingMessage) -> None:
         if self._journal is None:
@@ -517,7 +528,14 @@ class Router:
         if self._journal is None or not self._cfg.track_record:
             self._feishu.reply_text(message.message_id, "成绩单没有打开。在服务器的 .env 里把 TRACK_RECORD 设成 true 再重启。")
             return
-        body = scorecard_markdown(self._journal, self._clock(), self._cfg.tz, days, inst_id, self._cfg.track_window_hours)
+        now = self._clock()
+        body = scorecard_markdown(self._journal, now, self._cfg.tz, days, inst_id, self._cfg.track_window_hours)
+        trades = [
+            row for row in self._journal.reviews_between(now - days * 86400, now + 1) if inst_id is None or row["inst_id"] == inst_id
+        ]  # fmt: skip
+        by_source = sources.record_block(trades, days)
+        if by_source:
+            body += "\n\n" + by_source
         self._feishu.reply_markdown(message.message_id, "成绩单", body, "green")
 
     # ---------------------------------------------------------------- intents

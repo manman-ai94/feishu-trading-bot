@@ -4,7 +4,10 @@ from __future__ import annotations
 from zoneinfo import ZoneInfo
 
 from bot.journal import Journal
-from bot.wishes import dump_text, is_list_request, list_markdown, record, take_ai_wish, wish_body
+import pytest
+
+from bot import releases
+from bot.wishes import dump_text, is_list_request, list_markdown, mark, record, status_reply, status_request, take_ai_wish, wish_body
 
 NOW = 1_800_000_000.0
 TZ = ZoneInfo("Asia/Shanghai")
@@ -52,3 +55,42 @@ def test_the_list_and_the_dump():
     assert "[owner/done] 分档挂单" in dump and "[auto/open] 按时间提醒" in dump
     assert "群] 问：跌破3800提醒我" in dump and "私聊] 问：按照这个计划开单" in dump and "下单预览 / 数量 12 XAU" in dump
     assert "对话" not in dump_text(journal, NOW, TZ, 1, with_dialog=False)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("诉求 3 做好了", ([3], "done")),
+        ("诉求3已做好", ([3], "done")),
+        ("把第3条诉求标成做好了", ([3], "done")),
+        ("诉求 3,4 做好了", ([3, 4], "done")),
+        ("把诉求 2和3 标为已完成", ([2, 3], "done")),
+        ("诉求 #7 完成", ([7], "done")),
+        ("诉求 5 不做了", ([5], "dropped")),
+        ("第5条诉求不要了", ([5], "dropped")),
+        ("诉求 3 怎么样了", None),
+        ("诉求清单", None),
+        ("诉求：分档挂单做好了", None),
+    ],
+)
+def test_marking_a_request(text, expected):
+    assert status_request(text) == expected
+
+
+def test_marked_requests_and_the_card_of_the_version_that_did_them():
+    journal = Journal(":memory:")
+    for n, text in enumerate(("分档挂单", "突破单", "按时间提醒")):
+        record(journal, text, "owner", "oc_1", NOW + n)
+    marked, missing = mark(journal, [1, 2, 9], "done", "v0.14.1")
+    assert [w["status"] for w in marked] == ["done", "done"] and missing == [9]
+    assert status_reply(marked, missing, "done") == "已标成做好了：#1 分档挂单；#2 突破单\n没有找到：#9。发“诉求清单”看编号。"
+    mark(journal, [3], "dropped", "你标的")
+    assert "#3" in list_markdown(journal, NOW + 10, TZ) and "（不做了）：你标的" in list_markdown(journal, NOW + 10, TZ)
+
+    news = releases.news_text(journal, "0.14.1")
+    assert news.startswith("**已更新到 v0.14.1**\n- 每张单都记下来源")
+    assert "你提的这些诉求，这个版本做好了：\n- #1 分档挂单\n- #2 突破单" in news and "按时间提醒" not in news
+    assert releases.news_text(journal, "0.14.1") == news  # until the card went out
+    releases.told(journal, "0.14.1")
+    assert releases.news_text(journal, "0.14.1") == ""
+    assert releases.news_text(journal, "9.9.9") == ""  # a version with no notes and nothing done says nothing

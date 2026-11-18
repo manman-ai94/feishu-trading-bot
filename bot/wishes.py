@@ -8,6 +8,11 @@ Three ways in:
 
 "诉求清单" lists them in Feishu. `python -m bot wishes` prints them on the
 server, with the chats, for the daily look the developer takes.
+
+Closing the loop: when a version does what a request asked for, the developer
+marks it on the server (`python -m bot wishes --done 3,4`, noted with the
+version), and the start-up card of that version tells the owner. He can mark
+one himself as well: "诉求 3 做好了", "诉求 5 不做了".
 """
 from __future__ import annotations
 
@@ -28,6 +33,12 @@ SAME_WISH_SECONDS = 86400  # the same words again within a day are not recorded 
 SOURCE_NAMES = {"owner": "你记的", "auto": "我没做到，自动记的", "unclear": "没看懂的指令"}
 STATUS_NAMES = {"open": "", "done": "（已做好）", "dropped": "（不做了）"}
 
+_IDS = r"(\d{1,5}(?:\s*(?:[,，、]|和|与)\s*\d{1,5})*)"
+_STATUS_WORDS = r"(做好了?|完成了?|搞定了?|已做好|已完成|不做了|不用做了|不要了|作废)"
+_STATUS = re.compile(
+    rf"^(?:把\s*)?(?:(?:第\s*)?{_IDS}\s*(?:号|条)?\s*诉求|诉求\s*#?\s*(?:第\s*)?{_IDS}\s*(?:号|条)?)"
+    rf"\s*(?:标(?:成|为|记为|记成)?|改(?:成|为))?\s*(?:已经|已)?\s*{_STATUS_WORDS}$"
+)
 _AI_WISH = re.compile(r"\n?[ \t]*\**诉求\**[ \t]*[：:][ \t]*(.+?)[ \t]*\Z", re.S)
 
 
@@ -46,6 +57,43 @@ def wish_body(text: str) -> str | None:
 
 def is_list_request(text: str) -> bool:
     return text.strip(" 。.!！?？").lower() in LIST_WORDS
+
+
+def status_request(text: str) -> tuple[list[int], str] | None:
+    """"诉求 3 做好了" -> ([3], "done"); "把第5条诉求标成不做了" -> ([5], "dropped"). None for anything else."""
+    plain = re.sub(r"\s+", " ", text.strip(" 。.!！")).replace("＃", "#")
+    found = _STATUS.match(plain)
+    if found is None:
+        return None
+    ids = [int(n) for n in re.findall(r"\d+", found.group(1) or found.group(2))]
+    word = found.group(3)
+    status = "dropped" if word.startswith(("不", "作废")) else "done"
+    return ids, status
+
+
+def mark(journal, ids: list[int], status: str, note: str = "") -> tuple[list[dict], list[int]]:
+    """Marks these requests; returns (the ones marked, as they now are; the numbers not found)."""
+    marked, missing = [], []
+    for wish_id in ids:
+        if journal.set_wish_status(wish_id, status, note):
+            marked.append(journal.wish(wish_id))
+        else:
+            missing.append(wish_id)
+    return marked, missing
+
+
+def status_reply(marked: list[dict], missing: list[int], status: str) -> str:
+    word = "做好了" if status == "done" else "不做了"
+    lines = [f"已标成{word}：" + "；".join(f"#{w['id']} {w['text'][:40]}" for w in marked)] if marked else []
+    if missing:
+        lines.append("没有找到：" + "、".join(f"#{n}" for n in missing) + "。发“诉求清单”看编号。")
+    return "\n".join(lines)
+
+
+def done_in(journal, version: str) -> list[dict]:
+    """The requests marked done with this version's note ("v0.14.1")."""
+    tag = f"v{version}"
+    return [w for w in journal.wishes(0, "done") if w["note"].strip() == tag or w["note"].startswith(tag + " ")]
 
 
 def take_ai_wish(answer: str) -> tuple[str, str]:

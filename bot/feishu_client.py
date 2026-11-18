@@ -99,6 +99,7 @@ class FeishuClient:
         self._app_id = app_id
         self._app_secret = app_secret
         self._domain = domain
+        self._ws = None  # the long connection's client, once listen() has made it
         self._client = (
             lark.Client.builder()
             .app_id(app_id)
@@ -240,7 +241,12 @@ class FeishuClient:
             domain=self._domain,
             log_level=lark.LogLevel.INFO,
         )
+        self._ws = ws_client
         ws_client.start()
+
+    def connected(self) -> bool:
+        """Whether the long connection to Feishu is up now. False before listen() has opened it."""
+        return getattr(self._ws, "_conn", None) is not None  # lark keeps the open socket there, None while it is down
 
 
 def _as_plain_text(title: str, markdown: str, footer: str | None) -> str:

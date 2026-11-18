@@ -13,6 +13,7 @@
     python -m bot record        print the track record: the AI's levels against what the market did
     python -m bot account       print the account, positions and waiting orders exactly as the AI is shown them
     python -m bot wishes 1      print the owner's requests of the last day (--dialog adds the chats)
+    python -m bot wishes --done 3,4   mark requests done with this version (the start-up card tells the owner)
     python -m bot eval          ask the eval questions, score each answer, compare with the last run (costs money)
 """
 from __future__ import annotations
@@ -215,6 +216,24 @@ def print_wishes(cfg: Config, days: float, with_dialog: bool) -> int:
         return 0
     print(dump_text(Journal(cfg.db_path), time.time(), cfg.tz, days, with_dialog, cfg.group_chat_id))
     return 0
+
+
+def mark_wishes(cfg: Config, numbers: str, status: str, note: str) -> int:
+    """Marks requests done (or dropped). Done ones noted "v<version>" are shown on that version's start-up card."""
+    from . import __version__
+    from .journal import Journal
+    from .wishes import mark
+
+    ids = [int(part) for part in numbers.replace("，", ",").split(",") if part.strip().isdigit()]
+    if not ids or not cfg.db_path.exists():
+        print("没有要标的诉求编号，或者还没有记录。")
+        return 1
+    marked, missing = mark(Journal(cfg.db_path), ids, status, note or (f"v{__version__}" if status == "done" else ""))
+    for wish in marked:
+        print(f"#{wish['id']} -> {wish['status']} {wish['note']}: {wish['text'][:60]}")
+    for wish_id in missing:
+        print(f"#{wish_id}: not found")
+    return 1 if missing else 0
 
 
 def print_status(cfg: Config) -> int:
@@ -423,6 +442,9 @@ def main(argv: list[str] | None = None) -> int:
     wishes = commands.add_parser("wishes", help="打印主人的诉求清单（--dialog 连同私聊和群里的问答），给开发的人每天看（只读取记录，不花钱）")
     wishes.add_argument("days", nargs="?", type=float, default=1.0)
     wishes.add_argument("--dialog", action="store_true", help="连同这几天私聊和群里的问答一起打印")
+    wishes.add_argument("--done", default="", help="把这些编号（逗号分隔）标成做好了，默认记上当前版本号")
+    wishes.add_argument("--drop", default="", help="把这些编号标成不做了")
+    wishes.add_argument("--note", default="", help="和 --done/--drop 一起用：记在诉求后面的说明")
     commands.add_parser(
         "replay", help="把 scripts/replay-group.txt 里群里问过的问题按主人在群里 @我 的样子重放，只打印回答（不发飞书、不下单，AI 调用照常计费）"
     )
@@ -459,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "account":
         return print_account(cfg, args.fields)
     if args.command == "wishes":
+        if args.done or args.drop:
+            return mark_wishes(cfg, args.done or args.drop, "done" if args.done else "dropped", args.note)
         return print_wishes(cfg, max(0.1, min(30.0, args.days)), args.dialog)
     if args.command == "replay":
         from .replay import replay

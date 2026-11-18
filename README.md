@@ -26,7 +26,10 @@
 | 发“算仓位 XAU 止损 3768”，按你定的单笔风险算最多开多大 | 可以 | 你可以 |
 | 和 AI 讨论完说“按刚才的情景一挂上”“按照这个计划开单”，带止损止盈出预览 | 可以 | 你可以 |
 | 价格提醒：“跌破 3800 提醒我”，到了马上告诉你（只提醒，不下单） | 可以 | 你可以；响的时候私聊和群里各发一条（`GROUP_SHOW_PNL=false` 时只发私聊） |
-| 诉求通道：“记个诉求：……”，做不到的事自动记，“诉求清单”查看 | 可以 | 你可以 |
+| 诉求通道：“记个诉求：……”，做不到的事自动记，“诉求清单”查看，“诉求 3 做好了”标掉；新版本做好的诉求写在上线卡片里 | 可以 | 你可以 |
+| CPI、非农、美联储议息公布前 30 分钟提醒，写清每个仓位离止损几个 ATR（有仓位或挂单时才发，只提醒不动单） | 有 | 有，同一份（`GROUP_SHOW_PNL=false` 时只发给你） |
+| 每张单记下来源，复盘、周报和成绩单按来源统计 | 有 | 有，同一份 |
+| 卡住或和飞书断线超过 5 分钟自己重启，上线卡片写原因和版本号 | 有 | 不发 |
 | 发“成绩单”看 AI 判断的命中率；每周复盘附本周成绩单 | 有 | 有，同一份（`GROUP_SHOW_PNL=false` 时只发给你） |
 | 熔断（连续止损暂停开仓）的提醒 | 有 | 有，同一份（`GROUP_SHOW_PNL=false` 时只发给你） |
 
@@ -262,6 +265,10 @@ AI 只写三行：和计划比怎么样、一条下次用得上的教训、有�
 
 发“跌破 3800 提醒我”，机器人记进数据库（重启不丢），之后每 10 秒读一次 OKX 的最新价和 1 分钟 K 线：价格到了就在私聊里告诉你（`GROUP_SHOW_PNL=true` 时群里也发一份），写明最低或最高到过多少、现价多少。K 线只算设提醒之后开始的那几根，所以设之前的插针不会误响，两次读数之间的插针也不会漏掉。每条只响一次；30 天没到自动取消并告诉你；最多同时 20 条。现价已经在那一边（例如现价 3,790 时设“跌破 3800”）或者离现价超过一半，就不设，并说明原因。提醒只告诉你，不下单、不改单。
 
+### 数据公布前提醒 (data release alerts)
+
+美国 CPI、非农就业和美联储利率决议公布前 30 分钟，只要账户上有仓位或等成交的挂单，机器人发一张卡片：几点公布（你的时区和美东时间），每个仓位离止损还有多远、折合几个 1 小时 ATR（平常一小时走多少），没挂止损的会标出来，再列出挂单。每次公布只发一次；账户上什么都没有就不发。只提醒，不动任何单。日期来自美国劳工统计局 (BLS) 和美联储 (Federal Reserve) 公布的日程，写在 `bot/econ.py` 里，排到 2027 年 12 月；快用完前一个月，机器人会在诉求清单里记一条“要补日历”。
+
 ### 提醒有多快
 
 机器人每 30 秒读一次账户（`POLL_SECONDS`）。另外它连着 OKX 的私有推送 (private WebSocket)，订阅了仓位、止盈止损单和强平预警三个频道（OKX 把止盈止损单放在另一个地址 `/ws/v5/business`，所以是两条连接，同一个 key 登录）：止损被打、仓位变了、OKX 发出强平预警时，推送一到机器人就马上读一次账户，提醒通常几秒内就到飞书。推送只负责“叫醒”，提醒的内容仍以随后从 OKX 读到的数字为准；推送断了会自动重连，期间照常每 30 秒读一次。推送只读，订阅的频道都不能下单。不想用设 `OKX_STREAM=false`。
@@ -447,10 +454,15 @@ AI 每次给出某个品种的多空情景时，机器人把里面的触发位�
 
 `TRACK_RECORD=false` 可以关掉。`python -m bot record` 在服务器上打印同一张成绩单，只读取记录。
 
+### 按下单来源统计 (by order source)
+
+机器人下的每张单都记下它是怎么来的：AI 情景（你说“按刚才的计划开”，AI 写成指令）、AI 改写的说法（你用自己的话说，AI 写成指令）、算仓位后下的（30 分钟内算过同一个品种的仓位）、自己写的指令，以及 OKX 里手动下的（机器人没下过这张单）。平仓复盘带上开仓单的来源；周报和“成绩单”按来源列出赚了几笔、合计多少、平均几 R。同一类单平仓满 5 笔（有 R 的）以后，开仓预览会多一行“这类单最近 180 天平仓 N 笔，平均 xR，赚 k 笔”。这些数字回答的是“哪种做法对你有效”，不是对下一笔的预测。
+
 ## 心跳和备份 (heartbeat and backup)
 
 - 停机会被说出来。机器人每分钟记一次时间。再次启动时如果发现中间空了 5 分钟以上，上线卡片的第一行会写明停了多久、从几点到几点，因为那段时间没有监控仓位。
 - 整台服务器停掉时，机器人自己发不出消息。想在这种时候也收到通知，可以用 healthchecks.io 这类“超时没来就报警”的服务：在那边建一个检查，把它给的网址填进 `HEARTBEAT_URL`，机器人每 5 分钟访问一次，访问时不带任何账户信息。不填就不访问。
+- 卡住了会自己重启。进程还在不等于机器人在干活：监控仓位的循环可能卡在一次不返回的读取里，和飞书的长连接也可能断了不再回来。机器人每分钟看一次这两样，任何一样超过 5 分钟没动静，就自己退出，由 `start.bat`（或 systemd）在 15 秒后拉起来；半小时内最多这样一次，免得重启解决不了的问题变成反复重启。之后的上线卡片会写明几点、因为什么重启。出问题期间不访问 `HEARTBEAT_URL`，所以重启也没修好的话，外面的检查服务会报警。
 - 每天自动备份。仓位记录、事件、订单、成绩单（`data/bot.db`）和你发给机器人的笔记，每天复制一份到 `data/backups/`，默认保留 14 天（`BACKUP_KEEP_DAYS`，填 0 关掉）。恢复的办法：停掉机器人，把 `data/backups/bot-日期.db` 复制成 `data/bot.db`，再启动。备份和数据在同一台服务器上，服务器硬盘坏了会一起丢，重要的话定期把 `data/backups` 下载到别处。
 
 ## 让它一直运行
@@ -484,6 +496,18 @@ Ubuntu 的 `setup.sh` 我在 Linux 上实际跑通过，生成的服务文件也
 
 ## 更新
 
+一键部署（推荐）：在开发的电脑上把代码打成 zip（`git archive`），算好它的 sha256，传到服务器后在安装文件夹里运行：
+
+```
+.venv\Scripts\python.exe -m bot.deploy --zip C:\bot\ftb.zip --sha256 <zip 的 sha256>
+```
+
+它会依次：核对 zip 的 sha256；用 SQLite 的备份接口复制一份数据库（`data/bot-before-版本.db`，机器人运行中也能复制）；把 zip 要覆盖的旧文件存进 `rollback/旧版本-时间/`；解压；`requirements.txt` 变了就装新包；跑测试，不过就把旧代码放回去、不动正在运行的机器人；重启计划任务 `FeishuTradingBot`（Ubuntu 用 `--restart systemd`），盯着 `logs/bot.log` 直到出现“connecting to Feishu”而且之后 20 秒没有报错；启动不干净就放回旧代码再重启。`.env`、`data/`、`logs/` 和你自己的资料库文件不在 zip 里，也从来不会被改。`--done-wishes 3,4` 顺便把这版做好的诉求标上，上线卡片会告诉你。
+
+每个新版本第一次启动时，上线卡片会写版本号、这一版改了什么，以及做好了的诉求。
+
+手动更新：
+
 - Windows：双击 `scripts\update.bat`，然后关掉机器人窗口，重新双击 `start.bat`。
 - Ubuntu：以 `bot` 用户在项目文件夹里输入 `bash scripts/update.sh`，再以 root 用户输入 `systemctl restart feishu-trading-bot`。
 
@@ -509,11 +533,15 @@ bot/trading.py        下单流程：读指令、对照限额检查、预览、�
 bot/selftest.py       模拟盘自测：用最小数量把每种指令在 OKX 模拟盘上真发一遍并核对
 bot/risk.py           风险读数：实际杠杆、强平距离折合几天波幅、止损代价、资金费，以及提醒线
 bot/alerts.py         价格提醒：读“跌破 3800 提醒我”，按最新价和 1 分钟 K 线到价就发
-bot/wishes.py         诉求通道：记下主人想要的事，列出来，给开发的人导出
+bot/wishes.py         诉求通道：记下主人想要的事，列出来，给开发的人导出，标成做好了或不做了
+bot/releases.py       每个版本改了什么，第一次启动时写进上线卡片
+bot/sources.py        下单来源：每张单从哪来，按来源统计平仓结果
+bot/econ.py           数据公布日历（CPI、非农、议息）和公布前 30 分钟的提醒
+bot/deploy.py         一键部署：核对、备份、测试、重启、看日志，不行就回滚
 bot/track.py          成绩单：从 AI 的回答里取出点位和把握，按 K 线打分，出成绩单卡片和给 AI 看的简版
 bot/review.py         平仓复盘：R 倍数、最大浮亏浮盈、止损轨迹、开仓前的分析，AI 写三行，教训存档
 bot/evaluate.py       评测：固定的 30 个问题，给回答打分，和上一次比
-bot/upkeep.py         心跳（发现停机）和每天的数据备份
+bot/upkeep.py         心跳（发现停机）、健康检查（卡住就重启）和每天的数据备份
 bot/models.py         数据结构
 bot/indicators.py     EMA、RSI、ATR
 bot/instruments.py    把“BTC”“比特币”这样的说法对应到 OKX 的品种
@@ -558,6 +586,10 @@ tests/                自动测试，运行方式：python -m pytest
 | 持仓量 | open interest | Open interest is rising with the price. |
 | 资金费率 | funding rate | The funding rate turned negative. |
 | 资料库 | knowledge base | I added my trading rules to the knowledge base. |
+| 回滚 | roll back | The new version failed, so we rolled back. |
+| 健康检查 | health check | The health check restarted the bot. |
+| 数据公布 | data release | CPI comes out in thirty minutes. |
+| 来源 | source | Which source do my best trades come from? |
 | 模拟盘 | demo trading | Test it in demo trading before going live. |
 | 市价单 / 限价单 | market order / limit order | A limit order waits until the price comes to it. |
 | 挂单 | pending order | I have two pending orders below the market. |

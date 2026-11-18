@@ -136,3 +136,18 @@ def test_a_refused_emoji_is_an_error_the_caller_can_catch():
             assert exc.code == 231021
         else:
             raise AssertionError("expected a FeishuError")
+
+
+def test_the_connection_is_down_until_listen_has_opened_it():
+    from bot.feishu_client import FeishuClient
+
+    client = FeishuClient("cli_x", "secret")
+    assert client.connected() is False
+
+    class Ws:
+        _conn = None
+
+    client._ws = Ws()
+    assert client.connected() is False
+    client._ws._conn = object()
+    assert client.connected() is True

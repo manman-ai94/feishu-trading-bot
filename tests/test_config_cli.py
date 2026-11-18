@@ -445,3 +445,19 @@ def test_account_command_prints_what_the_ai_sees_and_the_field_names_only(tmp_pa
     assert "[fields] limit: accFillSz, attachAlgoOrds, cTime" in output and "| attachAlgoOrds: [['slOrdPx'" in output
     assert "[fields] trigger: algoClOrdId, algoId" in output and "3905" not in output.split("[fields]", 1)[1]
     assert "这段时间没有平仓记录" in output and not (tmp_path / "data").exists()
+
+
+def test_requests_are_marked_done_with_the_version_from_the_command_line(tmp_path, capsys):
+    from bot import __version__
+    from bot.journal import Journal
+
+    db = tmp_path / "bot.db"
+    env = tmp_path / "test.env"
+    env.write_text(f"DB_PATH={db}\n", encoding="utf-8")
+    journal = Journal(db)
+    journal.add_wish("分档挂单", source="owner", chat="oc", ts=1)
+    journal.add_wish("突破单", source="owner", chat="oc", ts=2)
+    assert main(["--env", str(env), "wishes", "--done", "1,2"]) == 0
+    assert [w["note"] for w in journal.wishes(0, "done")] == [f"v{__version__}"] * 2
+    assert main(["--env", str(env), "wishes", "--drop", "7"]) == 1
+    assert "#7: not found" in capsys.readouterr().out

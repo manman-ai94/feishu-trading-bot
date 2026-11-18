@@ -9,6 +9,16 @@ Heartbeat
     owner when the fetches stop, which is the one thing a bot cannot report
     about itself. The fetch carries nothing about the account.
 
+Health
+  * A process can be running and still be of no use: the monitor stuck in a
+    call that never returns, or the connection to Feishu gone and not coming
+    back. Every minute the parts that matter are looked at. One that has not
+    been alive for five minutes ends the process, and scripts/start.bat (or
+    the systemd unit) starts it again, at most once in half an hour so a
+    fault that a restart does not cure does not turn into a loop. While
+    something is wrong the outside address above is not fetched, so the
+    watcher there raises the alarm if the restart did not help.
+
 Backup
   * Once a day the journal (snapshots, events, orders, the track record) and
     the owner's notes are copied into data/backups/, and copies older than
@@ -35,6 +45,11 @@ from .knowledge import NOTES_FILE
 log = logging.getLogger(__name__)
 
 HEARTBEAT_SETTING = "heartbeat_ts"
+HEALTH_SECONDS = 5 * 60  # a part not alive for this long is stuck
+HEALTH_RESTART_SECONDS = 30 * 60  # at most one restart for health in this long
+HEALTH_RESTART_AT = "health_restart_at"
+HEALTH_RESTART_REASON = "health_restart_reason"  # what was wrong, for the start-up card after the restart
+HEALTH_LABELS = {"monitor": "监控仓位的循环停住了", "feishu": "和飞书的长连接断了"}
 BEAT_SECONDS = 60
 DOWNTIME_SECONDS = 5 * 60  # a shorter gap is a restart, not an outage
 PING_SECONDS = 5 * 60
@@ -62,6 +77,80 @@ def downtime_text(gap: tuple[float, float], tz) -> str:
     return f"上次停止运行约 {' '.join(parts) or '几分钟'}（{began} 到 {back}），这段时间没有监控仓位，也没有发提醒。"
 
 
+def going_round(counter: Callable[[], int]) -> Callable[[], bool]:
+    """Alive when the counter moved since the last look."""
+    last = [None]
+
+    def alive() -> bool:
+        now = counter()
+        moved = now != last[0]
+        last[0] = now
+        return moved
+
+    return alive
+
+
+class Health:
+    """Whether the parts that matter are alive, and a restart when one of them has not been for too long."""
+
+    def __init__(self, journal: Journal, restart: Callable[[], None], clock: Callable[[], float] = time.time):
+        self._journal = journal
+        self._restart = restart
+        self._clock = clock
+        self._watches: dict[str, list] = {}  # name -> [alive(), limit in seconds, last time it was alive]
+
+    def watch(self, name: str, alive: Callable[[], bool], limit: float = HEALTH_SECONDS) -> None:
+        """`name` is one of HEALTH_LABELS. It counts as alive from now, so a part gets `limit` to come up."""
+        self._watches[name] = [alive, max(limit, HEALTH_SECONDS), self._clock()]
+
+    def check(self) -> str:
+        """What is wrong ("" when nothing is). Restarts the bot when something is, unless it did so lately."""
+        now = self._clock()
+        wrong = []
+        for name, entry in self._watches.items():
+            alive, limit, seen = entry
+            try:
+                ok = bool(alive())
+            except Exception:
+                ok = False
+            if ok:
+                entry[2] = now
+            elif now - seen > limit:
+                wrong.append((name, now - seen))
+        if not wrong:
+            return ""
+        reason = "，".join(f"{HEALTH_LABELS.get(name, name)}（{int(gone // 60)} 分钟）" for name, gone in wrong)
+        names = ", ".join(f"{name} for {int(gone // 60)} min" for name, gone in wrong)
+        try:
+            last = float(self._journal.get_setting(HEALTH_RESTART_AT) or 0)
+        except ValueError:
+            last = 0.0
+        if now - last < HEALTH_RESTART_SECONDS:
+            log.warning("health: not alive: %s; restarted for this less than 30 minutes ago, so not again", names)
+            return reason
+        log.warning("health: not alive: %s; restarting", names)
+        self._journal.set_setting(HEALTH_RESTART_AT, str(int(now)))
+        self._journal.set_setting(HEALTH_RESTART_REASON, reason)
+        self._restart()
+        return reason
+
+
+def restart_text(journal: Journal, now: float, tz) -> str:
+    """For the start-up card after a restart the health check made: when and why. Read once, then cleared."""
+    reason = journal.get_setting(HEALTH_RESTART_REASON, "")
+    if not reason:
+        return ""
+    journal.set_setting(HEALTH_RESTART_REASON, "")
+    try:
+        at = float(journal.get_setting(HEALTH_RESTART_AT) or 0)
+    except ValueError:
+        at = 0.0
+    if not at or now - at > HEALTH_RESTART_SECONDS:
+        return ""
+    when = datetime.fromtimestamp(at, tz=tz).strftime("%H:%M")
+    return f"{when} 我发现{reason}，自己重启了一次。"
+
+
 class Upkeep:
     def __init__(
         self,
@@ -69,11 +158,13 @@ class Upkeep:
         journal: Journal,
         clock: Callable[[], float] = time.time,
         fetch: Callable[[str], None] = _get,
+        health: Health | None = None,
     ):
         self._cfg = cfg
         self._journal = journal
         self._clock = clock
         self._fetch = fetch
+        self._health = health
         self._last_ping = 0.0
         self._backed_up: str | None = None  # the local date of the last backup made or found
 
@@ -94,6 +185,8 @@ class Upkeep:
     def beat(self) -> None:
         now = self._clock()
         self._journal.set_setting(HEARTBEAT_SETTING, str(int(now)))
+        if self._health is not None and self._health.check():
+            return  # no ping while something is wrong: the outside watcher should notice
         url = self._cfg.heartbeat_url
         if url and now - self._last_ping >= PING_SECONDS:
             self._last_ping = now

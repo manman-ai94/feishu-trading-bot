@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from .closes import FULL_CLOSE_TYPES, Closed, how_it_closed, read_closed, read_triggers
+from . import sources
 from .models import Candle
 
 log = logging.getLogger(__name__)
@@ -149,6 +150,7 @@ class TradeFacts:
     bar: str
     analysis: str
     order: str
+    source: str = ""  # where the opening order came from (sources.SOURCE_NAMES); "manual" when the bot did not place it
 
     def per_r(self, distance: float | None) -> float | None:
         risk = _risk(self.closed.direction, self.closed.open_px, self.trail.first)
@@ -162,6 +164,7 @@ class TradeFacts:
             closed_at=int(c.closed_at), open_px=c.open_px, close_px=c.close_px, realized=c.realized, ccy=c.ccy,
             how=self.how, first_stop=self.trail.first, stop_moves=self.trail.moves, risk_pct=self.risk_pct,
             r_multiple=self.r, mae_r=mae, mfe_r=mfe, facts=facts_text(self, None, None), text=text, lesson=lesson,
+            source=self.source,
         )  # fmt: skip
 
 
@@ -277,6 +280,9 @@ def week_text(reviews: list[dict]) -> str:
                 total = sum(r["realized"] or 0 for r in rows)
                 parts.append(f"{name} {len(rows)} 笔 {total:+,.2f}")
             lines.append(f"{label}（UTC）：" + "；".join(parts))
+    by_source = sources.week_line(reviews)
+    if by_source:
+        lines.append(by_source)
     return "\n".join(lines)
 
 
@@ -358,6 +364,7 @@ class Reviewer:
         return None, []
 
     def facts(self, closed: Closed, triggers) -> TradeFacts:
+        opening = self._opening_order(closed)
         start = closed.opened_at or closed.closed_at
         trail = stop_trail(self._journal.snapshots_between(start - 60, closed.closed_at + 60), closed.inst_id, closed.direction)
         coins, coin_ccy = self._coins(closed)
@@ -390,7 +397,8 @@ class Reviewer:
             mfe_px=mfe,
             bar=bar,
             analysis=self._analysis_line(closed),
-            order=self._order_line(closed),
+            order=self._order_line(opening),
+            source=self._source(closed, opening),
         )
 
     def _coins(self, closed: Closed) -> tuple[float | None, str]:
@@ -422,14 +430,29 @@ class Reviewer:
         question = f"，问题“{last['question']}”" if last["question"] else ""
         return f"开仓前最后一次带点位的分析：{when}{question}，{bias}" + (f"；情景：{scenarios}" if scenarios else "")
 
-    def _order_line(self, closed: Closed) -> str:
+    def _opening_order(self, closed: Closed) -> dict | None:
+        """The bot's order that opened this position: an opening order sent just before it opened. None when
+        the open time is not known, and {} when the bot sent none (the owner opened it in OKX)."""
         if not closed.opened_at:
-            return ""
+            return None
         before, after = ORDER_WINDOW_SECONDS
         orders = [
             o for o in self._journal.orders_between(closed.opened_at - before, closed.opened_at + after)
             if o["inst_id"] == closed.inst_id and o["action"] == "open" and o["result"] == "ok"
         ]  # fmt: skip
-        if not orders:
+        return orders[-1] if orders else {}
+
+    @staticmethod
+    def _order_line(opening: dict | None) -> str:
+        if opening is None:
+            return ""
+        if not opening:
             return "开仓单不是机器人下的（在 OKX 里手动下的）"
-        return f"机器人下的开仓单：{orders[-1]['summary']}"
+        how = f"（来源：{sources.name(opening['source'])}）" if opening.get("source") else ""
+        return f"机器人下的开仓单：{opening['summary']}{how}"
+
+    @staticmethod
+    def _source(closed: Closed, opening: dict | None) -> str:
+        if opening is None:
+            return ""
+        return (opening.get("source") or "") if opening else "manual"

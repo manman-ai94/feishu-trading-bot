@@ -33,7 +33,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
@@ -45,6 +45,7 @@ from .journal import Journal
 from .models import AccountConfig, AccountState, InstrumentSpec, OrderInfo, Position
 from .okx_client import OkxError, OkxNetworkError
 from .reports import currency_lines
+from . import sources
 
 log = logging.getLogger(__name__)
 
@@ -204,6 +205,7 @@ class Command:
     reduce: bool = False  # 减仓: a part of the position, never all of it by default
     code: str = ""
     note: str = ""  # unclear: what to tell the owner
+    source: str = ""  # where the order came from (sources.SOURCE_NAMES); set by the desk, not by the parser
 
 
 class _Unclear(Exception):
@@ -716,6 +718,7 @@ class TradeDesk:
         self._lock = threading.Lock()  # guards the pending confirmation
         self._sending = threading.Lock()  # one order at a time
         self._pending: _Pending | None = None
+        self._last_sizing: tuple[str, float] | None = None  # (instrument, when) of the last "算仓位" answered
         self._account_config: tuple[float, AccountConfig] | None = None
         self.stream_status: Callable[[], str] | None = None  # set by the app: whether OKX's push stream is up
 
@@ -770,6 +773,7 @@ class TradeDesk:
         if command is None or command.kind not in ("open", "close", "cancel", "stop", "orders", "unclear"):
             return None
         log.info("an order was read with the AI's help: %s", command.kind)
+        command = replace(command, source=sources.of_words(said))
         heading = f"我把“{said.strip()[:60]}”理解为：**{command_text}**"
         try:
             reply = self._dispatch(command, in_group)
@@ -803,6 +807,7 @@ class TradeDesk:
             return None
         if refused_here:
             return Reply(refused_here)
+        command = self._tagged(command)
         try:
             return self._dispatch(command, in_group)
         except Refused as exc:
@@ -811,6 +816,18 @@ class TradeDesk:
             return Reply(f"OKX 返回了错误，没有执行任何操作：{exc.message or '没有给出原因'}（代码 {exc.code}）")
         except OkxNetworkError:
             return Reply("现在连不上 OKX，没有执行任何操作。请稍后再试。")
+
+    def _tagged(self, command: Command) -> Command:
+        """A command the owner typed himself: "sized" when it opens on an instrument he had sized just before."""
+        if command.kind not in ("open", "close", "cancel", "stop"):
+            return command
+        sized = self._last_sizing
+        if (
+            command.kind == "open" and sized is not None and sized[0] == command.inst_id
+            and self._clock() - sized[1] <= sources.SIZING_SECONDS
+        ):  # fmt: skip
+            return replace(command, source="sized")
+        return replace(command, source="own")
 
     def _dispatch(self, command: Command, in_group: bool = False) -> Reply:
         kind = command.kind
@@ -829,7 +846,9 @@ class TradeDesk:
         if kind == "abort":
             return self._abort(command.note == REFUSED_NOTE)
         if kind == "size":
-            return self._size(command)
+            reply = self._size(command)
+            self._last_sizing = (command.inst_id, self._clock())
+            return reply
         if self._mode == "off":
             return Reply(self._off_text())
         if kind == "unclear":
@@ -901,7 +920,7 @@ class TradeDesk:
                 plan = self._plan(pending.command, previous=pending.plan)
             except Refused as exc:
                 return Reply(f"没有执行。{exc}")
-            return self._execute(plan)
+            return self._execute(plan, pending.command.source)
 
     def _selftest(self, inst_id: str = ""):
         from .selftest import SelfTest  # imported here because that module is built on this one
@@ -1530,6 +1549,9 @@ class TradeDesk:
         else:
             lines.append("止盈 无")
         lines.append(f"下单后 {inst_id} 的{word}单约 {_amt(total)} {settle}（上限 {cfg.trade_max_position_usd:,.0f}）")
+        track = self._source_line(cmd.source) if previous is None else ""
+        if track:
+            lines.append(track)
 
         args = {"inst_id": inst_id, "td_mode": td_mode, "side": side, "ord_type": cmd.ord_type, "sz": _plain(contracts)}
         if px is not None:
@@ -1545,6 +1567,17 @@ class TradeDesk:
         if sized:
             data["sized"] = sized
         return Plan("open", title, tuple(lines), (Step("place_order", args, "开仓"),), inst_id, data)
+
+    def _source_line(self, source: str) -> str:
+        """How orders that came the same way have done, once there are enough of them to say."""
+        if not source:
+            return ""
+        now = self._clock()
+        try:
+            return sources.preview_line(self._journal.reviews_between(now - sources.RECORD_DAYS * 86400, now + 1), source)
+        except Exception as exc:  # a figure for the preview never stops an order
+            log.warning("could not read the record of %s orders: %s", source, exc)
+            return ""
 
     def _risk_sized(
         self, direction: str, ref: Decimal, sl: Decimal | None, entry_name: str, equity: Decimal, spec: InstrumentSpec
@@ -1904,13 +1937,13 @@ class TradeDesk:
 
     # -------------------------------------------------------------- execution
 
-    def _execute(self, plan: Plan) -> Reply:
+    def _execute(self, plan: Plan, source: str = "") -> Reply:
         """Sends the steps of a confirmed plan and reports, truthfully, what happened."""
-        _, heading, template, lines = self._carry_out(plan)
+        _, heading, template, lines = self._carry_out(plan, source=source)
         body = "\n".join([f"**{plan.title}**", *(f"- {line}" for line in lines)])
         return Reply(body, title=f"{heading} · {MODE_LABELS[self._mode]}", template=template)
 
-    def _carry_out(self, plan: Plan, in_diary: bool = True) -> tuple[str, str, str, list[str]]:
+    def _carry_out(self, plan: Plan, in_diary: bool = True, source: str = "") -> tuple[str, str, str, list[str]]:
         """Sends the steps and keeps the record. Returns (ok | rejected | partial | unknown, heading, colour, lines).
         Every plan goes into the order record; `in_diary` says whether it is also a line of the day's events."""
         lines: list[str] = []
@@ -1946,6 +1979,7 @@ class TradeDesk:
         self._journal.record_order(
             self._mode, plan.action, plan.title, result, plan.inst_id,
             request=[{"call": step.call, **step.args} for step in plan.steps], detail="\n".join(lines), ts=now,
+            source=source,
         )  # fmt: skip
         if in_diary:
             tag = "[模拟盘] " if self._mode == "demo" else ""
