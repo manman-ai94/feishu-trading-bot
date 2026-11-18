@@ -371,7 +371,7 @@ def test_talk_about_trading_is_not_an_order(text):
         ("做多 XAU", "数量和单位"),
         ("做多 XAU 100", "多出来一个数字 100"),
         ("做多 XAU 100张 3850", "多出来一个数字 3850"),
-        ("做多 XAU 1手", "没有“手”"),
+        ("做多 BTC 1手", "只用在黄金上"),
         ("做多 XAU 50%", "百分比"),
         ("做多 BTC ETH 1张", "一个品种"),
         ("做多 XAU 100张 200张", "数量写了不止一个"),
@@ -788,11 +788,32 @@ def test_a_resting_limit_order_is_sized_from_its_own_price():
     assert (order["ord_type"], order["px"], order["sz"], order["sl_trigger_px"]) == ("limit", "3850", "10000", "3800")
 
 
-def test_a_risk_sized_open_that_breaks_a_limit_says_how_it_was_sized():
+def test_a_risk_sized_open_over_a_limit_is_cut_to_the_limit():
     bench = Bench(**roomy())
     text = bench.say("做多 XAU 止损 3860").text  # 500 over 20 is 25 XAU, about 97,000 USDT
     assert "最多开 25000 张（合 25 XAU）" in text
-    assert "超过了单笔上限 60,000" in text and "可以写一个更小的数量，或者把止损放远一点" in text
+    # 99% of 60,000 at 3,880 is 15.309 XAU: a hundredth spare for the price moving before the code
+    assert "这超过了单笔上限 60,000，按上限减到 15309 张（合 15.309 XAU）" in text
+    assert "数量 15309 张" in text and "确认 1111" in text
+    assert bench.say("确认 1111").title.startswith("已执行")
+    assert bench.sent[-1][1]["sz"] == "15309"
+
+
+def test_a_risk_sized_open_is_cut_to_what_the_position_limit_leaves():
+    bench = Bench(**roomy(trade_max_order_usd=200000.0))
+    text = bench.say("做多 XAU 止损 3860").text
+    assert "这超过了持仓上限 80,000 还剩的额度，按上限减到 20412 张" in text  # 99% of 80,000 at 3,880
+
+
+def test_a_stated_size_over_a_limit_is_refused_with_the_most_it_may_be():
+    bench = Bench(**roomy())
+    text = bench.say("做多 XAU 20个 止损 3860").text
+    assert "超过了单笔上限 60,000" in text and "这张单最多能开约 15463 张（合 15.463 XAU）" in text
+    assert bench.sent == []
+
+
+def test_a_risk_sized_open_says_how_it_was_sized_when_refused():
+    bench = Bench(**roomy())
     assert "多单的止损要低于现价" in bench.say("做多 XAU 止损 3900").text
     assert "最小的 1 张也会亏约 0.05 USDT" in Bench(risk_per_trade_pct=0.0001).say("做多 XAU 止损 3830").text
     assert bench.sent == []
@@ -1421,3 +1442,46 @@ def test_confirmation_codes_never_look_like_a_gold_price():
     assert all(len(code) == 4 and code.isdigit() for code in codes)
     assert not any(3000 <= int(code) <= 4999 for code in codes)
     assert any(int(code) < 3000 for code in codes) and any(int(code) >= 5000 for code in codes)
+
+
+def test_a_lot_of_gold_is_one_xau():
+    command = parser().parse("做多 XAU 12手 止损 3768")
+    assert (command.kind, command.unit, command.size) == ("open", "coins", Decimal(12))
+    assert parser(instruments=(XAU,)).parse("平仓 2手").unit == "coins"  # only gold is traded: no instrument needed
+    assert parser().parse("平仓 2手").kind == "unclear"  # gold or bitcoin: 手 means nothing on BTC
+    bench = Bench(**roomy())
+    assert "数量 12000 张（合 12 XAU）" in bench.say("限价做多 XAU 12手 3850 止损 3830").text
+
+
+@pytest.mark.parametrize(
+    "text, px, side, inst",
+    [
+        ("撤单 XAU 3788", Decimal(3788), "", XAU),
+        ("撤单 3788", Decimal(3788), "", ""),
+        ("撤单 XAU 挂在 3788 的单", Decimal(3788), "", XAU),
+        ("撤单 买单", None, "buy", ""),
+        ("撤单 XAU 卖单 3900", Decimal(3900), "sell", XAU),
+    ],
+)
+def test_cancel_by_price_or_side_is_read(text, px, side, inst):
+    command = parser().parse(text)
+    assert (command.kind, command.px, command.direction, command.inst_id) == ("cancel", px, side, inst)
+
+
+def test_cancelling_the_order_at_a_price():
+    exchange = FakeExchange()
+    resting(
+        exchange,
+        OrderInfo("590908157585625111", XAU, "buy", px=3788.0, sz=12000.0, state="live"),
+        OrderInfo("590908157585625222", XAU, "buy", px=3755.0, sz=100.0, state="live"),
+        OrderInfo("590908157585625333", XAU, "sell", px=3900.0, sz=100.0, state="live"),
+    )
+    bench = Bench(exchange)
+    preview = bench.say("撤单 XAU 3755").text
+    assert "撤单（1 张）" in preview and "590908157585625222" in preview and "625111" not in preview
+    bench.say("确认 1111")
+    assert bench.sent == [("cancel_order", {"inst_id": XAU, "ord_id": "590908157585625222"})]
+    refusal = bench.say("撤单 XAU 3700").text
+    assert "没有找到挂在 3700 的单" in refusal and "限价 3,788.0" in refusal
+    assert "订单号 590908157585625333" in bench.say("撤单 卖单").text
+    assert "590908157585625111" in bench.say("撤单 3788").text  # a short number is tried as a price too

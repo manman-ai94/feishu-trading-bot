@@ -10,6 +10,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from .alerts import AlertWatcher, PriceAlerts
 from .analyst import Analyst, Usage
 from .config import Config
 from .crowd import Crowd
@@ -240,9 +241,14 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
 
     desk = build_trade_desk(cfg, journal, okx, resolver, reporter)
     reporter.breaker_alert = desk.breaker_alert
+    alerts = PriceAlerts(
+        journal, okx, resolver, lambda: cfg.watch_instruments[0] if cfg.watch_instruments else "",
+        shares_with_group=lambda: reporter.group_shares_account, tz=cfg.tz,
+    )  # fmt: skip
     router = Router(
         cfg, feishu, okx, analyst, reporter, bot_open_id, save_setting=save_setting, restart=restart,
         resolver=resolver, knowledge=knowledge, usage=journal.usage_between, trade=desk, journal=journal,
+        alerts=alerts,
     )  # fmt: skip
     log.info("trading: %s (instruments: %s)", desk.mode, ", ".join(cfg.tradable_instruments))
     if cfg.trading_blocked:
@@ -275,6 +281,9 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         },
     )
     threading.Thread(target=scheduler.run_forever, args=(stop,), name="scheduler", daemon=True).start()
+    watcher = AlertWatcher(journal, okx, reporter.send_alert, tz=cfg.tz)
+    threading.Thread(target=watcher.run_forever, args=(stop,), name="alerts", daemon=True).start()
+    log.info("price alerts: %d active", len(journal.alerts("active")))
     if cfg.track_record:
         scorer = Scorer(journal, okx, cfg.track_window_hours)
         threading.Thread(target=scorer.run_forever, args=(stop,), name="track", daemon=True).start()

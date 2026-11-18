@@ -58,6 +58,8 @@ FAR_LIMIT_PCT = Decimal(30)  # a resting limit price further than this from the 
 CONFIRM_RISK_SLACK = Decimal("1.1")  # TRADE_MAX_RISK_PCT at the confirmation: a tenth over, for the price moving meanwhile
 ACCOUNT_CONFIG_TTL = 600.0
 ORDER_NOT_FOUND_CODES = {"51603"}  # OKX: the order does not exist
+CAP_SHARE = Decimal("0.99")  # a risk-sized order cut to the limits keeps a hundredth spare, for the price moving before the code
+PRICE_MATCH = Decimal("0.00001")  # "撤单 3788" finds the order resting within this share of 3788
 
 # A message with any of these is talk about trading, not an order.
 QUESTION_MARKS = (
@@ -137,8 +139,8 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 市价：“做多 XAU 100张”“做空 BTC 0.01个”“做多 XAU 500U”
 - 限价挂单：“限价做多 XAU 100张 3850”“挂单做空 BTC 0.01个 68000”
 - 随单带止损止盈：在后面加“止损 3860 止盈 3950”
-- 数量带单位：“张”是合约张数，“个”是币的数量（黄金就是盎司），“U”是仓位的名义价值，不是保证金
-- 只写止损不写数量：“做多 XAU 止损 3816”“限价做多 XAU 3850 止损 3820”，我按你定的单笔风险算数量，预览里写出怎么算的
+- 数量带单位：“张”是合约张数，“个”是币的数量（黄金就是盎司），“U”是仓位的名义价值，不是保证金。黄金也可以写“手”，1 手 = 1 XAU
+- 只写止损不写数量：“做多 XAU 止损 3816”“限价做多 XAU 3850 止损 3820”，我按你定的单笔风险算数量，预览里写出怎么算的；算出来超过单笔上限或持仓上限时，自动减到上限以内
 - “加仓 XAU 100张”：按现有仓位的方向再开
 
 **平仓**（都按市价）
@@ -147,7 +149,8 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 
 **挂单**
 - “挂单”看当前的挂单和止盈止损
-- “撤单 XAU”“撤单 全部”“撤单 订单号”
+- “撤单 XAU”“撤单 全部”“撤单 订单号”，或按价格撤：“撤单 XAU 3788”“撤单 3788”
+- 改挂单的价格：先撤单，再重新挂
 
 **止盈止损**（对整个仓位）
 - “止损 XAU 3860”“止盈 XAU 3950”“止损 XAU 3860 止盈 3950”
@@ -187,11 +190,11 @@ class Command:
 
     kind: str  # open | close | cancel | stop | orders | pause | resume | unbreak | settings | help | selftest | confirm | abort | unclear
     inst_id: str = ""
-    direction: str = ""  # open: long | short | same (加仓). close: long | short | "" (whichever there is)
+    direction: str = ""  # open: long | short | same (加仓). close: long | short | "" (whichever there is). cancel: buy | sell | ""
     ord_type: str = ""  # market | limit
     size: Decimal | None = None
     unit: str = ""  # contracts | coins | usd | fraction | risk (opening: sized from the stop and RISK_PER_TRADE_PCT)
-    px: Decimal | None = None
+    px: Decimal | None = None  # open: the limit price. cancel: the price of the resting order to cancel
     sl: Decimal | None = None
     tp: Decimal | None = None
     clear_sl: bool = False
@@ -414,15 +417,24 @@ class CommandParser:
             return Command("cancel")
         if rest.lower() in ("全部", "所有", "all", "全部挂单", "所有挂单"):
             return Command("cancel", everything=True)
-        if re.fullmatch(r"\d{6,}", rest):
+        if re.fullmatch(r"\d{6,}", rest):  # an order id; the plan also tries it as a price ("撤单 100500" on BTC)
             return Command("cancel", ord_id=rest)
         work, ids = self._without_instruments(rest)
-        leftover = _FILLER.sub(" ", work.replace("挂单", " ")).strip()
-        if len(ids) == 1 and not leftover:
-            return Command("cancel", inst_id=ids[0])
-        if len(rest) > 12:
+        if len(ids) > 1:
+            raise _Unclear("一条撤单只能写一个品种。")
+        side = ""
+        for word, value in (("买单", "buy"), ("卖单", "sell")):
+            if word in work:
+                side, work = value, work.replace(word, " ")
+        px, work = _take(_PX, work, "价格")
+        leftover = _FILLER.sub(" ", work.replace("挂单", " ").replace("那张", " ")).strip()
+        if px is None and leftover and _BARE_NUMBER.fullmatch(leftover):
+            px, leftover = Decimal(leftover), ""  # "撤单 XAU 3788": the order resting at 3788
+        if not leftover and (ids or px is not None or side):
+            return Command("cancel", inst_id=ids[0] if ids else "", px=px, direction=side)
+        if len(rest) > 16:
             return None
-        raise _Unclear("撤哪张单没看懂。可以发：撤单 XAU、撤单 全部，或 撤单 订单号。")
+        raise _Unclear("撤哪张单没看懂。可以发：撤单 XAU、撤单 XAU 3788（按价格）、撤单 全部，或 撤单 订单号。")
 
     def _sizing(self, rest: str) -> Command:
         """算仓位: arithmetic on the owner's own prices. Nothing is sent anywhere."""
@@ -526,7 +538,10 @@ class CommandParser:
                 raise _Unclear("“盎司”只用在黄金和白银上。其他品种请用 张、个 或 U。")
             unit = "coins"
         elif word == "手":
-            raise _Unclear("OKX 上没有“手”这个单位。请用 张（合约张数）、个（币的数量）或 U（名义价值）。")
+            gold_only = all(inst.split("-")[0] == "XAU" for inst in self._instruments())
+            if base != "XAU" and not (not base and gold_only):
+                raise _Unclear("“手”只用在黄金上（1 手 = 1 XAU）。其他品种请用 张（合约张数）、个（币的数量）或 U（名义价值）。")
+            unit = "coins"  # the owner's own convention: 1 手 of gold is 1 XAU
         elif word == "%":
             if not fraction_ok or value > 100:
                 raise _Unclear("百分比只能用在平仓上，而且不能超过 100%。")
@@ -650,6 +665,11 @@ def _round_to(value: Decimal, step: Decimal) -> Decimal:
 def _px(value, spec: InstrumentSpec) -> str:
     decimals = max(0, -spec.tick_sz.normalize().as_tuple().exponent)
     return f"{_dec(value):,.{decimals}f}"
+
+
+def _at_price(order: OrderInfo, px: Decimal) -> bool:
+    """Whether a resting order is the one at this price."""
+    return order.px is not None and abs(_dec(order.px) - px) <= px * PRICE_MATCH
 
 
 def _side_word(direction: str) -> str:
@@ -1415,13 +1435,6 @@ class TradeDesk:
             )
         value = contracts * per_contract * ref
 
-        smaller = "可以写一个更小的数量，或者把止损放远一点。" if sized else ""
-        if value > _dec(cfg.trade_max_order_usd):
-            raise Refused(
-                (f"{sized}。" if sized else "")
-                + f"这张单约 {_amt(value)} {settle}，超过了单笔上限 {cfg.trade_max_order_usd:,.0f}。{smaller}"
-                "上限在服务器 .env 的 TRADE_MAX_ORDER_USD，飞书里改不了。"
-            )
         side = "buy" if long else "sell"
         held_value = sum((self._value(p, spec) for p in same), Decimal(0))
         queued = Decimal(0)
@@ -1431,13 +1444,31 @@ class TradeDesk:
             if account.hedge_mode and order.pos_side != direction:
                 continue
             queued += _dec(order.remaining) * per_contract * _dec(order.px)
+        max_order, max_position = _dec(cfg.trade_max_order_usd), _dec(cfg.trade_max_position_usd)
+        if cmd.unit == "risk" and previous is None:
+            # Sized from the stop: when that comes to more than the limits allow, take as much as they allow.
+            room = min(max_order, max_position - held_value - queued)
+            if value > room:
+                capped = _floor_to(room * CAP_SHARE / (per_contract * ref), spec.lot_sz)
+                if capped >= spec.min_sz and capped > 0:
+                    which = f"单笔上限 {max_order:,.0f}" if room == max_order else f"持仓上限 {max_position:,.0f} 还剩的额度"
+                    sized += f"；这超过了{which}，按上限减到 {_contracts_text(capped, spec)}，打到止损时亏得也相应少"
+                    contracts, value = capped, capped * per_contract * ref
+
+        if value > max_order:
+            hint = f"这张单最多能开约 {_contracts_text(_floor_to(max_order / (per_contract * ref), spec.lot_sz), spec)}。"
+            raise Refused(
+                (f"{sized}。" if sized else "")
+                + f"这张单约 {_amt(value)} {settle}，超过了单笔上限 {cfg.trade_max_order_usd:,.0f}。{hint}"
+                "上限在服务器 .env 的 TRADE_MAX_ORDER_USD，飞书里改不了。"
+            )
         total = held_value + queued + value
-        if total > _dec(cfg.trade_max_position_usd):
+        if total > max_position:
             raise Refused(
                 (f"{sized}。" if sized else "")
                 + f"下了这张单，{inst_id} 的{word}单会到约 {_amt(total)} {settle}"
                 f"（现有 {_amt(held_value)}，挂单 {_amt(queued)}，这张 {_amt(value)}），"
-                f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。{smaller}"
+                f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。可以写一个更小的数量。"
                 "上限在服务器 .env 的 TRADE_MAX_POSITION_USD，飞书里改不了。"
             )
         opens = self._journal.count_opens(self._day_start(), self._clock() + 1, self._mode)
@@ -1714,11 +1745,28 @@ class TradeDesk:
         orders = [order for order in everything if order.inst_id in allowed]
         skipped = len(everything) - len(orders)
         if cmd.ord_id:
-            orders = [order for order in orders if order.ord_id == cmd.ord_id]
+            by_id = [order for order in orders if order.ord_id == cmd.ord_id]
+            if not by_id and len(cmd.ord_id) < 10:  # OKX's ids are longer: a short number may be a price
+                by_id = [order for order in orders if _at_price(order, Decimal(cmd.ord_id))]
+            orders = by_id
             if not orders:
                 raise Refused(f"没有找到订单号 {cmd.ord_id} 的挂单。发“挂单”可以看当前的挂单。")
         elif cmd.inst_id and cmd.inst_id not in allowed:
             raise Refused(f"{cmd.inst_id} 不在允许下单的品种里，我不动它的挂单。请在 OKX 里操作。")
+        if cmd.px is not None or cmd.direction:
+            matching = [
+                order for order in orders
+                if (cmd.px is None or _at_price(order, cmd.px))
+                and (not cmd.direction or order.side == cmd.direction)
+            ]  # fmt: skip
+            if not matching and previous is None:
+                which = " ".join(
+                    part for part in ((f"挂在 {_plain(cmd.px)}" if cmd.px is not None else ""),
+                                      {"buy": "的买单", "sell": "的卖单"}.get(cmd.direction, "的单" if cmd.px is not None else "")) if part
+                )  # fmt: skip
+                listing = "\n".join(f"- {self._order_line(order)}" for order in orders) or "现在没有挂单。"
+                raise Refused(f"没有找到{which}。现在的挂单：\n{listing}")
+            orders = matching
         if previous is not None:
             wanted = set(previous.data["ids"])
             orders = [order for order in orders if order.ord_id in wanted]
@@ -1726,7 +1774,7 @@ class TradeDesk:
                 raise Refused("预览里的挂单已经不在了（可能已经成交或被撤掉）。发“挂单”可以看现在的情况。")
         if not orders:
             raise Refused("现在没有可以撤的挂单。" + (f"（另有 {skipped} 张在不允许下单的品种上，我不动。）" if skipped else ""))
-        if not (cmd.ord_id or cmd.inst_id or cmd.everything) and len(orders) > 1 and previous is None:
+        if not (cmd.ord_id or cmd.inst_id or cmd.everything or cmd.px is not None or cmd.direction) and len(orders) > 1 and previous is None:
             listing = "\n".join(f"- {self._order_line(order)}" for order in orders)
             raise Refused(f"现在有 {len(orders)} 张挂单，请写明撤哪张：撤单 品种、撤单 订单号，或 撤单 全部。\n{listing}")
         lines = [self._order_line(order) for order in orders]

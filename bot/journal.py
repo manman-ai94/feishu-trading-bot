@@ -115,6 +115,27 @@ CREATE TABLE IF NOT EXISTS dialog (
     answer TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dialog_chat ON dialog (chat_id, ts);
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    inst_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    price REAL NOT NULL,
+    said TEXT NOT NULL DEFAULT '',
+    chat TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    done_ts INTEGER,
+    done_price REAL
+);
+CREATE TABLE IF NOT EXISTS wishes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'owner',
+    chat TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    note TEXT NOT NULL DEFAULT ''
+);
 """
 
 # Columns added after a table was first created: (table, column, declaration).
@@ -443,6 +464,72 @@ class Journal:
         with self._lock:
             self._db.execute("DELETE FROM dialog WHERE ts < ?", (int(ts),))
             self._db.commit()
+
+    # ---------------------------------------------------------------- alerts
+
+    def add_alert(
+        self, inst_id: str, direction: str, price: float, said: str = "", chat: str = "", ts: float | None = None
+    ) -> int:
+        """A price alert: `direction` is "below" or "above" `price`. Returns its number."""
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO alerts (ts, inst_id, direction, price, said, chat) VALUES (?, ?, ?, ?, ?, ?)",
+                (int(ts or time.time()), inst_id, direction, float(price), said, chat),
+            )
+            self._db.commit()
+            return int(cursor.lastrowid)
+
+    def alerts(self, status: str = "active") -> list[dict]:
+        """Price alerts with this status, oldest first."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM alerts WHERE status = ? ORDER BY id", (status,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def close_alert(self, alert_id: int, status: str, price: float | None = None, ts: float | None = None) -> bool:
+        """Marks an active alert fired, cancelled or expired. False when it was no longer active."""
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE alerts SET status = ?, done_ts = ?, done_price = ? WHERE id = ? AND status = 'active'",
+                (status, int(ts or time.time()), price, int(alert_id)),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    # ---------------------------------------------------------------- wishes
+
+    def add_wish(self, text: str, source: str = "owner", chat: str = "", ts: float | None = None) -> int:
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO wishes (ts, text, source, chat) VALUES (?, ?, ?, ?)",
+                (int(ts or time.time()), text, source, chat),
+            )
+            self._db.commit()
+            return int(cursor.lastrowid)
+
+    def wishes(self, since: float = 0, status: str | None = None) -> list[dict]:
+        """The owner's requests and suggestions recorded since `since`, oldest first."""
+        query, values = "SELECT * FROM wishes WHERE ts >= ?", [int(since)]
+        if status:
+            query += " AND status = ?"
+            values.append(status)
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY id", values).fetchall()
+        return [dict(row) for row in rows]
+
+    def dialog_between(self, start: float, end: float) -> list[dict]:
+        """Every question and answer kept for [start, end), all chats, oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT chat_id, ts, question, answer FROM dialog WHERE ts >= ? AND ts < ? ORDER BY ts, rowid",
+                (int(start), int(end)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_wish_status(self, wish_id: int, status: str, note: str = "") -> bool:
+        with self._lock:
+            cursor = self._db.execute("UPDATE wishes SET status = ?, note = ? WHERE id = ?", (status, note, int(wish_id)))
+            self._db.commit()
+            return cursor.rowcount > 0
 
     # -------------------------------------------------------------- settings
 

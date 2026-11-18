@@ -30,6 +30,8 @@ import time
 from collections import OrderedDict, deque
 from typing import Callable
 
+from . import wishes
+from .alerts import PriceAlerts
 from .analyst import Analyst, AnalystUnavailable
 from .config import Config
 from .feishu_client import FeishuClient, FeishuError, IncomingMessage
@@ -53,6 +55,8 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 主人专用：
 - 下单、平仓、撤单、设止盈止损：私聊里，或者在登记的群里 @我。每条指令我先回预览，你回复确认码才执行。发“交易帮助”看写法
 - 发“算仓位 XAU 止损 3768”：按你定的单笔风险算最多开多大，只算数不下单
+- 价格提醒：发“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了我马上告诉你（只提醒，不下单）。发“提醒”看已设的，“取消提醒 编号”取消
+- 发“记个诉求：……”，把想让我做到的事记下来；我做不到的事也会自动记。发“诉求清单”看记了什么
 - 问题前面加“深度”，我会多查几轮、分析得更细
 - 发“记住：……”，把交易规则、心得或资料存进资料库，以后回答时我会参考。发“资料”看资料库里有什么
 - 发“用量”，看今天和本月 AI 大约花了多少钱
@@ -70,8 +74,14 @@ TRADE_OTHER_GROUP_TEXT = "这个群没有登记，下单类指令只在私聊和
 # Words that make a message from the owner worth reading as an order, when no fixed pattern matched it.
 ORDER_WORDS = (
     "止损", "止盈", "平仓", "平掉", "平一半", "减仓", "加仓", "开仓", "做多", "做空", "开多", "开空", "平多", "平空",
-    "撤单", "撤掉", "挂", "清仓", "下单", "按你说的", "照你说的", "按刚才", "按计划", "照计划", "sl", "tp",
-)  # fmt: skip  # "按刚才的情景一挂上": the AI's rewrite takes the prices from the earlier answer
+    "撤单", "撤掉", "挂上", "挂单", "挂个", "挂一张", "挂一单", "开单", "清仓", "下单", "按你说的", "照你说的", "按刚才",
+    "按计划", "照计划", "按照", "照着", "sl", "tp",
+)  # fmt: skip  # "按照这个计划开单": the AI's rewrite takes the prices from the earlier answer
+# Words of someone still talking a plan over, not asking for it to be done: "把把握提到 60%，要确保单子挂上".
+DISCUSS_WORDS = (
+    "把握", "确保", "尽可能", "尽量", "讨论", "商量", "思路", "如果", "假如", "要是", "的话", "先别", "先不", "不要下",
+    "别下",
+)  # fmt: skip
 ORDER_WORDS_MAX_CHARS = 80
 COMMAND_HISTORY_TURNS = 3  # earlier answers the AI may take an order's prices from
 
@@ -137,6 +147,7 @@ class Router:
         trade=None,
         journal=None,
         later: Callable[[float, Callable[[], None]], Callable[[], None]] | None = None,
+        alerts: PriceAlerts | None = None,
     ):
         """`save_setting(name, value)` writes one line of .env, so a group the
         owner registers survives a restart. `restart()` ends the process; the
@@ -144,7 +155,8 @@ class Router:
         `usage(start, end)` returns the AI use between two moments. `trade` is
         the trade desk (trading.py), which reads the owner's order commands.
         `journal` holds the track record the owner can ask for. `later(seconds,
-        call)` runs a call after a delay and returns what cancels it."""
+        call)` runs a call after a delay and returns what cancels it. `alerts`
+        reads the owner's price alerts ("跌破 3800 提醒我")."""
         self._cfg = cfg
         self._save_setting = save_setting
         self._restart = restart
@@ -160,6 +172,7 @@ class Router:
         self._trade = trade
         self._journal = journal
         self._later = later or _call_later
+        self._alerts = alerts
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
@@ -268,12 +281,60 @@ class Router:
             self._reply_usage(message)
         elif lowered.startswith(RECORD_PREFIXES) and self._record_request(text) is not None:
             self._reply_record(message, *self._record_request(text))
+        elif wishes.is_list_request(text):
+            self._reply_wishes(message)
+        elif wishes.wish_body(text) is not None:
+            self._record_wish(message, wishes.wish_body(text))
+        elif _note_body(text) is not None:
+            self._learn(message, _note_body(text))
         else:
-            note = _note_body(text)
-            if note is None:
+            # Before the orders: "跌破 3800 提醒我平仓" asks to be told, never for a close.
+            alert = self._alerts.handle(text, message.chat_id) if self._alerts is not None else None
+            if alert is None:
                 return self._trade_command(message, text)
-            self._learn(message, note)
+            self._reply_alert(message, text, alert)
         return True
+
+    def _reply_alert(self, message: IncomingMessage, text: str, alert) -> None:
+        if alert.title:
+            self._feishu.reply_markdown(message.message_id, alert.title, alert.text, "orange")
+        else:
+            self._feishu.reply_text(message.message_id, alert.text)
+        self._remember_fixed(message.chat_id, text, alert.title, alert.text)
+
+    def _record_wish(self, message: IncomingMessage, body: str) -> None:
+        if self._journal is None:
+            self._feishu.reply_text(message.message_id, "这种运行方式没有记录诉求的地方。")
+            return
+        if not body:
+            self._feishu.reply_text(message.message_id, "把想让我做到的事写在后面，例如：记个诉求：跌破某个价位时提醒我。")
+            return
+        wish_id = wishes.record(self._journal, body, "owner", message.chat_id, self._clock())
+        reply = (
+            f"记下了（诉求 #{wish_id}）。会交给开发这个机器人的 Claude，每天看一次，做好了告诉你。发“诉求清单”看全部。"
+            if wish_id is not None
+            else "这条今天已经记过了。发“诉求清单”看全部。"
+        )
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember_fixed(message.chat_id, f"记个诉求：{body}", "", reply)
+
+    def _reply_wishes(self, message: IncomingMessage) -> None:
+        if self._journal is None:
+            self._feishu.reply_text(message.message_id, "这种运行方式没有记录诉求的地方。")
+            return
+        body = wishes.list_markdown(self._journal, self._clock(), self._cfg.tz)
+        self._feishu.reply_markdown(message.message_id, "诉求清单", body, "purple")
+        self._remember_fixed(message.chat_id, message.text.strip(), "诉求清单", body)
+
+    def _note_wish(self, chat_id: str, wish: str, source: str = "auto") -> bool:
+        """Records what this bot could not do or read. True when it went into the list."""
+        if self._journal is None or not wish:
+            return False
+        try:
+            return wishes.record(self._journal, wish, source, chat_id, self._clock()) is not None
+        except Exception:
+            log.exception("could not record a wish")
+            return False
 
     def _trade_command(self, message: IncomingMessage, text: str) -> bool:
         """Order commands: the trade desk reads them by fixed patterns, never the AI."""
@@ -290,7 +351,11 @@ class Router:
         if (reply is None or reply.unclear) and not refused_here and self._sounds_like_an_order(text):
             # "止损减两点": an order the patterns could not read in full. The AI may make it out from the
             # current stop; when it cannot either, the desk's own question stands.
-            reply = self._order_in_own_words(text, message.chat_id, in_group=not message.is_private) or reply
+            understood = self._order_in_own_words(text, message.chat_id, in_group=not message.is_private)
+            if understood is None and reply is not None and reply.unclear:
+                # Neither could read it: worth a look at how he puts his orders.
+                self._note_wish(message.chat_id, f"下单的话没看懂：{text}", "unclear")
+            reply = understood or reply
         if reply is None:
             return False
         if reply.title:
@@ -307,6 +372,8 @@ class Router:
         lowered = text.lower()
         if any(word in text for word in QUESTION_WORDS):
             return False  # "有没有必要平仓，还是再等等" asks for a view, it does not ask for a close
+        if any(word in text for word in DISCUSS_WORDS):
+            return False  # "把把握提到 60%，要确保单子挂上" talks the plan over; the AI answers it
         return any(word in lowered for word in ORDER_WORDS)
 
     def _order_in_own_words(self, text: str, chat_id: str, in_group: bool):
@@ -556,6 +623,9 @@ class Router:
             done()
         log.info("answered in %.0f seconds", self._clock() - started)
         title, body = split_title(answer)
+        body, wish = wishes.take_ai_wish(body)
+        if wish and is_owner and self._note_wish(message.chat_id, wish):
+            body += "\n\n（这件事已记进诉求清单。）"
         self._remember(message.chat_id, text, body)
         footer = DISCLAIMER if in_group else None
         if is_plain(body):

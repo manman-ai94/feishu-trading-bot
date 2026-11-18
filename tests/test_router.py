@@ -2,7 +2,9 @@
 from __future__ import annotations
 import pytest
 
+from bot.alerts import PriceAlerts
 from bot.analyst import AnalystUnavailable
+from bot.instruments import InstrumentResolver
 from bot.journal import Journal
 from bot.monitor import Monitor
 from bot.okx_client import OkxNetworkError
@@ -50,10 +52,14 @@ class Bench:
                 self.cfg, journal, self.okx, exchange, FakeResolver(), self.clock, sleep=lambda seconds: None,
                 new_code=lambda: "4821", new_id=lambda: "ftb0001",
             )  # fmt: skip
+        self.alerts = PriceAlerts(
+            journal, self.okx, InstrumentResolver(self.okx, self.clock), lambda: "XAU-USDT-SWAP",
+            lambda: self.reporter.group_shares_account, self.clock,
+        )  # fmt: skip
         self.router = Router(
             self.cfg, self.feishu, self.okx, self.analyst, self.reporter, bot_open_id, self.clock,
             save_setting=lambda name, value: self.saved.append((name, value)), restart=self._restart,
-            knowledge=knowledge, usage=usage, trade=self.desk, journal=journal, later=self._later,
+            knowledge=knowledge, usage=usage, trade=self.desk, journal=journal, later=self._later, alerts=self.alerts,
         )  # fmt: skip
 
     def _restart(self):
@@ -1064,3 +1070,97 @@ def test_everything_the_owner_can_do_in_private_he_can_do_in_the_group_with_the_
     assert [c["earlier"] for c in private[2]] == [c["earlier"] for c in group[2]]
     assert private[3] == group[3] == 1
     assert any(title.startswith("已执行") for title, _ in group[0])  # the order went through from the group too
+
+
+# ------------------------------------------------- price alerts and requests
+
+
+def test_the_owner_sets_a_price_alert_in_either_chat():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    [reply] = bench.say("跌破 2600 提醒我")
+    assert reply.how == "reply_text" and "好，XAU 跌破 2,600 时提醒你（现价 2,650）" in reply.body
+    [reply] = bench.say("黄金涨到 2700 提醒我", private=False)
+    assert "XAU 涨破 2,700" in reply.body
+    assert len(bench.journal.alerts()) == 2
+    assert bench.analyst.calls == [] and bench.exchange.changes == []
+    [listing] = bench.say("提醒")
+    assert listing.title == "价格提醒（2 条）"
+
+
+def test_an_alert_with_an_order_word_only_tells():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.analyst.command = "平仓 XAU"
+    [reply] = bench.say("跌破 2600 提醒我平仓")
+    assert "XAU 跌破 2,600 时提醒你" in reply.body and "不会下单" in reply.body
+    assert bench.analyst.named("to_command") == [] and not reply.title.startswith("下单预览")
+
+
+def test_only_the_owner_sets_alerts():
+    bench = Bench(group_owner_only=False, group_show_pnl=True)
+    [reply] = bench.say("跌破 2600 提醒我", sender=FRIEND, private=False)
+    assert "提醒你" not in reply.body
+    assert bench.journal.alerts() == []
+
+
+def test_the_owner_records_a_request_and_lists_them():
+    bench = Bench()
+    [reply] = bench.say("记个诉求：一次挂好几档，总风险按 25% 算")
+    assert "记下了（诉求 #1）" in reply.body
+    assert "今天已经记过了" in bench.say("记个诉求：一次挂好几档，总风险按 25% 算", message_id="again")[0].body
+    bench.say("建议：盘前简报再短一点", private=False)
+    [listing] = bench.say("诉求清单")
+    assert listing.title == "诉求清单" and "一次挂好几档" in listing.body and "盘前简报再短一点" in listing.body
+    assert bench.analyst.calls == []
+    assert bench.say("建议止损放哪")  # asks for advice: the AI answers it
+    assert bench.analyst.named("answer")
+
+
+def test_what_the_ai_says_it_cannot_do_goes_into_the_requests():
+    bench = Bench()
+    bench.analyst.reply = "现在做不到按时间提醒，可以先设价格提醒。\n诉求：明早 8 点提醒他看 CPI"
+    [reply] = bench.say("明早8点提醒我看CPI")
+    assert "诉求：" not in reply.body and "已记进诉求清单" in reply.body
+    [wish] = bench.journal.wishes()
+    assert (wish["text"], wish["source"]) == ("明早 8 点提醒他看 CPI", "auto")
+    friend = Bench(group_owner_only=False)
+    friend.analyst.reply = "做不到。\n诉求：按时间提醒"
+    [reply] = friend.say("明早8点提醒我", sender=FRIEND, private=False)
+    assert "诉求" not in reply.body and friend.journal.wishes() == []
+
+
+def test_an_order_neither_could_read_is_recorded():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.say("止损 XAU")
+    [wish] = bench.journal.wishes()
+    assert wish["text"] == "下单的话没看懂：止损 XAU" and wish["source"] == "unclear"
+
+
+def test_talking_a_plan_over_is_not_taken_for_an_order():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    bench.analyst.command = "限价做多 XAU 3850 止损 3820"
+    [reply] = bench.say("把你的把握提到60%，然后要确保单子尽可能地挂上")
+    assert bench.analyst.named("to_command") == [] and bench.analyst.named("answer")
+    assert not reply.title.startswith("下单预览")
+    [preview] = bench.say("按照这个计划开单")
+    assert bench.analyst.named("to_command") and preview.title.startswith("下单预览")
+
+
+def test_the_ai_sees_how_the_bots_recent_orders_went():
+    bench = Bench()
+    bench.journal.record_order(
+        "live", "open", "市价做多 XAU-USDT-SWAP", "rejected", "XAU-USDT-SWAP",
+        detail="OKX 拒绝了：API key 没有这个币种的权限（代码 50123）", ts=bench.clock() - 3600,
+    )  # fmt: skip
+    bench.journal.record_order("demo", "cancel", "撤单（1 张）", "ok", ts=bench.clock() - 3 * 86400)
+    text = bench.reporter.account_for_ai()
+    assert "实盘 市价做多 XAU-USDT-SWAP：没有执行。OKX 拒绝了：API key 没有这个币种的权限（代码 50123）" in text
+    assert "撤单（1 张）" not in text  # three days ago
+
+
+def test_the_ai_is_told_what_can_be_done_in_feishu():
+    from bot.analyst import ANALYST_SYSTEM as SYSTEM_PROMPT
+    from bot.analyst import COMMAND_SYSTEM
+
+    assert "不要说只能去 OKX 的 App 里操作" in SYSTEM_PROMPT and "撤单 XAU 3788" in SYSTEM_PROMPT
+    assert "跌破 3800 提醒我" in SYSTEM_PROMPT and "诉求：" in SYSTEM_PROMPT
+    assert "把把握提到 60%" in COMMAND_SYSTEM and "1 手 = 1 个" in COMMAND_SYSTEM

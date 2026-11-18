@@ -12,6 +12,7 @@
     python -m bot trading       print how placing orders is set up: mode, limits, what the key may do
     python -m bot record        print the track record: the AI's levels against what the market did
     python -m bot account       print the account, positions and waiting orders exactly as the AI is shown them
+    python -m bot wishes 1      print the owner's requests of the last day (--dialog adds the chats)
     python -m bot eval          ask the eval questions, score each answer, compare with the last run (costs money)
 """
 from __future__ import annotations
@@ -201,6 +202,18 @@ def print_record(cfg: Config, days: int) -> int:
         print("还没有记录：机器人还没有运行过。")
         return 0
     print(scorecard_markdown(Journal(cfg.db_path), time.time(), cfg.tz, days, None, cfg.track_window_hours).replace("**", ""))
+    return 0
+
+
+def print_wishes(cfg: Config, days: float, with_dialog: bool) -> int:
+    """The owner's requests channel, for the developer's daily look. Reads the journal only; costs nothing."""
+    from .journal import Journal
+    from .wishes import dump_text
+
+    if not cfg.db_path.exists():
+        print("还没有记录：机器人还没有运行过。")
+        return 0
+    print(dump_text(Journal(cfg.db_path), time.time(), cfg.tz, days, with_dialog, cfg.group_chat_id))
     return 0
 
 
@@ -407,6 +420,9 @@ def main(argv: list[str] | None = None) -> int:
     account.add_argument("--fields", action="store_true", help="另外列出 OKX 每张挂单返回的字段名（只有名字，没有值）")
     record = commands.add_parser("record", help="打印成绩单：AI 给过的点位和事后的行情对照（只读取记录，不花钱）")
     record.add_argument("days", nargs="?", type=int, default=30)
+    wishes = commands.add_parser("wishes", help="打印主人的诉求清单（--dialog 连同私聊和群里的问答），给开发的人每天看（只读取记录，不花钱）")
+    wishes.add_argument("days", nargs="?", type=float, default=1.0)
+    wishes.add_argument("--dialog", action="store_true", help="连同这几天私聊和群里的问答一起打印")
     commands.add_parser(
         "replay", help="把 scripts/replay-group.txt 里群里问过的问题按主人在群里 @我 的样子重放，只打印回答（不发飞书、不下单，AI 调用照常计费）"
     )
@@ -442,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
         return print_record(cfg, max(1, min(365, args.days)))
     if args.command == "account":
         return print_account(cfg, args.fields)
+    if args.command == "wishes":
+        return print_wishes(cfg, max(0.1, min(30.0, args.days)), args.dialog)
     if args.command == "replay":
         from .replay import replay
 

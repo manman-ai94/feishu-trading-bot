@@ -36,10 +36,29 @@ EVENT_COLOURS = {
     "okx_recovered": "green",
 }
 RISK_KINDS = ("margin_warning", "liq_warning", "daily_loss", "no_stop", "risk_level")
+RECENT_ORDERS_HOURS = 24
+RECENT_ORDERS_SHOWN = 8
+RESULT_NAMES = {"ok": "已执行", "rejected": "没有执行", "partial": "只执行了一部分", "unknown": "结果不确定"}
 
 
 def _usd(value: float | None) -> str:
     return "未知" if value is None else f"{value:,.2f} USD"
+
+
+def recent_orders_text(rows: list[dict], tz) -> str:
+    """What the bot sent to OKX on the owner's code lately, and how each went, for the AI: so that
+    "刚才那单怎么没成" is answered from the record, OKX's own reason included, and not guessed."""
+    if not rows:
+        return ""
+    lines = [f"机器人最近 {RECENT_ORDERS_HOURS} 小时按他的确认码发给 OKX 的指令（结果是 OKX 的原话）："]
+    for row in rows[-RECENT_ORDERS_SHOWN:]:
+        when = datetime.fromtimestamp(row["ts"], tz=tz).strftime("%m-%d %H:%M")
+        mode = "模拟盘" if row["mode"] == "demo" else "实盘"
+        detail = row["detail"].replace("\n", "；")
+        if len(detail) > 200:
+            detail = detail[:200] + "……"
+        lines.append(f"- {when} {mode} {row['summary']}：{RESULT_NAMES.get(row['result'], row['result'])}。{detail}")
+    return "\n".join(lines)
 
 
 class Reporter:
@@ -131,7 +150,23 @@ class Reporter:
         except Exception:  # the orders sit beside the account: an answer is never held up for them
             log.exception("could not write out the waiting orders for the AI")
             orders = "挂着的委托：这次没读到，不要猜，直接说没读到。"
-        return text + "\n" + orders
+        now = self._clock()
+        try:
+            sent = recent_orders_text(self._journal.orders_between(now - RECENT_ORDERS_HOURS * 3600, now + 1), self._cfg.tz)
+        except Exception:
+            log.exception("could not read the bot's recent orders for the AI")
+            sent = ""
+        return text + "\n" + orders + ("\n" + sent if sent else "")
+
+    def send_alert(self, title: str, markdown: str) -> None:
+        """A price alert the owner set: to him, and to the group when he shares the account there.
+        Raises when the owner could not be told, so the alert stays and is tried again."""
+        self.to_owner(title, markdown, "orange")
+        if self.group_shares_account:
+            try:
+                self.to_group(title, markdown, "orange", footer=DISCLAIMER)
+            except Exception:
+                log.exception("could not send a price alert to the group")
 
     def history_for_ai(self, days: int) -> str:
         """Positions closed in the last `days` days: how each closed and what it made, from OKX's own records."""
