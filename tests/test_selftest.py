@@ -252,6 +252,8 @@ def test_while_trading_live_it_runs_on_the_demo_keys_and_never_touches_the_real_
     assert {row["mode"] for row in bench.rows()} == {"demo"}
     assert bench.journal.count_opens(0, 2_000_000_000, "live") == 0
     assert bench.desk.mode == "live"  # the desk itself stays on the real account
+    line = next(line for line in bench.desk.status_lines() if line.startswith("**模拟盘自测**"))
+    assert "上通过" in line and "实盘时用 .env 里模拟盘的 key 跑" in line
 
 
 def test_a_rehearsal_client_that_is_not_on_demo_trading_is_refused():

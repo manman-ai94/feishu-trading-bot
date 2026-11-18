@@ -464,6 +464,9 @@ def test_the_settings_say_where_orders_are_taken_and_the_risk_rule():
     assert "**单笔风险**：权益的 1%" in settings
     assert "GROUP_TRADING=false" in Bench(group_trading=False).say("交易设置").text
     assert "还没有登记群" in Bench(group_chat_id="").say("交易设置").text
+    assert "没有设账户总风险上限（TRADE_MAX_TOTAL_RISK_PCT）" in settings
+    capped = Bench(trade_max_total_risk_pct=25.0).say("交易设置").text
+    assert "所有止损都打到合计最多亏权益的 25%，加上新单会超过就不执行（TRADE_MAX_TOTAL_RISK_PCT）" in capped
 
 
 def test_where_orders_are_not_taken_the_desk_says_so_and_does_nothing():

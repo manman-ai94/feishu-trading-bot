@@ -1238,6 +1238,10 @@ class TradeDesk:
             lines.append(f"- 开仓的止损触发时最多亏权益的 {cfg.trade_max_risk_pct:g}%，超过就不执行（TRADE_MAX_RISK_PCT）")
         else:
             lines.append("- 没有设开仓止损的亏损上限（TRADE_MAX_RISK_PCT）")
+        if cfg.trade_max_total_risk_pct is not None:
+            lines.append(f"- 所有止损都打到合计最多亏权益的 {cfg.trade_max_total_risk_pct:g}%，加上新单会超过就不执行（TRADE_MAX_TOTAL_RISK_PCT）")
+        else:
+            lines.append("- 没有设账户总风险上限（TRADE_MAX_TOTAL_RISK_PCT）")
         lines.append(f"**OKX key**（{self._account_label()}）")
         try:
             account = self._okx.account_config()
@@ -1254,7 +1258,10 @@ class TradeDesk:
                 lines.append(f"- 账户模式：{account.level_name}")
         if self._mode != "off":
             lines.extend(self._funds_lines())
-        lines.append(f"**模拟盘自测**：{self._selftest().last_text()}")
+        where = ""
+        if self._mode == "live":
+            where = "。实盘时用 .env 里模拟盘的 key 跑" if self._demo_trader is not None else "。实盘时要 .env 里有模拟盘的 key 才能跑，现在没有"
+        lines.append(f"**模拟盘自测**：{self._selftest().last_text()}{where}")
         lines.append("限额、品种名单和开放哪些操作只能在服务器的 .env 里改，飞书里改不了。")
         return lines
 
