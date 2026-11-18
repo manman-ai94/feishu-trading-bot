@@ -93,4 +93,15 @@ def test_marked_requests_and_the_card_of_the_version_that_did_them():
     assert releases.news_text(journal, "0.14.1") == news  # until the card went out
     releases.told(journal, "0.14.1")
     assert releases.news_text(journal, "0.14.1") == ""
+    assert "分档挂单" in releases.news_text(journal, "9.9.9")  # 0.15.0 was skipped on the way: its news is told
+    releases.told(journal, "0.15.0")
     assert releases.news_text(journal, "9.9.9") == ""  # a version with no notes and nothing done says nothing
+
+
+def test_a_version_installed_over_a_skipped_one_tells_both():
+    journal = Journal(":memory:")
+    news = releases.news_text(journal, "0.15.0")  # straight from 0.13.0, which never set the running version
+    assert news.startswith("**已更新到 v0.15.0**\n- 每张单都记下来源")
+    assert news.index("每张单都记下来源") < news.index("账户总风险") and "模拟盘自测扩到 13 步" in news
+    releases.told(journal, "0.14.1")
+    assert "每张单都记下来源" not in releases.news_text(journal, "0.15.0")

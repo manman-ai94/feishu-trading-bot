@@ -91,6 +91,11 @@ class OkxClient:
 
     # ------------------------------------------------------------------ core
 
+    @property
+    def demo(self) -> bool:
+        """Talks to OKX demo trading (the x-simulated-trading header)."""
+        return self._demo
+
     def _headers(self, method: str, request_path: str, auth: bool, body: str = "") -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self._demo:

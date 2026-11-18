@@ -133,6 +133,8 @@ class FakeExchange:
             px=None if market else float(order["px"]), sz=float(order["sz"]), filled_sz=float(order["sz"]) if market else 0.0,
             avg_px=self.last[order["inst_id"]] if market else None, state="filled" if market else "live",
             reduce_only=bool(order.get("reduce_only")), cl_ord_id=order["cl_ord_id"],
+            sl_trigger_px=float(order["sl_trigger_px"]) if order.get("sl_trigger_px") else None,
+            tp_trigger_px=float(order["tp_trigger_px"]) if order.get("tp_trigger_px") else None,
         )  # fmt: skip
         self.orders[info.ord_id] = info
         if not market:

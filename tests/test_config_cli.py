@@ -300,7 +300,7 @@ def test_the_demo_keys_stay_out_of_the_config_repr(tmp_path):
 
 
 def test_the_order_client_exists_only_when_trading_is_on(tmp_path):
-    from bot.app import build_okx, build_trader
+    from bot.app import build_demo_trader, build_okx, build_trader
     from bot.okx_trade import OkxTradeClient
 
     off, _ = load_config(write_env(tmp_path, LIVE_KEYS + DEMO_KEYS))
@@ -322,6 +322,15 @@ def test_the_order_client_exists_only_when_trading_is_on(tmp_path):
     live, _ = load_config(write_env(tmp_path, "TRADING=live\n" + LIVE_KEYS + DEMO_KEYS))
     trader = build_trader(live)
     assert not trader._demo and trader._api_key == "k"
+    rehearsal = build_demo_trader(live)  # while live, the rehearsal has a client of its own on the demo account
+    assert rehearsal.demo and rehearsal._api_key == "dk"
+    assert build_demo_trader(demo) is None and build_demo_trader(off) is None
+
+    for name in list(os.environ):
+        if name.startswith(PREFIXES):
+            del os.environ[name]
+    live_only, _ = load_config(write_env(tmp_path, "TRADING=live\n" + LIVE_KEYS))
+    assert build_demo_trader(live_only) is None
 
 
 def test_trading_command_prints_the_setup_and_writes_nothing(tmp_path, monkeypatch, capsys):

@@ -19,14 +19,33 @@ NOTES: dict[str, tuple[str, ...]] = {
         "你的诉求做好了，上线卡片会告诉你；也可以自己发“诉求 3 做好了”或“诉求 3 不做了”标掉一条",
         "装新版本改成一键部署：先备份、跑测试，启动不正常就自动退回上一版",
     ),
+    "0.15.0": (
+        "账户总风险：所有止损都打到合计亏多少（没止损的按到强平价算，等成交的挂单和突破单也算），开仓预览和“仓位”卡片都写；"
+        "超过你定的上限就不执行，只写止损不写数量的自动减到放得下",
+        "加仓带止损时，整个仓位合成一张止损；已经有好几张止损的，发“止损 XAU 价格”合成一张",
+        "突破单：“涨破 3900 做多 XAU 止损 3870”，价格到了按市价进场，没到一直挂着；“撤单 XAU 3900”按触发价撤",
+        "分档挂单：“分档做多 XAU 3850 3830 3810 止损 3790”，最多 5 档；不写数量时几档全成交再打到止损合计亏你定的单笔风险",
+        "开仓预览多一行粗估强平价，止损在强平价外面会提醒你",
+        "模拟盘自测扩到 13 步，实盘时也能跑：用 .env 里模拟盘的 key，不碰实盘账户",
+    ),
 }
+
+
+def _key(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return ()
 
 
 def news_text(journal, version: str = __version__) -> str:
     """For the start-up card: what changed, until a card for this version has gone out (see `told`)."""
-    if journal.get_setting(RUNNING_VERSION, "") == version:
+    before = journal.get_setting(RUNNING_VERSION, "")
+    if before == version:
         return ""
-    notes = NOTES.get(version, ())
+    # A version skipped on the way (installed straight from an older one) still has its news told.
+    skipped = [v for v in sorted(NOTES, key=_key) if _key(before or "0") < _key(v) < _key(version)]
+    notes = [note for v in skipped for note in NOTES[v]] + list(NOTES.get(version, ()))
     lines = [f"**已更新到 v{version}**"] + [f"- {note}" for note in notes]
     done = wishes.done_in(journal, version)
     if done:

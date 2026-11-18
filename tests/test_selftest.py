@@ -1,4 +1,4 @@
-"""The demo rehearsal: one command, eight steps, each read back from the exchange."""
+"""The demo rehearsal: one command, thirteen steps, each read back from the exchange."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,7 @@ import pytest
 from bot import __version__
 from bot.models import OrderInfo, StopOrder
 from bot.okx_client import OkxError, OkxNetworkError
-from bot.selftest import CHECK_TRIES, SETTING, STEPS
+from bot.selftest import CHECK_TRIES, OPENS, SETTING, STEPS
 from bot.trading import PAUSED_SETTING, Command, CommandParser
 
 from .helpers import make_position
@@ -83,7 +83,7 @@ def calls(bench: Bench) -> list[str]:
 
 
 def empty(exchange: Demo) -> bool:
-    return not exchange.positions and not exchange.pending and not exchange.pending_stops()
+    return not exchange.positions and not exchange.pending and not exchange.pending_stops() and not exchange.algos
 
 
 def last_run(bench: Bench) -> dict:
@@ -123,34 +123,46 @@ def test_it_is_not_run_where_orders_are_not_taken():
 # --------------------------------------------------------------------- a full run
 
 
-def test_all_eight_steps_are_sent_checked_and_cleared_away():
+def test_every_step_is_sent_checked_and_cleared_away():
     bench = Bench(Demo())
     reply = bench.run("模拟盘自测")
     assert reply.title == "模拟盘自测 · 通过" and reply.template == "green"
     assert f"{STEPS} 步都通过" in reply.text and reply.text.count("✅") == STEPS and "❌" not in reply.text
     assert calls(bench) == [
-        "place_order", "place_stop", "amend_stop", "place_order", "cancel_stops", "place_stop", "place_order",
-        "cancel_order", "close_position",
+        "place_order", "place_stop", "amend_stop", "place_order", "cancel_stops", "place_stop",
+        "place_order", "amend_stop",  # the addition goes without a stop of its own; the whole-position stop moves
+        "place_order", "cancel_order",
+        "place_trigger", "cancel_stops",
+        "place_order", "place_order", "cancel_order", "cancel_order",
+        "close_position",
     ]  # fmt: skip
-    opened, reduced, resting = bench.exchange.named("place_order")
+    opened, reduced, added, resting, near, far = bench.exchange.named("place_order")
     assert (opened["side"], opened["ord_type"], opened["sz"]) == ("buy", "market", "2")
     assert (reduced["side"], reduced["sz"], reduced["reduce_only"]) == ("sell", "1", True)
+    assert (added["side"], added["ord_type"], added["sz"]) == ("buy", "market", "1") and "sl_trigger_px" not in added
     assert (resting["side"], resting["ord_type"], resting["sz"], resting["px"]) == ("buy", "limit", "1", "3763.6")
+    assert [(o["px"], o["sz"], o["sl_trigger_px"]) for o in (near, far)] == [("3763.6", "1", "3650.3"), ("3724.8", "1", "3650.3")]
     first, second = bench.exchange.named("place_stop")
     assert (first["sl_trigger_px"], first["tp_trigger_px"]) == ("3802.4", "3957.6")
     assert second["sl_trigger_px"] == "3821.8" and "tp_trigger_px" not in second
-    assert bench.exchange.named("amend_stop")[0]["sl_trigger_px"] == "3821.8"
+    moved, merged = bench.exchange.named("amend_stop")
+    assert moved["sl_trigger_px"] == "3821.8" and merged["sl_trigger_px"] == "3810.2"
+    [breakout] = bench.exchange.named("place_trigger")
+    assert (breakout["side"], breakout["trigger_px"], breakout["sz"], breakout["sl_trigger_px"]) == ("buy", "3996.4", "1", "3802.4")
     assert empty(bench.exchange)
     assert "止损 3,821.8，止盈 3,957.6" in reply.text and "止损 3,821.8，止盈 无" in reply.text
+    assert "第 6 步 加仓合成一张止损" in reply.text and "多单 2 张，止损 3,810.2，止盈 无" in reply.text
+    assert "突破单触发价 3,996.4，1 张，带止损 3,802.4" in reply.text and "已撤：突破单" in reply.text
+    assert "买单挂在 3,763.6、3,724.8，各 1 张，都带止损 3,650.3" in reply.text
 
 
-def test_a_run_is_in_the_order_record_and_counts_as_two_openings():
+def test_a_run_is_in_the_order_record_and_counts_its_openings():
     bench = Bench(Demo())
     bench.run("模拟盘自测")
     rows = bench.rows()
     assert len(rows) == STEPS and all(row["summary"].startswith("自测：") for row in rows)
     assert {row["mode"] for row in rows} == {"demo"} and {row["result"] for row in rows} == {"ok"}
-    assert bench.journal.count_opens(0, 2_000_000_000, "demo") == 2
+    assert bench.journal.count_opens(0, 2_000_000_000, "demo") == OPENS == 5
     # The day's events get one line for the whole run, so the evening brief is not eight lines longer.
     events = bench.journal.events_between(0, 2_000_000_000)
     assert [event["summary"] for event in events] == [f"[模拟盘] 下单自测：{STEPS} 步都通过"]
@@ -194,7 +206,7 @@ def test_with_stops_required_the_orders_carry_one(setting):
     bench = Bench(Demo(), **setting)
     reply = bench.run("模拟盘自测")
     assert reply.title == "模拟盘自测 · 通过", reply.text
-    opened, _, resting = bench.exchange.named("place_order")
+    opened, _, _, resting, *_ = bench.exchange.named("place_order")
     assert opened["sl_trigger_px"] == "3802.4" and resting["sl_trigger_px"] == "3688.3"
     # The stop that came with the order is replaced by one with a take-profit: cancel, then place.
     assert calls(bench)[:3] == ["place_order", "cancel_stops", "place_stop"]
@@ -207,7 +219,7 @@ def test_a_broken_connection_on_the_first_order_is_looked_up_not_repeated():
     bench = Bench(exchange)
     reply = bench.run("模拟盘自测")
     assert reply.title == "模拟盘自测 · 通过"
-    assert len(exchange.named("place_order")) == 3
+    assert len(exchange.named("place_order")) == 6
 
 
 def test_a_slow_read_is_tried_again():
@@ -228,6 +240,29 @@ def test_never_on_the_real_account():
     assert bench.sent == []
 
 
+def test_while_trading_live_it_runs_on_the_demo_keys_and_never_touches_the_real_account():
+    real, demo = Demo(), Demo()
+    bench = Bench(real, trading="live")
+    bench.desk._demo_trader = demo  # what the app gives the desk when the demo keys are in .env
+    preview = bench.say("模拟盘自测")
+    assert "现在是实盘，所以用 .env 里模拟盘的 key" in preview.text
+    reply = bench.say("确认 1111")
+    assert reply.title == "模拟盘自测 · 通过", reply.text
+    assert real.changes == [] and len(demo.changes) == 17
+    assert {row["mode"] for row in bench.rows()} == {"demo"}
+    assert bench.journal.count_opens(0, 2_000_000_000, "live") == 0
+    assert bench.desk.mode == "live"  # the desk itself stays on the real account
+
+
+def test_a_rehearsal_client_that_is_not_on_demo_trading_is_refused():
+    real, demo = Demo(), Demo()
+    demo.demo = False  # the header that sends it to demo trading is missing
+    bench = Bench(real, trading="live")
+    bench.desk._demo_trader = demo
+    assert "只在模拟盘上跑" in bench.say("模拟盘自测").text
+    assert real.changes == [] and demo.changes == []
+
+
 def test_with_trading_off_it_says_so():
     bench = Bench(Demo(), trading="off")
     assert "下单功能现在是关着的" in bench.say("模拟盘自测").text
@@ -237,7 +272,7 @@ def test_with_trading_off_it_says_so():
     "cfg, words",
     [
         (dict(trade_actions=("stops", "close")), "没有开放：撤单、限价挂单、市价开仓和加仓"),
-        (dict(trade_max_opens_per_day=1), "自测要开仓 2 次"),
+        (dict(trade_max_opens_per_day=4), "自测要开仓 5 次"),
         (dict(trade_max_order_usd=5.0), "超过了单笔上限"),
         (dict(trade_instruments=(BTC,)), "不在允许下单的品种里"),
     ],
@@ -262,18 +297,20 @@ def test_not_on_a_spot_only_account():
     assert "现货模式" in bench.say("模拟盘自测").text and bench.sent == []
 
 
-@pytest.mark.parametrize("what", ["position", "order", "stop"])
+@pytest.mark.parametrize("what", ["position", "order", "stop", "trigger"])
 def test_it_leaves_alone_an_instrument_that_already_holds_something(what):
     exchange = Demo()
     if what == "position":
         exchange.positions = [small()]
     elif what == "order":
         exchange.pending = [OrderInfo("5001", XAU, "buy", px=3700.0, sz=1.0, state="live")]
+    elif what == "trigger":
+        exchange.algos = [{"ordType": "trigger", "algoId": "8002", "instId": XAU, "side": "buy", "sz": "1", "triggerPx": "3990"}]
     else:
         exchange.orphans = [{"instId": XAU, "algoId": "8001"}]
     bench = Bench(exchange)
     reply = bench.say("模拟盘自测")
-    assert "已经" not in reply.title and "现在有仓位、挂单或止盈止损单" in reply.text
+    assert "已经" not in reply.title and "现在有仓位、挂单、突破单或止盈止损单" in reply.text
     assert bench.sent == []
     assert bench.run("模拟盘自测 BTC").title == "模拟盘自测 · 通过"  # the other instrument is free
 
@@ -337,7 +374,7 @@ def test_a_failure_with_an_order_resting_cancels_it_and_closes():
     exchange.failures["cancel_order"] = [OkxError("50001", "Service temporarily unavailable")]
     bench = Bench(exchange)
     reply = bench.run("模拟盘自测")
-    assert "停在第 7 步（撤单）" in reply.text
+    assert "停在第 8 步（撤单）" in reply.text
     assert calls(bench)[-3:] == ["cancel_order", "cancel_order", "close_position"]
     assert "已经收拾干净" in reply.text and empty(exchange)
 
@@ -347,7 +384,7 @@ def test_stop_orders_left_behind_by_the_close_are_found_and_cancelled():
     exchange.leave_stops = True
     bench = Bench(exchange)
     reply = bench.run("模拟盘自测")
-    assert "停在第 8 步（平仓）" in reply.text and "应该什么都不剩，读到止盈止损单 1 张" in reply.text
+    assert "停在第 13 步（平仓）" in reply.text and "应该什么都不剩，读到止盈止损单 1 张" in reply.text
     assert calls(bench)[-2:] == ["close_position", "cancel_stops"]
     assert "已经收拾干净" in reply.text and empty(exchange)
 
@@ -358,7 +395,7 @@ def test_what_could_not_be_cleared_is_said_plainly():
     exchange.failures["close_position"] = [refusal, refusal]
     bench = Bench(exchange)
     reply = bench.run("模拟盘自测")
-    assert "停在第 8 步（平仓）" in reply.text
+    assert "停在第 13 步（平仓）" in reply.text
     assert "还留着仓位 1 个、止盈止损单 1 张" in reply.text and "手动处理" in reply.text
     assert "已经收拾干净" not in reply.text
     assert len(exchange.positions) == 1

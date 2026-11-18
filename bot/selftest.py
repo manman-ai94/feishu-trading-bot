@@ -11,13 +11,21 @@ account back after every step:
   3. the stop-loss is moved
   4. the position is reduced by one lot (the stops must stay)
   5. the take-profit is taken away (the stop order is cancelled and placed again)
-  6. a limit order that rests below the market
-  7. that order is cancelled
-  8. the position is closed (OKX must take the stop order away with it)
+  6. one lot is added at market with a new stop: the addition goes without a
+     stop of its own and the whole-position stop is moved, so one stop is left
+  7. a limit order that rests below the market
+  8. that order is cancelled
+  9. a breakout (trigger) order above the market, carrying a stop
+ 10. that trigger order is cancelled
+ 11. a ladder: two limit orders below the market, each carrying the stop
+ 12. both are cancelled at once
+ 13. the position is closed (OKX must take the stop order away with it)
 
 Rules:
-  * Only on the demo account. It refuses unless TRADING=demo, both when it is
-    asked for and again when the owner confirms.
+  * Only on the demo account: with TRADING=demo, or, while trading live, on a
+    twin of the desk that reads and sends only with the demo keys (OKX_DEMO_*).
+    It refuses anywhere else, both when it is asked for and again when the
+    owner confirms.
   * Every step goes through the desk's own planning and sending, so the limits
     in .env apply to it and every request is in the order record.
   * It only starts on an instrument that holds nothing: no position, no order,
@@ -30,7 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Callable
@@ -44,13 +52,16 @@ from .trading import ACTION_NAMES, Command, Plan, Refused, Reply, Step, _amt, _c
 log = logging.getLogger(__name__)
 
 SETTING = "selftest_last"  # the outcome of the latest run, as JSON
-STEPS = 8
+STEPS = 13
+OPENS = 5  # opening orders it sends: the position, the addition, the limit order, the breakout and the ladder
 LOTS = 2  # the position is this many times the smallest size, so that half of it can be closed
 STOP_PCT = Decimal(2)  # how far from the market the stop-loss and the take-profit are placed
 MOVED_STOP_PCT = Decimal("1.5")  # where the stop-loss is moved to
 RESTING_PCT = Decimal(3)  # how far below the market the limit order waits
+MERGED_STOP_PCT = Decimal("1.8")  # the stop given with the addition
+BREAKOUT_PCT = Decimal(3)  # how far above the market the breakout order is set off
 CHECK_TRIES = 6  # reads of the account after a step, a second apart, before the step counts as failed
-NEVER_RUN = "还没有跑过。模拟盘（TRADING=demo）下私聊发“模拟盘自测”可以跑一遍"
+NEVER_RUN = "还没有跑过。私聊发“模拟盘自测”可以跑一遍（只在模拟盘；实盘时用 .env 里模拟盘的 key）"
 
 
 class _Failed(Exception):
@@ -65,11 +76,14 @@ class _View:
     orders: list[OrderInfo]
     algos: list[dict]  # pending stop orders, as OKX lists them
     stops_known: bool = True
+    triggers: list[dict] = field(default_factory=list)  # trigger orders (计划委托) waiting, as OKX lists them
 
 
 class SelfTest:
-    def __init__(self, desk, inst_id: str = ""):
+    def __init__(self, desk, inst_id: str = "", twin: bool = False):
+        """`twin`: the desk is the demo twin of a desk trading live (TradeDesk._rehearsal_desk)."""
         self._desk = desk
+        self._twin = twin
         self._cfg = desk._cfg
         self._okx = desk._okx
         self._journal = desk._journal
@@ -120,16 +134,23 @@ class SelfTest:
         lines = (
             f"品种 {self._inst_id}，现价 {_px(last, spec)}。用最小的数量：开 {_contracts_text(size, spec)}，"
             f"约 {_amt(value)} {spec.settle_ccy or 'USDT'}（名义价值）",
-            f"一共 {STEPS} 步：市价开多、挂止损和止盈、改止损、减掉一半、取消止盈、限价挂单、撤单、平仓",
+            f"一共 {STEPS} 步：市价开多、挂止损和止盈、改止损、减掉一半、取消止盈、加仓合成一张止损、限价挂单、撤单、"
+            "突破单、撤突破单、分两档挂单、一起撤掉、平仓",
             "每一步发出去以后，我到 OKX 把结果读回来核对。哪一步不对就停下，把已经开的仓位和挂单收掉，再告诉你停在哪里",
-            "全程只在模拟盘，不碰实盘账户。大约要半分钟，会用掉今天 2 次开仓次数（模拟盘的计数）",
+            f"全程只在模拟盘，不碰实盘账户{'（现在是实盘，所以用 .env 里模拟盘的 key）' if self._twin else ''}。"
+            f"大约要一分钟，会用掉今天 {OPENS} 次开仓次数（模拟盘的计数）",
         )
         return Plan("selftest", f"模拟盘自测 {self._inst_id}", lines, (), self._inst_id)
 
     def _ready(self) -> tuple[InstrumentSpec, Decimal]:
         """Everything that must hold before the first order. Raises Refused with the reason."""
         desk, cfg = self._desk, self._cfg
-        if desk.mode != "demo":
+        if desk.mode != "demo" or getattr(desk._okx, "demo", None) is False:
+            if desk.mode == "live":
+                raise Refused(
+                    "自测只在模拟盘上跑。现在是实盘，服务器 .env 里没有模拟盘的 key（OKX_DEMO_API_KEY、OKX_DEMO_SECRET_KEY、"
+                    "OKX_DEMO_PASSPHRASE），我不会在实盘账户上做自测。"
+                )
             raise Refused("自测只在模拟盘上跑（TRADING=demo）。现在不是模拟盘，我不会在实盘账户上做自测。")
         closed = [ACTION_NAMES[action] for action in TRADE_ACTIONS if action not in cfg.trade_actions]
         if closed:
@@ -148,15 +169,15 @@ class SelfTest:
             desk._account_config = None  # read it again next time: the mode may just have been changed
             raise Refused(desk._spot_mode_text())
         view = self._look()
-        if view.positions or view.orders or view.algos:
+        if view.positions or view.orders or view.algos or view.triggers:
             raise Refused(
-                f"模拟账户的 {inst_id} 上现在有仓位、挂单或止盈止损单。自测会开仓再平掉，为了不动到你自己的单子，"
+                f"模拟账户的 {inst_id} 上现在有仓位、挂单、突破单或止盈止损单。自测会开仓再平掉，为了不动到你自己的单子，"
                 "请先把它们平掉、撤掉，再发“模拟盘自测”。"
             )
         opens = self._journal.count_opens(desk._day_start(), desk._clock() + 1, "demo")
-        if opens + 2 > cfg.trade_max_opens_per_day:
+        if opens + OPENS > cfg.trade_max_opens_per_day:
             raise Refused(
-                f"自测要开仓 2 次，今天模拟盘已经开了 {opens} 次，每天的上限是 {cfg.trade_max_opens_per_day} 次"
+                f"自测要开仓 {OPENS} 次，今天模拟盘已经开了 {opens} 次，每天的上限是 {cfg.trade_max_opens_per_day} 次"
                 "（TRADE_MAX_OPENS_PER_DAY）。明天再跑，或者先把上限调高。"
             )
         return spec, _dec(self._okx.ticker(inst_id).last)
@@ -172,7 +193,7 @@ class SelfTest:
     # -------------------------------------------------------------------- run
 
     def run(self) -> Reply:
-        """The eight steps, after the owner's confirmation. Raises Refused when it may no longer start."""
+        """The steps, after the owner's confirmation. Raises Refused when it may no longer start."""
         spec, last = self._ready()
         started = self._desk._clock()
         failure = ""
@@ -230,6 +251,11 @@ class SelfTest:
             "取消止盈", Command("stop", inst_id=inst_id, clear_tp=True),
             lambda view: self._stops_are(view, size - one, moved, None),
         )  # fmt: skip
+        merged = self._below(last, MERGED_STOP_PCT)
+        self._step(
+            "加仓合成一张止损", Command("open", inst_id=inst_id, direction="long", ord_type="market", size=one, unit="contracts", sl=merged),
+            lambda view: self._stops_are(view, size, merged, None),
+        )  # fmt: skip
         limit_stop = self._below(resting, STOP_PCT) if self._stop_needed() else None
         found: list[tuple[OrderInfo | None, str, str]] = []
         self._step(
@@ -241,6 +267,29 @@ class SelfTest:
         self._step(
             "撤单", Command("cancel", inst_id=inst_id, ord_id=order.ord_id),
             lambda view: (f"订单 {order.ord_id} 还挂着", "") if view.orders else ("", "挂单已经不在了"),
+        )  # fmt: skip
+        trigger = self._above(last, BREAKOUT_PCT)
+        waiting: list[tuple[str, str, str]] = []
+        self._step(
+            "突破单",
+            Command("open", inst_id=inst_id, direction="long", ord_type="trigger", size=one, unit="contracts", px=trigger, sl=stop),
+            lambda view: waiting.append(self._breakout(view, one, trigger, stop)) or waiting[-1][1:],
+        )
+        algo_id = waiting[-1][0]
+        self._step(
+            "撤突破单", Command("cancel", inst_id=inst_id, ord_id=algo_id),
+            lambda view: (f"突破单 {algo_id} 还挂着", "") if view.triggers else ("", "突破单已经不在了"),
+        )  # fmt: skip
+        tiers = (resting, self._below(last, RESTING_PCT + 1))
+        tier_stop = self._below(tiers[-1], STOP_PCT)
+        self._step(
+            "分两档挂单",
+            Command("open", inst_id=inst_id, direction="long", ord_type="limit", size=one * 2, unit="contracts", sl=tier_stop, tiers=tiers),
+            lambda view: self._ladder(view, one, tiers, tier_stop),
+        )
+        self._step(
+            "一起撤掉", Command("cancel", inst_id=inst_id),
+            lambda view: (f"还有 {len(view.orders)} 张挂单", "") if view.orders else ("", "两档挂单都不在了"),
         )  # fmt: skip
         self._step("平仓", Command("close", inst_id=inst_id), self._nothing_left)
 
@@ -292,6 +341,7 @@ class SelfTest:
             orders=list(self._okx.pending_orders(inst_id)),
             algos=[row for row in self._okx.pending_stops() if row.get("instId") == inst_id],
             stops_known=state.stops_known,
+            triggers=[row for row in self._okx.pending_algos("trigger") if isinstance(row, dict) and row.get("instId") == inst_id],
         )
 
     def _holding(self, view: _View, size: Decimal) -> tuple[Position | None, str, str]:
@@ -325,6 +375,32 @@ class SelfTest:
         if len(mine) != 1 or len(view.orders) != 1:
             return None, f"应该有 1 张限价 {self._show(px)} 的买单，读到 {len(view.orders)} 张挂单", ""
         return mine[0], "", f"买单挂在 {self._show(px)}，{_plain(size)} 张，订单号 {mine[0].ord_id}"
+
+    def _breakout(self, view: _View, size: Decimal, trigger: Decimal, sl: Decimal) -> tuple[str, str, str]:
+        """(the trigger order's id, what is wrong, what was seen)."""
+        if len(view.triggers) != 1:
+            return "", f"应该有 1 张突破单，读到 {len(view.triggers)} 张", ""
+        row = view.triggers[0]
+        attached = next((a for a in row.get("attachAlgoOrds") or [] if isinstance(a, dict)), row)
+        got_sl = attached.get("slTriggerPx") or row.get("slTriggerPx")
+        if row.get("side") != "buy" or not self._same(row.get("triggerPx"), trigger) or _dec(row.get("sz") or 0) != size:
+            return "", f"应该是触发价 {self._show(trigger)} 的买入突破单 {_plain(size)} 张，读到的是{row.get('side')} {row.get('triggerPx')}，{row.get('sz')} 张", ""
+        if not self._same(got_sl, sl):
+            return "", f"突破单挂上了，可是带的止损应该是 {self._show(sl)}，读到的是 {self._show(got_sl)}", ""
+        algo_id = str(row.get("algoId", ""))
+        return algo_id, "", f"突破单触发价 {self._show(trigger)}，{_plain(size)} 张，带止损 {self._show(sl)}，计划委托号 {algo_id}"
+
+    def _ladder(self, view: _View, size: Decimal, tiers: tuple[Decimal, ...], sl: Decimal) -> tuple[str, str]:
+        if len(view.orders) != len(tiers):
+            return f"应该有 {len(tiers)} 张挂单，读到 {len(view.orders)} 张", ""
+        for price in tiers:
+            mine = [o for o in view.orders if o.side == "buy" and self._same(o.px, price) and _dec(o.sz) == size]
+            if len(mine) != 1:
+                return f"应该有一张挂在 {self._show(price)} 的买单 {_plain(size)} 张，没有读到", ""
+            if not self._same(mine[0].sl_trigger_px, sl):
+                return f"挂在 {self._show(price)} 的单带的止损应该是 {self._show(sl)}，读到的是 {self._show(mine[0].sl_trigger_px)}", ""
+        where = "、".join(self._show(price) for price in tiers)
+        return "", f"买单挂在 {where}，各 {_plain(size)} 张，都带止损 {self._show(sl)}"
 
     @staticmethod
     def _nothing_left(view: _View) -> tuple[str, str]:
@@ -389,6 +465,8 @@ def _left(view: _View) -> str:
         parts.append(f"仓位 {len(view.positions)} 个")
     if view.orders:
         parts.append(f"挂单 {len(view.orders)} 张")
+    if view.triggers:
+        parts.append(f"突破单 {len(view.triggers)} 张")
     if view.algos:
         parts.append(f"止盈止损单 {len(view.algos)} 张")
     return "、".join(parts)

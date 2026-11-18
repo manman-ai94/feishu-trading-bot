@@ -186,7 +186,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - “停止交易”：立刻不再接受开仓（平仓、撤单、改止损照常）。“恢复交易”解除
 - 熔断：24 小时内亏损的止损或强平满 2 次，我自动不再接受开仓（平仓、撤单、改止损照常），不动任何仓位。“解除熔断”再回确认码恢复
 - “交易设置”：看当前是模拟盘还是实盘、各项限额、这把 key 的权限
-- “模拟盘自测”：只在模拟盘。我用最小的数量把开仓、止盈止损、减仓、挂单、撤单、平仓各跑一遍，告诉你 OKX 每一步收没收
+- “模拟盘自测”：只在模拟盘（实盘时用 .env 里模拟盘的 key，不碰实盘账户）。我用最小的数量把开仓、止盈止损、减仓、加仓合成止损、挂单、突破单、分档挂单、撤单、平仓各跑一遍，告诉你 OKX 每一步收没收
 - 限额和品种名单只能在服务器的 .env 里改，飞书里改不了。杠杆倍数请在 OKX 里设"""
 
 
@@ -786,12 +786,15 @@ class TradeDesk:
         new_code: Callable[[], str] | None = None,
         new_id: Callable[[], str] | None = None,
         day_change: Callable[[], float | None] | None = None,
+        demo_trader=None,
     ):
         """`reader` is the read-only OKX client the rest of the bot uses. `trader`
         is the client that can place orders, or None while trading is off; in
         demo mode it talks to OKX demo trading, so every check and every preview
         is made against the account the order would go to. `day_change()` is
-        today's change of the real account's equity in USD."""
+        today's change of the real account's equity in USD. `demo_trader`, while
+        trading live: a client on OKX demo trading with the demo keys, for the
+        rehearsal (模拟盘自测) only."""
         self._cfg = cfg
         self._journal = journal
         self._trader = trader
@@ -809,6 +812,8 @@ class TradeDesk:
         self._last_sizing: tuple[str, float] | None = None  # (instrument, when) of the last "算仓位" answered
         self._account_config: tuple[float, AccountConfig] | None = None
         self.stream_status: Callable[[], str] | None = None  # set by the app: whether OKX's push stream is up
+        self._demo_trader = demo_trader
+        self._twin: TradeDesk | None = None  # the rehearsal's desk on the demo account, while trading live
 
     @property
     def mode(self) -> str:
@@ -1013,7 +1018,21 @@ class TradeDesk:
     def _selftest(self, inst_id: str = ""):
         from .selftest import SelfTest  # imported here because that module is built on this one
 
-        return SelfTest(self, inst_id)
+        desk = self._rehearsal_desk()
+        return SelfTest(desk, inst_id, twin=desk is not self)
+
+    def _rehearsal_desk(self) -> TradeDesk:
+        """Where the rehearsal runs: this desk when it is on the demo account; while trading live, a twin of
+        it that reads and sends only with the demo keys (OKX_DEMO_*), so the real account is never touched.
+        The twin has the same settings, the same record (its orders are marked demo) and the same pause."""
+        if self._mode != "live" or self._demo_trader is None:
+            return self
+        if self._twin is None:
+            self._twin = TradeDesk(
+                replace(self._cfg, trading="demo"), self._journal, self._demo_trader, self._demo_trader,
+                resolver=self._parser._resolver, clock=self._clock, sleep=self._sleep, new_code=self._new_code, new_id=self._new_id,
+            )  # fmt: skip
+        return self._twin
 
     def _abort(self, refused: bool = False) -> Reply:
         with self._lock:
@@ -2590,6 +2609,8 @@ class TradeDesk:
                 return [f"已撤：订单号 {args['ord_id']}"]
             if step.call == "cancel_stops":
                 self._trader.cancel_stops([tuple(item) for item in args["items"]])
+                if step.label.startswith("撤突破单"):
+                    return [f"已撤：突破单 {args['items'][0][1]}"]
                 return [f"已撤掉 {len(args['items'])} 张止盈止损单"]
             if step.call == "amend_stop":
                 self._trader.amend_stop(**args)

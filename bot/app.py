@@ -104,6 +104,16 @@ def build_trader(cfg: Config) -> OkxTradeClient | None:
     return trader
 
 
+def build_demo_trader(cfg: Config) -> OkxTradeClient | None:
+    """While trading live, a client on OKX demo trading with the demo keys, so that the rehearsal
+    (模拟盘自测) can run without switching the bot off the real account. None otherwise."""
+    if cfg.trading != "live" or not cfg.has_okx_demo_keys:
+        return None
+    trader = OkxTradeClient(cfg.okx_demo_api_key, cfg.okx_demo_secret_key, cfg.okx_demo_passphrase, cfg.okx_base_url, demo=True)
+    trader.trigger_px_type = cfg.trade_stop_trigger
+    return trader
+
+
 def build_trade_desk(cfg: Config, journal: Journal, okx: OkxClient, resolver: InstrumentResolver, reporter=None) -> TradeDesk:
     """The trade desk is always there, so the owner can ask how trading is set up; it only gets a
     client that can place orders when trading is switched on."""
@@ -112,7 +122,7 @@ def build_trade_desk(cfg: Config, journal: Journal, okx: OkxClient, resolver: In
         state = reporter.current_state() if reporter is not None else None
         return reporter.day_change(state) if state is not None else None
 
-    return TradeDesk(cfg, journal, okx, build_trader(cfg), resolver, day_change=day_change)
+    return TradeDesk(cfg, journal, okx, build_trader(cfg), resolver, day_change=day_change, demo_trader=build_demo_trader(cfg))
 
 
 def build_crowd(cfg: Config, okx: OkxClient) -> Crowd | None:
