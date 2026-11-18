@@ -28,7 +28,8 @@ from .router import Router
 from .scheduler import Scheduler
 from .service import Reporter
 from .tools import Toolbox
-from .track import Levels, Scorer
+from .review import LESSONS_DAYS, LESSONS_SHOWN, Reviewer, lessons_text
+from .track import Levels, Scorer, track_text_for_ai
 from .trading import TradeDesk
 from .upkeep import Upkeep
 
@@ -148,7 +149,10 @@ def build_ai(
             # No price means the instrument does not exist on OKX or cannot be read: nothing to score against.
             log.info("track record: %s not kept, no price (%s)", levels.inst_id, exc)
             return
-        scenarios = [{"side": s.side, "trigger": s.trigger, "target": s.target, "invalid": s.invalid} for s in levels.scenarios]
+        scenarios = [
+            {"side": s.side, "trigger": s.trigger, "target": s.target, "invalid": s.invalid, "confidence": s.confidence}
+            for s in levels.scenarios
+        ]
         journal.record_analysis(purpose, levels.inst_id, levels.bias, ref_px, scenarios, question[:120])
 
     analyst = Analyst(
@@ -158,7 +162,19 @@ def build_ai(
         month_spend=month_spend,
         on_levels=keep_levels if track else None,
     )
+    analyst.attach_feedback(lambda with_account: feedback_text(cfg, journal, time.time(), with_account))
     return analyst, resolver, knowledge
+
+
+def feedback_text(cfg: Config, journal: Journal, now: float, with_account: bool) -> str:
+    """What the AI reads before it answers: its own track record, and the lessons of the latest
+    trade reviews when the answer may show the account (they name the trader's trades)."""
+    parts = []
+    if cfg.track_record:
+        parts.append(track_text_for_ai(journal, now, cfg.tz))
+    if with_account and cfg.close_review:
+        parts.append(lessons_text(journal.recent_lessons(LESSONS_SHOWN, now - LESSONS_DAYS * 86400), cfg.tz))
+    return "\n\n".join(part for part in parts if part)
 
 
 def start_stream(cfg: Config, monitor: Monitor, stop: threading.Event) -> Streams | None:
@@ -207,6 +223,8 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     analyst.attach_account(lambda: reporter.account_for_ai(fresh=True), reporter.history_for_ai)
     monitor = Monitor(okx, cfg, journal, reporter.notify_event, gauge=gauge)
     reporter.monitor = monitor
+    if cfg.close_review:
+        reporter.reviewer = Reviewer(okx, journal, analyst, cfg, reporter)
 
     bot_open_id = None
     try:
@@ -230,10 +248,11 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     if cfg.trading_blocked:
         log.warning("trading stays off: the TRADING setting in .env cannot be honoured")
     log.info(
-        "AI: questions on %s (%s), deep on %s (%s), web search %s, crowd data %s, macro data %s, %d knowledge file(s)",
-        cfg.model_daily, cfg.effort_daily, cfg.model_deep, cfg.effort_deep,
+        "AI: questions on %s (%s, own positions %s), deep on %s (%s), web search %s, crowd data %s, macro data %s, "
+        "%d knowledge file(s), close reviews %s",
+        cfg.model_daily, cfg.effort_daily, cfg.effort_account, cfg.model_deep, cfg.effort_deep,
         "on" if cfg.web_search else "off", "on" if crowd is not None else "off",
-        "on" if macro is not None else "off", len(knowledge.summary()),
+        "on" if macro is not None else "off", len(knowledge.summary()), "on" if cfg.close_review else "off",
     )  # fmt: skip
 
     stop = threading.Event()

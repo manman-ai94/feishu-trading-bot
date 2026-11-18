@@ -18,6 +18,7 @@ from .models import AccountState
 from .monitor import Event, Monitor, position_brief
 from .okx_client import OkxClient, OkxError, OkxNetworkError
 from .reports import DISCLAIMER, account_text, equity_text, event_markdown, journal_text, status_markdown
+from .review import week_text
 from .risk import AccountRisk, weekend_lines
 from .track import scorecard_markdown
 from .upkeep import downtime_text
@@ -65,6 +66,7 @@ class Reporter:
         self._macro = macro  # macro.Macro, or None when MACRO_DATA is off
         self.breaker_alert: Callable[[], str] | None = None  # set by the app: the trade desk's circuit breaker notice
         self.monitor: Monitor | None = None  # set by the app once both exist
+        self.reviewer = None  # review.Reviewer, set by the app when CLOSE_REVIEW is on
 
     # ----------------------------------------------------------- destinations
 
@@ -155,6 +157,14 @@ class Reporter:
             self.to_group(event.title, body or "（无更多信息）", template, footer=DISCLAIMER)
         if event.kind in ("closed", "reduced") and self.breaker_alert is not None:
             self._tell_breaker()
+        if event.kind == "closed" and self.reviewer is not None:
+            self.reviewer.on_close(event.inst_id)
+
+    def send_review(self, title: str, markdown: str) -> None:
+        """A closed position's review: to the owner, and to the group when the owner shares the account there."""
+        self._owner_safely(title, markdown, "violet")
+        if self.group_shares_account:
+            self.to_group(title, markdown, "violet", footer=DISCLAIMER)
 
     def _tell_breaker(self) -> None:
         """After a close: whether that stop-out tripped the circuit breaker. Only the owner hears it."""
@@ -261,8 +271,9 @@ class Reporter:
         equity = equity_text(self._journal.equity_series(start, end))
         title = "本周复盘 · " + self.now_local().strftime("%m月%d日")
         shared = self.group_shares_account
+        figures = week_text(self._journal.reviews_between(start, end))
         try:
-            text = self._analyst.weekly_review(self.market_text(), journal, equity, shared_with_group=shared)
+            text = self._analyst.weekly_review(self.market_text(), journal, equity, shared_with_group=shared, week_figures=figures)
         except AnalystUnavailable as exc:
             self._owner_safely(title, f"这次复盘没有生成：{exc}", "grey")
             return

@@ -1,9 +1,13 @@
 """The AI layer. Claude is the analyst and risk officer; it never trades.
 
-Three tiers:
-  quick -> MODEL_QUICK, low effort            (sorting short messages)
-  daily -> MODEL_DAILY at EFFORT_DAILY        (questions, pre-market brief, daily wrap)
-  deep  -> MODEL_DEEP at EFFORT_DEEP          (weekly review, "深度" requests from the owner)
+Four tiers:
+  quick   -> MODEL_QUICK, low effort          (sorting short messages)
+  daily   -> MODEL_DAILY at EFFORT_DAILY      (questions, pre-market brief, daily wrap, trade reviews)
+  account -> MODEL_DAILY at EFFORT_ACCOUNT    (questions about the trader's own positions and orders)
+  deep    -> MODEL_DEEP at EFFORT_DEEP        (weekly review, "深度" requests from the owner)
+
+Before it answers, the AI reads its own track record and the lessons of the latest trade reviews
+(see `attach_feedback`), so an analysis starts from how the last ones went.
 
 For daily and deep work the AI is given tools (see tools.py): OKX market data
 for any instrument, raw candles, the owner's knowledge base, web search for
@@ -132,6 +136,19 @@ TITLE_NOTE = (
     "回答超过五六行时，在最前面单独写一行“标题：……”，用不超过 16 个字说出这条回答的要点，例如“黄金：4,050 上方偏多”。"
     "程序会把这一行放进卡片的标题栏，正文里不用再重复它。两三句话就能说完的回答不要写标题，也不要用加粗和列表。"
 )
+# Words that make a question about the trader's own positions and orders: answered at EFFORT_ACCOUNT.
+ACCOUNT_WORDS = (
+    "仓位", "持仓", "挂单", "委托", "止损", "止盈", "平仓", "加仓", "减仓", "开仓", "账户", "盈亏", "浮亏", "浮盈",
+    "爆仓", "强平", "保证金", "权益", "这单", "那单", "这笔", "拿着", "拿住", "我的单",
+)  # fmt: skip
+
+REVIEW_TASK = """请复盘这笔刚平掉的交易。上面的数字都是程序从 OKX 的记录、机器人的快照和 K 线里算出来的：直接用，不要重算，也不要再列一遍。
+只写三行，每行以固定的词开头，每行一两句：
+和计划比：开仓前的分析或他的止损计划，和实际走势、出场方式比怎么样。没有开仓前的分析，就拿止损位置、最大逆向和最大顺向来说，例如“最多顺向 2.1R 却以 -1R 出场”。
+教训：一条下次用得上的具体做法，带条件或数字，例如“亚洲盘的突破等 15 分钟收盘确认再进”。不要写“控制风险”“保持纪律”这类空话。这笔做得好，就写值得保留的那个做法。
+规则：对照他自己的交易规则，说有没有违反、违反了哪条。规则在资料库里，用 search_knowledge 查“交易规则”；资料库里没有，就只对照程序给出的单笔止损比例那一条，并说明他还没写交易规则。
+不要搜索网页，不写标题，不寒暄，不要替他决定下一笔怎么做。"""
+
 DEEP_NOTE = (
     "这次交易员要的是深度分析：可以多查几轮数据和资料，把各周期的结构、关键事件和值得做计划的情景讲透，"
     "篇幅可以到两三屏。"
@@ -226,9 +243,12 @@ class Analyst:
         self._on_levels = on_levels if cfg.track_record else None
         # Which set of web tools to offer; steps down when the API turns one away.
         self._web_level = 0 if cfg.web_search else len(WEB_TOOL_SETS) - 1
+        self._feedback: Callable[[bool], str] | None = None
         self._tiers = {
             "quick": Tier(cfg.model_quick, "low", 1024),
             "daily": Tier(cfg.model_daily, cfg.effort_daily, 16000, tools=True),
+            "account": Tier(cfg.model_daily, cfg.effort_account, 16000, tools=True),
+            "judge": Tier(cfg.model_daily, "low", 2000),  # scores answers in `python -m bot eval`
             "deep": Tier(cfg.model_deep, cfg.effort_deep, 32000, tools=True, web_searches=WEB_SEARCHES_DEEP),
         }
 
@@ -236,6 +256,20 @@ class Analyst:
         """Lets the AI read the trader's account and closes with its tools, in answers that may show them."""
         if self._toolbox is not None:
             self._toolbox.attach_account(account, history)
+
+    def attach_feedback(self, feedback: Callable[[bool], str]) -> None:
+        """`feedback(with_account)` gives the AI's own track record and, when the answer may show the
+        account, the lessons of the latest trade reviews. Read before every answer and brief."""
+        self._feedback = feedback
+
+    def _feedback_text(self, with_account: bool) -> str:
+        if self._feedback is None:
+            return ""
+        try:
+            return self._feedback(with_account) or ""
+        except Exception:  # an answer is never held up for it
+            log.exception("could not read the track record and lessons for the AI")
+            return ""
 
     @property
     def enabled(self) -> bool:
@@ -262,8 +296,8 @@ class Analyst:
             log.exception("could not read this month's AI spend")
             return False
 
-    def _ask(self, tier_name: str, system: str, user: str, purpose: str = "", history=None) -> str:
-        return self._ask_with_levels(tier_name, system, user, purpose, history)[0]
+    def _ask(self, tier_name: str, system: str, user: str, purpose: str = "", history=None, account: bool = False) -> str:
+        return self._ask_with_levels(tier_name, system, user, purpose, history, account)[0]
 
     def _analyse(
         self, tier_name: str, user: str, purpose: str, question: str = "", history=None, record: bool = True, account: bool = False
@@ -498,6 +532,9 @@ class Analyst:
             )
         elif account_text:
             parts.append(f"交易员当前的账户和持仓：\n{account_text}")
+        feedback = self._feedback_text(account_text is not None)
+        if feedback:
+            parts.append(feedback)
         note = self._tools_note()
         if note:
             parts.append(note)
@@ -505,7 +542,7 @@ class Analyst:
             parts.append(DEEP_NOTE)
         parts.append(TITLE_NOTE)
         parts.append(f"问题：{question}")
-        tier = "deep" if deep else "daily"
+        tier = "deep" if deep else ("account" if account_text is not None and about_account(question) else "daily")
         return self._analyse(
             tier, "\n\n".join(parts), "deep question" if deep else "question", question, history, account=account_text is not None
         )
@@ -549,6 +586,9 @@ class Analyst:
             task += "结尾加一行“今日英语”：给一句和今天行情有关的地道英文交易用语，并附中文意思。"
         else:
             task += "这份简报会发在一个有其他人的群里，只讲行情本身，不要提及任何人的持仓和资金。"
+        feedback = self._feedback_text(for_owner)
+        if feedback:
+            parts.append(feedback)
         note = self._tools_note()
         if note:
             parts.append(note)
@@ -556,28 +596,48 @@ class Analyst:
         # Two versions of one brief may be written (owner and group): only the owner's is kept, so it counts once.
         return self._analyse("daily", "\n\n".join(parts), f"{kind} brief", record=for_owner, account=for_owner)
 
-    def weekly_review(self, market_text: str, journal_text: str, equity_text: str, shared_with_group: bool = False) -> str:
+    def weekly_review(
+        self, market_text: str, journal_text: str, equity_text: str, shared_with_group: bool = False, week_figures: str = ""
+    ) -> str:
         task = (
             "请写本周复盘 (weekly review)。"
             + (SHARED_NOTE if shared_with_group else "这份复盘只发给交易员本人。")
-            + "根据下面的交易记录，找出他这一周的交易行为模式，"
-            "例如开仓的时间段、加减仓的节奏、止损有没有被移动，说明哪些做法值得保留、哪些值得警惕。"
+            + "根据下面的数字和交易记录，找出他这一周的交易行为模式，"
+            "例如开仓的时间段、加减仓的节奏、止损有没有被移动、赚到的占持仓期间最大浮盈的多少，说明哪些做法值得保留、哪些值得警惕。"
+            "R、期望值和分时段的数字是程序算好的，直接用，不要重算。"
             "只根据给出的记录来写，记录里没有的事情不要推测。记录很少时就直接说样本太少，不要硬凑结论。"
         )
         if self._toolbox is not None:
-            task += "资料库里如果有他自己的交易规则，拿来对照他这一周的做法。"
+            task += "每笔平仓的细节可以用 get_trade_history 查。资料库里如果有他自己的交易规则，拿来对照他这一周的做法。"
         task += "结尾加一行“本周英语”：给一句和复盘有关的地道英文交易用语，并附中文意思。"
         parts = [
             self._now_line(),
             f"OKX 实时行情数据：\n{market_text}",
             f"本周权益变化：\n{equity_text}",
-            f"本周交易记录：\n{journal_text}",
         ]
+        if week_figures:
+            parts.append(f"本周的平仓（程序从复盘记录里算的）：\n{week_figures}")
+        parts.append(f"本周交易记录：\n{journal_text}")
+        feedback = self._feedback_text(True)
+        if feedback:
+            parts.append(feedback)
         note = self._tools_note()
         if note:
             parts.append(note)
         parts.append(task)
-        return self._ask("deep", ANALYST_SYSTEM, "\n\n".join(parts), purpose="weekly review")
+        return self._ask("deep", ANALYST_SYSTEM, "\n\n".join(parts), purpose="weekly review", account=True)
+
+    def review_trade(self, figures: str, lessons: str = "", shared_with_group: bool = False) -> str:
+        """Three lines on a position just closed: against the plan, one lesson, the trader's rules."""
+        parts = [self._now_line(), f"刚平掉的这笔交易：\n{figures}"]
+        if lessons:
+            parts.append(lessons + "\n这些教训已经记下了：不要重复写同一条；这笔又犯了同样的错，就直说又犯了。")
+        parts.append(REVIEW_TASK + (SHARED_NOTE if shared_with_group else ""))
+        return self._ask("daily", ANALYST_SYSTEM, "\n\n".join(parts), purpose="trade review", account=True)
+
+    def grade(self, system: str, user: str) -> str:
+        """One answer scored against its points, for `python -m bot eval`. No tools; metered as "eval judge"."""
+        return self._ask("judge", system, user, purpose="eval judge")
 
     def ping(self) -> str:
         """Used by the self-check: the cheapest possible real call."""
@@ -602,6 +662,11 @@ class Analyst:
             raise AnalystUnavailable("这把 Claude API key 所在的组织没有开通联网搜索。在 Claude Console 的设置里打开 Web search 即可。")
         if usage.web_searches == 0:
             raise AnalystUnavailable("测试请求成功了，但模型没有执行搜索，联网搜索的状态不确定。")
+
+
+def about_account(question: str) -> bool:
+    """Whether a question is about the trader's own positions and orders."""
+    return any(word in question for word in ACCOUNT_WORDS)
 
 
 def _about_tools(exc: anthropic.APIStatusError) -> bool:

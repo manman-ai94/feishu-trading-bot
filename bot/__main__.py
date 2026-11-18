@@ -12,6 +12,7 @@
     python -m bot trading       print how placing orders is set up: mode, limits, what the key may do
     python -m bot record        print the track record: the AI's levels against what the market did
     python -m bot account       print the account, positions and waiting orders exactly as the AI is shown them
+    python -m bot eval          ask the eval questions, score each answer, compare with the last run (costs money)
 """
 from __future__ import annotations
 
@@ -409,6 +410,11 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser(
         "replay", help="把 scripts/replay-group.txt 里群里问过的问题按主人在群里 @我 的样子重放，只打印回答（不发飞书、不下单，AI 调用照常计费）"
     )
+    evaluate = commands.add_parser(
+        "eval", help="评测：问 scripts/eval-questions.json 里的题，给每个回答打分，和上一次比（不发飞书、不下单；一轮约几美元）"
+    )
+    evaluate.add_argument("--dry-run", action="store_true", help="只列出题目和要点，不调用 AI，不花钱")
+    evaluate.add_argument("--only", default="", help="只问这几题，题号用逗号隔开，例如 9,10,11")
     args = parser.parse_args(argv)
 
     if args.command == "setenv":
@@ -440,6 +446,11 @@ def main(argv: list[str] | None = None) -> int:
         from .replay import replay
 
         return replay(cfg)
+    if args.command == "eval":
+        from .evaluate import run_eval
+
+        only = {int(part) for part in args.only.split(",") if part.strip().isdigit()}
+        return run_eval(cfg, dry_run=args.dry_run, only=only or None)
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:
         print("还没填飞书的 FEISHU_APP_ID 和 FEISHU_APP_SECRET，机器人无法启动。先运行：python -m bot selfcheck")

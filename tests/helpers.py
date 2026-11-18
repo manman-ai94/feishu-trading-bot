@@ -249,8 +249,15 @@ class FakeAnalyst:
             for_owner=for_owner, shared_with_group=shared_with_group,
         )
 
-    def weekly_review(self, market_text, journal_text, equity_text, shared_with_group=False):
-        return self._record("weekly", market_text=market_text, journal_text=journal_text, equity_text=equity_text, shared_with_group=shared_with_group)
+    def weekly_review(self, market_text, journal_text, equity_text, shared_with_group=False, week_figures=""):
+        return self._record(
+            "weekly", market_text=market_text, journal_text=journal_text, equity_text=equity_text,
+            shared_with_group=shared_with_group, week_figures=week_figures,
+        )  # fmt: skip
+
+    def review_trade(self, figures, lessons="", shared_with_group=False):
+        text = self._record("review", figures=figures, lessons=lessons, shared_with_group=shared_with_group)
+        return text if self.reply is None else self.reply
 
 
 class Clock:

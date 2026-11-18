@@ -319,18 +319,33 @@ def test_follow_up_questions_carry_the_recent_conversation():
     first, second, group = (call["history"] for call in bench.analyst.named("answer"))
     assert first == [] and second == [("BTC 现在怎么看", "AI:answer")] and group == []
 
-    bench.clock.advance(31 * 60)  # half an hour later he is still in the same conversation
+    bench.clock.advance(5 * 3600)  # hours later he is still in the same conversation
     bench.say("黄金呢")
     assert len(bench.analyst.named("answer")[-1]["history"]) == 2
-    bench.clock.advance(2 * 3600 + 1)  # two hours later it is a new one
+    bench.clock.advance(24 * 3600 + 1)  # a day later it is a new one
     bench.say("那白银呢")
     assert bench.analyst.named("answer")[-1]["history"] == []
 
-    for index in range(7):
+    for index in range(12):
         bench.say(f"第 {index} 个问题：金价怎么看")
     assert [question for question, _ in bench.analyst.named("answer")[-1]["history"]] == [
-        f"第 {index} 个问题：金价怎么看" for index in range(1, 6)
-    ]  # the last five
+        f"第 {index} 个问题：金价怎么看" for index in range(1, 11)
+    ]  # the last ten
+
+
+def test_the_conversation_survives_a_restart_because_the_journal_keeps_it():
+    bench = Bench()
+    bench.say("BTC 现在怎么看")
+    restarted = Router(
+        bench.cfg, bench.feishu, bench.okx, bench.analyst, bench.reporter, BOT, bench.clock,
+        journal=bench.journal, later=bench._later,
+    )  # fmt: skip
+    bench.router = restarted
+    bench.say("那 ETH 呢")
+    assert bench.analyst.named("answer")[-1]["history"] == [("BTC 现在怎么看", "AI:answer")]
+    bench.clock.advance(8 * 86400)
+    bench.say("新的问题")
+    assert bench.journal.recent_dialog("oc_private", 0, 99) == [("新的问题", "AI:answer")]  # a week on, older ones are gone
 
 
 def test_a_failed_answer_is_not_remembered():

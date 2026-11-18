@@ -82,11 +82,20 @@ def test_daily_question_uses_opus_at_medium_effort_with_the_refusal_fallback():
     assert client.messages.calls == []
 
 
-def test_deep_question_uses_opus_at_high_effort():
+def test_deep_question_uses_opus_at_xhigh_effort():
     bot, client = analyst(beta=[message()])
     bot.answer("下周怎么看", "行情", "账户", in_group=False, deep=True)
     [call] = client.beta.messages.calls
-    assert call["model"] == "claude-opus-5-5" and call["output_config"] == {"effort": "high"}
+    assert call["model"] == "claude-opus-5-5" and call["output_config"] == {"effort": "xhigh"}
+
+
+def test_a_question_about_his_own_positions_thinks_harder_only_where_the_account_is_shown():
+    efforts = []
+    for question, account in (("挂单要不要留", "账户"), ("黄金怎么看", "账户"), ("挂单要不要留", None)):
+        bot, client = analyst(beta=[message()])
+        bot.answer(question, "行情", account, in_group=False)
+        efforts.append(client.beta.messages.calls[0]["output_config"]["effort"])
+    assert efforts == ["high", "medium", "medium"]
 
 
 def test_routing_uses_haiku_without_the_fallback_option():
@@ -285,7 +294,7 @@ def test_the_prompt_tells_the_ai_the_time_and_what_is_already_fetched():
     assert "现在是 2027-01-15 00:00，星期五（交易员的时区 America/Los_Angeles）" in prompt
     assert "OKX 实时行情数据：\n品种：XAU-USDT-SWAP" in prompt and "深度分析" in prompt and prompt.endswith("问题：现在怎么看")
     assert "没有任何工具" not in prompt and "没有联网搜索" not in prompt
-    assert client.messages.calls[0]["output_config"] == {"effort": "high"}
+    assert client.messages.calls[0]["output_config"] == {"effort": "xhigh"}
 
     bare, bare_client = analyst(beta=[message()])  # no toolbox at all
     bare.answer("现在怎么看", "", None, in_group=False)
@@ -556,3 +565,31 @@ def test_the_instructions_keep_answers_off_a_template():
     assert "有没有必要平仓" in ROUTER_SYSTEM and "这个我去跟 Claude 商量" in ROUTER_SYSTEM
     assert "表了个态" in SMALL_TALK_SYSTEM
     assert "不要为了写它而在正文里加情景" in LEVELS_NOTE
+
+
+def test_the_ai_reads_its_record_and_lessons_and_reviews_a_close_with_the_account_tools():
+    bot, client, box, reports = tooled([reply([text_block("好")]), reply([text_block("好")]), reply([text_block("和计划比：…\n教训：…\n规则：…")]), reply([text_block("复盘")])])
+    seen = []
+    bot.attach_feedback(lambda with_account: seen.append(with_account) or ("成绩单" + ("和教训" if with_account else "")))
+    bot.answer("挂单要不要留", "行情", "账户", in_group=False)
+    assert "成绩单和教训" in client.messages.calls[0]["messages"][-1]["content"]
+    bot.answer("黄金怎么看", "行情", None, in_group=True)
+    prompt = client.messages.calls[1]["messages"][-1]["content"]
+    assert "成绩单" in prompt and "教训" not in prompt and seen == [True, False]
+
+    assert bot.review_trade("结果 +1.00R", "最近几笔平仓复盘记下的教训：…") == "和计划比：…\n教训：…\n规则：…"
+    call = client.messages.calls[2]
+    prompt = call["messages"][-1]["content"]
+    assert "刚平掉的这笔交易：\n结果 +1.00R" in prompt and "不要重复写同一条" in prompt and "只写三行" in prompt
+    assert "get_account" in [tool["name"] for tool in call["tools"]] and call["output_config"] == {"effort": "medium"}
+
+    bot.weekly_review("行情", "记录", "权益", week_figures="本周复盘过的平仓 2 笔")
+    call = client.messages.calls[3]
+    assert "本周的平仓（程序从复盘记录里算的）：\n本周复盘过的平仓 2 笔" in call["messages"][-1]["content"]
+    assert "get_account" in [tool["name"] for tool in call["tools"]] and call["output_config"] == {"effort": "xhigh"}
+
+
+def test_a_broken_feedback_never_stops_an_answer():
+    bot, client, box, reports = tooled([reply([text_block("好")])])
+    bot.attach_feedback(lambda with_account: 1 / 0)
+    assert bot.answer("黄金怎么看", "行情", None, in_group=False) == "好"

@@ -117,7 +117,8 @@ class Config:
     model_daily: str = "claude-opus-5-5"  # questions and briefs
     model_deep: str = "claude-opus-5-5"  # "深度" questions and the weekly review
     effort_daily: str = "medium"
-    effort_deep: str = "high"
+    effort_account: str = "high"  # questions about his own positions and orders, when the account is shown
+    effort_deep: str = "xhigh"
     web_search: bool = True  # the AI may search the web for news and economic data
     ai_monthly_budget_usd: float | None = 180.0  # above this the AI switches to its cheapest setting
     knowledge_dir: Path = Path("knowledge")
@@ -125,6 +126,7 @@ class Config:
     macro_data: bool = True  # show the AI US real rates, Treasury yields and the dollar, from FRED
     track_record: bool = True  # keep the levels the AI gives and score them against the market later
     track_window_hours: int = 72  # how long a scenario is watched
+    close_review: bool = True  # review each closed position: R, excursions, the plan, one lesson the AI keeps
 
     # Behaviour
     timezone: str = "America/Los_Angeles"
@@ -370,13 +372,15 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         model_daily=_get("MODEL_DAILY", "claude-opus-5-5"),
         model_deep=_get("MODEL_DEEP", "claude-opus-5-5"),
         effort_daily=_effort("EFFORT_DAILY", "medium"),
-        effort_deep=_effort("EFFORT_DEEP", "high"),
+        effort_account=_effort("EFFORT_ACCOUNT", "high"),
+        effort_deep=_effort("EFFORT_DEEP", "xhigh"),
         web_search=_get_bool("WEB_SEARCH", True),
         ai_monthly_budget_usd=_get_float("AI_MONTHLY_BUDGET_USD", 180.0, problems),
         knowledge_dir=Path(_get("KNOWLEDGE_DIR", "knowledge")),
         crowd_data=_get_bool("CROWD_DATA", True),
         macro_data=_get_bool("MACRO_DATA", True),
         track_record=_get_bool("TRACK_RECORD", True),
+        close_review=_get_bool("CLOSE_REVIEW", True),
         track_window_hours=min(72, max(4, _get_int("TRACK_WINDOW_HOURS", 72, problems))),
         timezone=timezone,
         poll_seconds=max(5, _get_int("POLL_SECONDS", 30, problems)),

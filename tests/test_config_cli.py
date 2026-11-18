@@ -46,7 +46,8 @@ def test_empty_configuration_lists_what_is_missing():
     assert not cfg.has_okx_keys
     assert cfg.watch_instruments == ("XAU-USDT-SWAP",)
     assert (cfg.model_quick, cfg.model_daily, cfg.model_deep) == ("claude-haiku-5-5", "claude-opus-5-5", "claude-opus-5-5")
-    assert (cfg.effort_daily, cfg.effort_deep) == ("medium", "high")
+    assert (cfg.effort_daily, cfg.effort_account, cfg.effort_deep) == ("medium", "high", "xhigh")
+    assert cfg.close_review is True
     assert cfg.web_search and cfg.ai_monthly_budget_usd == 180.0 and cfg.knowledge_dir == Path("knowledge")
     assert (cfg.brief_morning, cfg.brief_evening, cfg.weekly_review) == (time(6, 0), time(14, 0), (6, time(17, 0)))
     assert str(cfg.tz) == "America/Los_Angeles"

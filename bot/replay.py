@@ -49,14 +49,55 @@ def read_questions(path: Path = QUESTIONS_FILE) -> list[str]:
     return [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
 
 
-def replay(cfg: Config, path: Path = QUESTIONS_FILE, out=print) -> int:
-    from .app import build_ai, build_crowd, build_macro, build_okx
-    from .journal import Journal
-    from .monitor import Monitor
-    from .risk import RiskGauge
-    from .router import Router
-    from .service import Reporter
+class Rehearsal:
+    """The bot's own answering path, wired to a console: what replay and eval run questions through.
 
+    Feishu is replaced by `feishu`, the trade desk is left out (nothing can be ordered), the levels
+    of the answers stay out of the track record, and the monitor's first read goes to a scratch
+    journal. Chat history stays in memory, so a rehearsal leaves no conversation behind. The AI's
+    use is metered in the real journal with the rest of the month."""
+
+    def __init__(self, cfg: Config, feishu):
+        from .app import build_ai, build_crowd, build_macro, build_okx
+        from .journal import Journal
+        from .monitor import Monitor
+        from .risk import RiskGauge
+        from .router import Router
+        from .service import Reporter
+
+        self.cfg = cfg
+        okx = build_okx(cfg)
+        self.journal = Journal(cfg.db_path)
+        self.analyst, resolver, _ = build_ai(cfg, okx, self.journal, build_crowd(cfg, okx), track=False, macro=build_macro(cfg))
+        scratch = Journal(":memory:")  # the monitor's first read leaves nothing behind
+        gauge = RiskGauge(okx)
+        reporter = Reporter(cfg, feishu, okx, self.analyst, scratch, crowd=None, gauge=gauge)
+        reporter.monitor = Monitor(okx, cfg, scratch, lambda event: None, gauge=gauge)
+        self.analyst.attach_account(lambda: reporter.account_for_ai(fresh=True), reporter.history_for_ai)
+        reporter.monitor.poll_once()
+        self.router = Router(
+            cfg, feishu, okx, self.analyst, reporter, BOT_ID, resolver=resolver, trade=None,
+            later=lambda seconds, call: (lambda: None),
+        )  # fmt: skip
+
+    def ask(self, number: int, question: str, in_group: bool = True) -> None:
+        """Hands one question to the router as the owner: @-mentioning the bot in the group, or in his private chat."""
+        self.router.handle(
+            IncomingMessage(
+                message_id=f"replay{number}",
+                chat_id=self.cfg.group_chat_id if in_group else PRIVATE_CHAT,
+                chat_type="group" if in_group else "p2p",
+                sender_open_id=self.cfg.owner_open_id,
+                text=question,
+                mentioned_open_ids=(BOT_ID,) if in_group else (),
+            )
+        )
+
+
+PRIVATE_CHAT = "replay-private"
+
+
+def replay(cfg: Config, path: Path = QUESTIONS_FILE, out=print) -> int:
     if not cfg.owner_open_id or not cfg.group_chat_id:
         out("[X] 没有登记主人或群（OWNER_OPEN_ID、GROUP_CHAT_ID），无法按群里的样子重放。")
         return 1
@@ -64,40 +105,16 @@ def replay(cfg: Config, path: Path = QUESTIONS_FILE, out=print) -> int:
     if not questions:
         out(f"[X] {path} 里没有问题。")
         return 1
-
-    okx = build_okx(cfg)
-    journal = Journal(cfg.db_path)  # the AI's use is metered with the rest of the month
-    analyst, resolver, _ = build_ai(cfg, okx, journal, build_crowd(cfg, okx), track=False, macro=build_macro(cfg))
-    if not analyst.enabled:
+    rehearsal = Rehearsal(cfg, PrintingFeishu(out))
+    if not rehearsal.analyst.enabled:
         out("[X] 还没有配置 Claude 的 API key。")
         return 1
-    feishu = PrintingFeishu(out)
-    scratch = Journal(":memory:")  # the monitor's first read leaves nothing behind
-    gauge = RiskGauge(okx)
-    reporter = Reporter(cfg, feishu, okx, analyst, scratch, crowd=None, gauge=gauge)
-    reporter.monitor = Monitor(okx, cfg, scratch, lambda event: None, gauge=gauge)
-    analyst.attach_account(lambda: reporter.account_for_ai(fresh=True), reporter.history_for_ai)
-    reporter.monitor.poll_once()
-    router = Router(
-        cfg, feishu, okx, analyst, reporter, BOT_ID, resolver=resolver, trade=None,
-        later=lambda seconds, call: (lambda: None),
-    )  # fmt: skip
-
     started = time.time()
     for number, question in enumerate(questions, 1):
         out(f"\n===== {number}. 问：{question}")
         asked = time.time()
-        router.handle(
-            IncomingMessage(
-                message_id=f"replay{number}",
-                chat_id=cfg.group_chat_id,
-                chat_type="group",
-                sender_open_id=cfg.owner_open_id,
-                text=question,
-                mentioned_open_ids=(BOT_ID,),
-            )
-        )
+        rehearsal.ask(number, question)
         out(f"（用时 {time.time() - asked:.0f} 秒）")
-    used = journal.usage_between(int(started), time.time() + 1)
+    used = rehearsal.journal.usage_between(int(started), time.time() + 1)
     out(f"\n[用量] {len(questions)} 个问题，联网搜索 {used['web_searches']} 次，约 {used['cost_usd']:.3f} 美元（估算）")
     return 0

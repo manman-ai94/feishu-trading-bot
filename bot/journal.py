@@ -85,7 +85,40 @@ CREATE TABLE IF NOT EXISTS calls (
 );
 CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls (ts);
 CREATE INDEX IF NOT EXISTS idx_calls_status ON calls (status);
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    inst_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    opened_at INTEGER,
+    closed_at INTEGER NOT NULL,
+    open_px REAL,
+    close_px REAL,
+    realized REAL,
+    ccy TEXT NOT NULL DEFAULT '',
+    how TEXT NOT NULL DEFAULT '',
+    first_stop REAL,
+    stop_moves INTEGER,
+    risk_pct REAL,
+    r_multiple REAL,
+    mae_r REAL,
+    mfe_r REAL,
+    facts TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL DEFAULT '',
+    lesson TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_closed ON reviews (closed_at);
+CREATE TABLE IF NOT EXISTS dialog (
+    chat_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dialog_chat ON dialog (chat_id, ts);
 """
+
+# Columns added after a table was first created: (table, column, declaration).
+ADDED_COLUMNS = (("calls", "confidence", "INTEGER"),)
 
 
 class Journal:
@@ -97,6 +130,10 @@ class Journal:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(SCHEMA)
+            for table, column, declaration in ADDED_COLUMNS:
+                known = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+                if column not in known:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
             self._db.commit()
 
     def record_snapshot(self, state: AccountState, ts: float | None = None) -> None:
@@ -115,6 +152,22 @@ class Journal:
                 (int(ts or time.time()), kind, inst_id, summary, json.dumps(payload or {}, ensure_ascii=False)),
             )
             self._db.commit()
+
+    def snapshots_between(self, start: float, end: float) -> list[dict]:
+        """Account snapshots in [start, end), oldest first: ts, total_eq and the positions as they were stored."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT ts, total_eq, positions FROM snapshots WHERE ts >= ? AND ts < ? ORDER BY ts ASC",
+                (int(start), int(end)),
+            ).fetchall()
+        snapshots = []
+        for row in rows:
+            try:
+                positions = json.loads(row["positions"])
+            except ValueError:
+                positions = []
+            snapshots.append({"ts": row["ts"], "total_eq": row["total_eq"], "positions": positions if isinstance(positions, list) else []})
+        return snapshots
 
     def first_equity_since(self, ts: float) -> float | None:
         """Equity of the first snapshot at or after `ts` (used as "start of day")."""
@@ -256,8 +309,12 @@ class Journal:
             )
             analysis_id = int(cursor.lastrowid)
             self._db.executemany(
-                "INSERT INTO calls (analysis_id, ts, inst_id, side, trigger_px, target_px, invalid_px) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [(analysis_id, when, inst_id, s["side"], s["trigger"], s["target"], s["invalid"]) for s in scenarios],
+                "INSERT INTO calls (analysis_id, ts, inst_id, side, trigger_px, target_px, invalid_px, confidence)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (analysis_id, when, inst_id, s["side"], s["trigger"], s["target"], s["invalid"], s.get("confidence"))
+                    for s in scenarios
+                ],
             )
             self._db.commit()
         return analysis_id
@@ -318,6 +375,74 @@ class Journal:
         with self._lock:
             rows = self._db.execute(query + " ORDER BY ts ASC, id ASC", values).fetchall()
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------- trade reviews
+
+    REVIEW_FIELDS = (
+        "inst_id", "direction", "opened_at", "closed_at", "open_px", "close_px", "realized", "ccy", "how",
+        "first_stop", "stop_moves", "risk_pct", "r_multiple", "mae_r", "mfe_r", "facts", "text", "lesson",
+    )  # fmt: skip
+
+    def record_review(self, ts: float | None = None, **fields) -> int:
+        """One closed position as it was reviewed: the program's figures, the AI's few lines and its lesson."""
+        names = [name for name in self.REVIEW_FIELDS if name in fields]
+        with self._lock:
+            cursor = self._db.execute(
+                f"INSERT INTO reviews (ts, {', '.join(names)}) VALUES (?, {', '.join('?' for _ in names)})",
+                [int(ts or time.time())] + [fields[name] for name in names],
+            )
+            self._db.commit()
+        return int(cursor.lastrowid)
+
+    def has_review(self, inst_id: str, closed_at: float) -> bool:
+        """Whether this close was reviewed already (the monitor can see one close twice across a restart)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM reviews WHERE inst_id = ? AND closed_at = ? LIMIT 1", (inst_id, int(closed_at))
+            ).fetchone()
+        return row is not None
+
+    def reviews_between(self, start: float, end: float) -> list[dict]:
+        """Reviews of positions closed in [start, end), oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM reviews WHERE closed_at >= ? AND closed_at < ? ORDER BY closed_at ASC", (int(start), int(end))
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_lessons(self, limit: int, since: float) -> list[dict]:
+        """The newest lessons, newest first: closed_at, inst_id, direction, r_multiple, lesson."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT closed_at, inst_id, direction, r_multiple, lesson FROM reviews"
+                " WHERE lesson != '' AND closed_at >= ? ORDER BY closed_at DESC LIMIT ?",
+                (int(since), int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------------------------------------------------------------- dialog
+
+    def record_dialog(self, chat_id: str, question: str, answer: str, ts: float | None = None) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO dialog (chat_id, ts, question, answer) VALUES (?, ?, ?, ?)",
+                (chat_id, int(ts or time.time()), question, answer),
+            )
+            self._db.commit()
+
+    def recent_dialog(self, chat_id: str, since: float, limit: int) -> list[tuple[str, str]]:
+        """The last `limit` questions and answers of one chat since `since`, oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT question, answer FROM dialog WHERE chat_id = ? AND ts >= ? ORDER BY ts DESC, rowid DESC LIMIT ?",
+                (chat_id, int(since), int(limit)),
+            ).fetchall()
+        return [(row["question"], row["answer"]) for row in reversed(rows)]
+
+    def forget_dialog_before(self, ts: float) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM dialog WHERE ts < ?", (int(ts),))
+            self._db.commit()
 
     # -------------------------------------------------------------- settings
 

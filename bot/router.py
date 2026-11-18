@@ -103,8 +103,9 @@ RECORD_PREFIXES = ("成绩单", "战绩", "/record")
 RECORD_DAYS = 30
 RECORD_MAX_DAYS = 365
 SEEN_LIMIT = 500
-HISTORY_TURNS = 5  # earlier questions of the same chat the AI is shown, for follow-ups
-HISTORY_SECONDS = 2 * 3600
+HISTORY_TURNS = 10  # earlier questions of the same chat the AI is shown, for follow-ups
+HISTORY_SECONDS = 24 * 3600
+HISTORY_KEPT_DAYS = 7  # the journal keeps a chat's questions and answers this long, so a restart forgets nothing
 HISTORY_ANSWER_CHARS = 1500
 NOTE_LIMIT = 20000
 
@@ -162,6 +163,7 @@ class Router:
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
         self._history: dict[str, deque[tuple[float, str, str]]] = {}  # chat_id -> (time, question, answer)
+        self._dialog_pruned_at = 0.0
 
     # ------------------------------------------------------------------ entry
 
@@ -620,6 +622,11 @@ class Router:
     def _recent(self, chat_id: str) -> list[tuple[str, str]]:
         """The last few questions and answers of this chat, so a follow-up makes sense."""
         cutoff = self._clock() - HISTORY_SECONDS
+        if self._journal is not None:
+            try:
+                return self._journal.recent_dialog(chat_id, cutoff, HISTORY_TURNS)
+            except Exception:  # an answer without the earlier ones is better than none
+                log.exception("could not read this chat's earlier questions")
         with self._lock:
             return [(question, answer) for when, question, answer in self._history.get(chat_id, ()) if when >= cutoff]
 
@@ -633,8 +640,18 @@ class Router:
     def _remember(self, chat_id: str, question: str, answer: str) -> None:
         if len(answer) > HISTORY_ANSWER_CHARS:
             answer = answer[:HISTORY_ANSWER_CHARS] + "……（后面略）"
+        now = self._clock()
         with self._lock:
-            self._history.setdefault(chat_id, deque(maxlen=HISTORY_TURNS)).append((self._clock(), question, answer))
+            self._history.setdefault(chat_id, deque(maxlen=HISTORY_TURNS)).append((now, question, answer))
+        if self._journal is None:
+            return
+        try:
+            self._journal.record_dialog(chat_id, question, answer, now)
+            if now - self._dialog_pruned_at > 86400:
+                self._journal.forget_dialog_before(now - HISTORY_KEPT_DAYS * 86400)
+                self._dialog_pruned_at = now
+        except Exception:
+            log.exception("could not keep this question and answer")
 
     def _allow_group_question(self) -> bool:
         limit = self._cfg.group_daily_question_limit

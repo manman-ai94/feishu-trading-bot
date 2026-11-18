@@ -345,3 +345,11 @@ def test_the_weekly_review_carries_no_levels_note():
     client = FakeClient(beta=[message("本周复盘。")])
     Analyst(make_cfg(), client, on_levels=lambda *args: None).weekly_review("行情", "记录", "权益")
     assert LEVELS_NOTE not in client.beta.messages.calls[0]["system"]
+
+
+def test_the_confidence_comes_with_each_scenario_and_odd_values_are_dropped():
+    raw = '{"inst":"XAU-USDT-SWAP","bias":"long","scenarios":[{"side":"long","trigger":3850,"target":3900,"invalid":3820,"conf":55},' \
+          '{"side":"short","trigger":3800,"target":3760,"invalid":3830,"conf":0.4},{"side":"long","trigger":3900,"target":3950,"invalid":3880,"conf":150}]}'
+    levels = parse_levels(raw)
+    assert [s.confidence for s in levels.scenarios] == [55, 40, None]
+    assert "把握约 55%" in LEVELS_NOTE and '"conf":把握' in LEVELS_NOTE

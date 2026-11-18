@@ -53,8 +53,9 @@ LEVELS_NOTE = """
 
 成绩记录：
 回答正文里已经给出了某个品种的情景（有触发位、目标位和失效位）时，在全文的最后另起一行，附一段给程序读的记录。读者看不到这一段。这段记录只是把正文里已有的情景抄下来：不要为了写它而在正文里加情景，正文没有情景就不附。格式严格如下，写在一行里，不要放进代码块：
-<levels>{"inst":"品种代码","bias":"long","scenarios":[{"side":"long","trigger":触发位,"target":目标位,"invalid":失效位}]}</levels>
-inst 写 OKX 的品种代码，例如 XAU-USDT-SWAP、BTC-USDT-SWAP；bias 是结论的方向，只能是 long、short 或 range；side 只能是 long 或 short。价位写成普通数字，不带逗号和引号，必须和正文里的数字完全一致。正文写了几个情景就写几个，目标位有多个时写第一个。一条回答只附一段，写最主要的那个品种。"""
+<levels>{"inst":"品种代码","bias":"long","scenarios":[{"side":"long","trigger":触发位,"target":目标位,"invalid":失效位,"conf":把握}]}</levels>
+inst 写 OKX 的品种代码，例如 XAU-USDT-SWAP、BTC-USDT-SWAP；bias 是结论的方向，只能是 long、short 或 range；side 只能是 long 或 short。价位写成普通数字，不带逗号和引号，必须和正文里的数字完全一致。正文写了几个情景就写几个，目标位有多个时写第一个。一条回答只附一段，写最主要的那个品种。
+把握程度：正文里每个情景顺带写一句你的把握，意思是“触发以后先到目标位、不先碰到失效位”的可能性，例如“把握约 55%”。凭数据给，不要每次都写同一个数；参考消息里你自己的成绩单，最近失效得多就写低一点。conf 写同一个数，是 1 到 99 的整数。"""
 
 _BLOCK = re.compile(r"\s*<levels>(.*?)</levels>[ \t]*", re.DOTALL | re.IGNORECASE)
 _DANGLING = re.compile(r"\s*<levels>.*?(?=\n\s*\n|\Z)", re.DOTALL | re.IGNORECASE)
@@ -69,6 +70,7 @@ class Scenario:
     trigger: float
     target: float
     invalid: float
+    confidence: int | None = None  # the AI's stated chance, in percent, that the target comes before the invalidation
 
     @property
     def risk(self) -> float:
@@ -139,12 +141,23 @@ def _scenario(row) -> Scenario | None:
         return None
     if not all(value > 0 and value == value and value != float("inf") for value in (trigger, target, invalid)):
         return None
+    confidence = _confidence(row.get("conf"))
     # The three levels must be in the order the side implies; anything else was misread or mistyped.
     if side == "long" and invalid < trigger < target:
-        return Scenario(side, trigger, target, invalid)
+        return Scenario(side, trigger, target, invalid, confidence)
     if side == "short" and target < trigger < invalid:
-        return Scenario(side, trigger, target, invalid)
+        return Scenario(side, trigger, target, invalid, confidence)
     return None
+
+
+def _confidence(raw) -> int | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if 0 < value < 1:
+        value *= 100  # written as a fraction
+    return int(round(value)) if 1 <= value <= 99 else None
 
 
 # --------------------------------------------------------------------- scoring
@@ -336,6 +349,11 @@ def scorecard_markdown(journal: Journal, now: float, tz, days: int = 30, inst_id
     if rest:
         lines.append("- " + "；".join(rest))
 
+    calibration = calibration_lines(hits + fails)
+    if calibration:
+        lines.append("**把握程度准不准 (calibration)**")
+        lines.extend(calibration)
+
     direction = _direction_lines(analyses)
     if direction:
         lines.append("**方向判断**")
@@ -361,6 +379,56 @@ def scorecard_markdown(journal: Journal, now: float, tz, days: int = 30, inst_id
     if decided < MIN_SAMPLE:
         lines.append(f"有结果的情景还不到 {MIN_SAMPLE} 个，这些比例现在说明不了什么，攒多了再看。")
     lines.append("这是把分析的点位和事后的行情做核对，不是交易记录，也不代表收益。")
+    return "\n".join(lines)
+
+
+CONFIDENCE_BANDS = ((1, 49, "50% 以下"), (50, 64, "50% 到 64%"), (65, 99, "65% 以上"))
+
+
+def calibration_lines(decided: list[dict]) -> list[str]:
+    """For scenarios that reached the target or the invalidation: how often each band of stated confidence was right."""
+    lines = []
+    for low, high, name in CONFIDENCE_BANDS:
+        band = [c for c in decided if c.get("confidence") is not None and low <= c["confidence"] <= high]
+        if not band:
+            continue
+        hits = sum(1 for c in band if c["status"] == "hit")
+        stated = sum(c["confidence"] for c in band) / len(band)
+        lines.append(f"- 说把握{name}的 {len(band)} 个：平均说 {stated:.0f}%，实际命中 {hits} 个（{_pct(hits, len(band))}）")
+    return lines
+
+
+def track_text_for_ai(journal: Journal, now: float, tz, days: int = 30) -> str:
+    """The AI's own track record in a few lines, read before it answers. Figures only; empty when nothing is recorded."""
+    start = now - days * 86400
+    analyses = journal.analyses_between(start, now + 1)
+    if not analyses:
+        return ""
+    calls = journal.calls_between(start, now + 1)
+    decided = [c for c in calls if c["status"] in ("hit", "failed")]
+    hits = sum(1 for c in decided if c["status"] == "hit")
+    lines = [f"你自己最近 {days} 天的成绩单（程序按 15 分钟 K 线自动核对，不是你自己打的分）："]
+    if decided:
+        valued = [c["result_r"] for c in calls if c["status"] in ("hit", "failed", "expired") and c["result_r"] is not None]
+        average = f"，触发过的情景平均 {sum(valued) / len(valued):+.2f}R" if valued else ""
+        lines.append(f"- 有结果的情景 {len(decided)} 个：命中 {hits} 个，失效 {len(decided) - hits} 个（{_pct(hits, len(decided))}）{average}")
+    else:
+        lines.append(f"- 记了 {len(calls)} 个情景，还没有走出结果的")
+    lines.extend(calibration_lines(decided))
+    lines.extend(_direction_lines(analyses))
+    settled = sorted((c for c in calls if c["status"] in ("hit", "failed", "expired")), key=lambda c: c["closed_ts"] or 0, reverse=True)
+    for call in settled[:3]:
+        when = datetime.fromtimestamp(call["ts"], tz=tz).strftime("%m-%d")
+        side = "多头" if call["side"] == "long" else "空头"
+        result = "" if call["result_r"] is None else f" {call['result_r']:+.2f}R"
+        conf = f"，当时说把握 {call['confidence']}%" if call.get("confidence") is not None else ""
+        lines.append(
+            f"- 最近结算：{when} {call['inst_id']} {side} 触发 {_level(call['trigger_px'])} 目标 {_level(call['target_px'])} "
+            f"失效 {_level(call['invalid_px'])}，{STATUS_WORDS[call['status']]}{result}{conf}"
+        )
+    if len(decided) < MIN_SAMPLE:
+        lines.append(f"- 有结果的还不到 {MIN_SAMPLE} 个，比例只作提醒，说明不了准不准。")
+    lines.append("用法：这些数字不改变你对眼下行情的判断，只用来写把握程度：最近失效得多，把握就写低一点、失效位写清楚。回答里不用提成绩单，除非他问。")
     return "\n".join(lines)
 
 

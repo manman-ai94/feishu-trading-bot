@@ -56,6 +56,7 @@ class Closed:
     realized: float | None  # pnl + fee + funding + liq_penalty, as OKX adds it up
     ccy: str
     closed_at: float  # seconds
+    opened_at: float | None = None  # seconds; when OKX created the position
 
     @classmethod
     def from_okx(cls, row: dict) -> Closed | None:
@@ -78,6 +79,7 @@ class Closed:
             realized=to_float(row.get("realizedPnl")),
             ccy=str(row.get("ccy", "")),
             closed_at=closed_at,
+            opened_at=_seconds(row.get("cTime")),
         )
 
 
