@@ -107,7 +107,8 @@ class SelfTest:
         except (ValueError, KeyError, TypeError):
             return NEVER_RUN
         if last.get("ok"):
-            text = f"{when} 在 v{version} 上通过（{inst_id}，{STEPS} 步）"
+            steps = f"，{last['steps']} 步" if last.get("steps") else ""  # runs before v0.15.0 did not note it
+            text = f"{when} 在 v{version} 上通过（{inst_id}{steps}）"
         else:
             text = f"{when} 在 v{version} 上没有通过，停在{last.get('at') or '开始之前'}（{inst_id}）"
         if version != __version__:
@@ -116,7 +117,7 @@ class SelfTest:
 
     def _remember(self, ok: bool) -> None:
         now = self._desk._clock()
-        value = {"ts": now, "version": __version__, "inst_id": self._inst_id, "ok": ok, "at": "" if ok else self._at}
+        value = {"ts": now, "version": __version__, "inst_id": self._inst_id, "ok": ok, "at": "" if ok else self._at, "steps": STEPS}
         self._journal.set_setting(SETTING, json.dumps(value, ensure_ascii=False))
         outcome = f"{STEPS} 步都通过" if ok else f"没有通过，停在{self._at}"
         # One line for the day's events, not one per step: the steps are in the order record.

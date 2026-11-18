@@ -175,7 +175,7 @@ def test_a_pass_is_remembered_and_shown_in_the_settings():
     last = last_run(bench)
     assert last["ok"] is True and last["version"] == __version__ and last["inst_id"] == XAU
     line = next(line for line in bench.desk.status_lines() if line.startswith("**模拟盘自测**"))
-    assert f"在 v{__version__} 上通过" in line and XAU in line and "还没有跑过" not in line
+    assert f"在 v{__version__} 上通过（{XAU}，{STEPS} 步）" in line and "还没有跑过" not in line
 
 
 def test_a_pass_on_an_older_version_is_said_to_be_old():
@@ -183,7 +183,7 @@ def test_a_pass_on_an_older_version_is_said_to_be_old():
     value = {"ts": bench.clock(), "version": "0.0.1", "inst_id": XAU, "ok": True, "at": ""}
     bench.journal.set_setting(SETTING, json.dumps(value))
     line = next(line for line in bench.desk.status_lines() if line.startswith("**模拟盘自测**"))
-    assert "v0.0.1 上通过" in line and f"现在是 v{__version__}，这个版本还没有跑过" in line
+    assert "v0.0.1 上通过（XAU-USDT-SWAP）" in line and f"现在是 v{__version__}，这个版本还没有跑过" in line  # no step count it never noted
 
 
 def test_a_record_that_cannot_be_read_counts_as_never_run():
