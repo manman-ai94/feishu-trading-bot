@@ -277,9 +277,14 @@ def deploy(
     return 2
 
 
+def _same_lines(data: bytes) -> bytes:
+    """Line endings left out of a comparison: a file written on Windows ends its lines with CR LF."""
+    return data.replace(b"\r\n", b"\n")
+
+
 def _check(root: Path, python: str, requirements_before: bytes, done_wishes: str, run: Callable) -> str:
     """The packages and the tests of the unpacked code. "" when all is well, else why not."""
-    if (root / "requirements.txt").read_bytes() != requirements_before:
+    if _same_lines((root / "requirements.txt").read_bytes()) != _same_lines(requirements_before):
         say("requirements.txt changed: installing packages")
         installed = run([python, "-m", "pip", "install", "-r", "requirements.txt"], timeout=900)
         if installed.returncode != 0:

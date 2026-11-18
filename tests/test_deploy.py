@@ -85,6 +85,13 @@ def test_a_good_version_goes_in_and_nothing_private_is_touched(tmp_path, capsys)
     assert "tests: 944 passed" in out and out.strip().endswith("RESULT: v0.14.1 is running")
 
 
+def test_requirements_that_differ_only_in_line_endings_install_nothing(tmp_path):
+    box = Box(tmp_path)
+    (box.root / "requirements.txt").write_bytes(b"lark-oapi==1.7.5\r\n")  # as Windows writes it
+    assert box.deploy() == 0
+    assert not any("pip" in c for c in box.calls)
+
+
 def test_the_tests_run_are_the_new_ones_not_the_old_code_kept_aside(tmp_path):
     """The old code kept in rollback/ has its own tests/ folder: collected too, the two collide by name."""
     box = Box(tmp_path)
