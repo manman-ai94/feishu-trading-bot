@@ -285,7 +285,8 @@ def _check(root: Path, python: str, requirements_before: bytes, done_wishes: str
         if installed.returncode != 0:
             say(_tail(installed.stdout or "") + "\n" + _tail(installed.stderr or ""))
             return "pip install failed"
-    tests = run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider"], timeout=900)
+    # Only tests/: the old code kept in rollback/ has a tests/ folder of its own, and the two would collide.
+    tests = run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests", "--ignore=rollback"], timeout=900)
     summary = (tests.stdout or "").strip().splitlines()[-1:] or ["(no output)"]
     say(f"tests: {summary[0]}")
     if tests.returncode != 0:
