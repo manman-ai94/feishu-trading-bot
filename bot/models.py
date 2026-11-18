@@ -33,6 +33,8 @@ class StopOrder:
     algo_id: str
     sl_trigger_px: float | None = None
     tp_trigger_px: float | None = None
+    whole: bool = True  # closes the whole position whatever its size (closeFraction=1); False: a set size, e.g. one an order brought
+    size: float | None = None  # contracts, when it closes a set size
 
 
 @dataclass(frozen=True)
@@ -347,6 +349,8 @@ class OrderInfo:
     c_time: int = 0
     pnl: float | None = None  # what a closing order made or lost, before fees; in the settlement currency
     fee: float | None = None  # negative when a fee was charged
+    sl_trigger_px: float | None = None  # the stop-loss that comes with it once it fills
+    tp_trigger_px: float | None = None
 
     @property
     def remaining(self) -> float:
@@ -370,4 +374,14 @@ class OrderInfo:
             c_time=int(to_float(row.get("cTime")) or 0),
             pnl=to_float(row.get("pnl")),
             fee=to_float(row.get("fee")),
+            sl_trigger_px=_attached_px(row, "slTriggerPx"),
+            tp_trigger_px=_attached_px(row, "tpTriggerPx"),
         )
+
+
+def _attached_px(row: dict, key: str) -> float | None:
+    """A take-profit or stop-loss price that comes with an order: in attachAlgoOrds, or (older orders) on the row itself."""
+    for attached in row.get("attachAlgoOrds") or []:
+        if isinstance(attached, dict) and to_float(attached.get(key)):
+            return to_float(attached.get(key))
+    return to_float(row.get(key)) or None

@@ -55,6 +55,7 @@ class FakeExchange:
         self.lever = 100.0
         self.available = 1000.0
         self.pending: list[OrderInfo] = []
+        self.algos: list[dict] = []  # trigger orders waiting, as OKX sends them
         self.orders: dict[str, OrderInfo] = {}
         self.changes: list[tuple[str, dict]] = []
         self.failures: dict[str, list[Exception]] = {}  # raised instead of doing the thing
@@ -84,6 +85,9 @@ class FakeExchange:
 
     def pending_orders(self, inst_id: str | None = None) -> list[OrderInfo]:
         return [order for order in self.pending if not inst_id or order.inst_id == inst_id]
+
+    def pending_algos(self, ord_type: str) -> list[dict]:
+        return [row for row in self.algos if row.get("ordType") in ord_type.split(",")]
 
     def order(self, inst_id: str, ord_id: str = "", cl_ord_id: str = "") -> OrderInfo:
         if self.lookup_failures:
@@ -744,7 +748,7 @@ def test_hedge_mode_names_the_position_side():
 def test_adding_follows_the_position_and_its_margin_mode():
     bench = Bench(FakeExchange([small(direction="short", mgn_mode="isolated")]))
     preview = bench.say("加仓 XAU 100张")
-    assert "市价做空" in preview.text and "逐仓" in preview.text
+    assert "市价加空" in preview.text and "逐仓" in preview.text
     bench.say("确认 1111")
     assert bench.sent[0][1]["side"] == "sell" and bench.sent[0][1]["td_mode"] == "isolated"
     assert "没有仓位，没法加仓" in Bench().say("加仓 XAU 100张").text
@@ -1263,12 +1267,66 @@ def test_removing_stops():
     assert "本来就没有止盈止损单" in Bench(FakeExchange([gold()])).say("取消止损 XAU").text
 
 
-def test_several_stop_orders_on_one_position_are_not_guessed_between():
-    stops = (StopOrder("a1", 3700.0, None), StopOrder("a2", 3750.0, None))
+def test_several_stops_on_one_position_are_merged_into_one_new_one_first():
+    stops = (StopOrder("a1", 3700.0, 3950.0, whole=False, size=5000.0), StopOrder("a2", 3750.0, 3950.0, whole=False, size=5000.0))
     bench = Bench(FakeExchange([gold(stops=stops)]))
-    assert "有 2 张止盈止损单，我分不清你要改哪一张" in bench.say("止损 XAU 3860").text
+    preview = bench.say("止损 XAU 3860").text
+    assert "合并止盈止损 XAU-USDT-SWAP 多单" in preview
+    assert "现在有 2 张：止损 3,700.0、止盈 3,950.0（管 5 XAU）；止损 3,750.0、止盈 3,950.0（管 5 XAU）" in preview
+    assert "止损 3,860.0（离现价" in preview and "止盈 3,950.0（离现价" in preview and "中间不会没有止损" in preview
+    bench.say("确认 1111")
+    assert bench.sent == [
+        ("place_stop", {"inst_id": XAU, "td_mode": "cross", "side": "sell", "sl_trigger_px": "3860", "tp_trigger_px": "3950", "cl_ord_id": "ftb0001"}),
+        ("cancel_stops", {"items": [(XAU, "a1"), (XAU, "a2")]}),
+    ]
+
+
+def test_merging_moves_a_whole_position_stop_and_takes_off_the_rest():
+    stops = (StopOrder("w1", 3700.0, None), StopOrder("p1", 3750.0, None, whole=False, size=2000.0))
+    bench = Bench(FakeExchange([gold(stops=stops)]))
+    bench.run("止损 XAU 3860")
+    assert bench.sent == [
+        ("amend_stop", {"inst_id": XAU, "algo_id": "w1", "sl_trigger_px": "3860"}),
+        ("cancel_stops", {"items": [(XAU, "p1")]}),
+    ]
+
+
+def test_merging_stops_at_different_prices_needs_the_new_stop_written():
+    stops = (StopOrder("a1", 3700.0, None, whole=False, size=1.0), StopOrder("a2", 3750.0, None, whole=False, size=1.0))
+    bench = Bench(FakeExchange([gold(stops=stops)]))
+    assert "止损价不一样（3,700.0、3,750.0）。要合成一张，请一起写上止损：止损 XAU 价格 止盈 3950" in bench.say("止盈 XAU 3950").text
     bench.run("取消止盈止损 XAU")
     assert bench.sent == [("cancel_stops", {"items": [(XAU, "a1"), (XAU, "a2")]})]
+
+
+def test_a_market_addition_leaves_one_stop_for_the_whole_position():
+    bench = Bench(FakeExchange([small(stops=(StopOrder("p1", 3800.0, None, whole=False, size=200.0),))]))
+    preview = bench.say("加仓 XAU 0.1个 止损 3850").text
+    assert "市价加多 XAU-USDT-SWAP" in preview
+    assert "合成一张止损：加仓成交后，整个仓位（原有 0.2 + 这次 0.1 XAU）都用止损 3,850.0，原来的止损（3,800.0）不再用" in preview
+    bench.say("确认 1111")
+    calls = [call for call, _ in bench.sent]
+    assert calls == ["place_order", "place_stop", "cancel_stops"]
+    assert "sl_trigger_px" not in bench.sent[0][1]  # the order itself carries no stop of its own
+    assert bench.sent[1][1]["sl_trigger_px"] == "3850" and bench.sent[2][1] == {"items": [(XAU, "p1")]}
+
+
+def test_a_limit_addition_keeps_its_own_stop_and_says_how_to_merge():
+    bench = Bench(FakeExchange([small(stops=(StopOrder("w1", 3800.0, None),))]))
+    preview = bench.say("限价加仓 XAU 0.1个 3870 止损 3850").text
+    assert "要和原来的合成一张，成交后发“止损 XAU 3850”" in preview
+    bench.say("确认 1111")
+    assert [call for call, _ in bench.sent] == ["place_order"] and bench.sent[0][1]["sl_trigger_px"] == "3850"
+
+
+def test_an_addition_that_cannot_put_the_whole_stop_on_says_so_loudly():
+    exchange = FakeExchange([small(stops=(StopOrder("p1", 3800.0, None, whole=False, size=200.0),))])
+    exchange.failures["place_stop"] = [OkxError("51000", "Parameter error")]
+    bench = Bench(exchange)
+    bench.say("加仓 XAU 0.1个 止损 3850")
+    reply = bench.say("确认 1111").text
+    assert "加仓单已经下了，但整仓止损没有全部做完" in reply
+    assert [call for call, _ in bench.sent] == ["place_order", "place_stop"]  # the old stop stays on
 
 
 def test_a_stop_that_would_trigger_at_once_is_refused():
@@ -1513,3 +1571,41 @@ def test_an_opening_preview_shows_how_orders_of_the_kind_have_done_once_there_ar
     bench.journal.record_review(inst_id=XAU, direction="long", closed_at=bench.clock() - 3600, r_multiple=0.5, source="own")
     bench.journal.record_review(inst_id=XAU, direction="long", closed_at=bench.clock() - 3600, r_multiple=-1.0, source="plan")
     assert "这类单（自己写的指令）最近 180 天平仓 5 笔，平均 +0.40R，赚 3 笔" in bench.say("做多 XAU 0.1个 止损 3850").text
+
+
+# ------------------------------------------------------------------ total risk
+
+
+def test_the_total_risk_counts_every_stop_and_a_risk_sized_open_is_cut_to_fit():
+    exchange = FakeExchange([gold(stops=(StopOrder("w1", 3840.8, None),))])  # 10 XAU, 40 below: 408 at risk
+    exchange.pending.append(OrderInfo("9", XAU, "buy", px=3800.0, sz=1000.0, state="live", sl_trigger_px=3780.0))  # 1 XAU, 20
+    exchange.algos.append({"ordType": "trigger", "instId": XAU, "side": "buy", "posSide": "net", "sz": "1000", "triggerPx": "3900",
+                           "orderPx": "-1", "attachAlgoOrds": [{"slTriggerPx": "3870"}]})  # 1 XAU, 30
+    bench = Bench(exchange, **roomy(trade_max_total_risk_pct=25.0))
+    preview = bench.say("限价做多 BTC 64000 止损 63000").text  # a new instrument: the cap is what is left of 500
+    assert "账户现在所有止损都打到要亏约 450.00，占权益 22.5%，总风险上限 25% 还剩约 50.00，按它减到 5 张（合 0.05 BTC）" in preview
+    assert "账户总风险（所有止损都打到）：现有约 450.00，加上这张约 50.00，合计约 500.00 USDT，占权益 25.0%" in preview
+
+
+def test_a_stated_size_over_the_total_risk_is_refused_with_what_still_fits():
+    exchange = FakeExchange([gold(stops=(StopOrder("w1", 3840.8, None),))])
+    bench = Bench(exchange, **roomy(trade_max_total_risk_pct=25.0))
+    refusal = bench.say("限价做多 BTC 0.2个 64000 止损 63000").text
+    assert "加上这张会超过你定的账户总风险 25%（TRADE_MAX_TOTAL_RISK_PCT）。按这个止损最多还能开 10 张（合 0.1 BTC）" in refusal
+    assert bench.sent == []
+
+
+def test_what_cannot_be_measured_is_named_and_a_bare_position_counts_to_its_liquidation():
+    exchange = FakeExchange([gold()])  # no stop: counted to its liquidation price 3,713.07
+    exchange.pending.append(OrderInfo("9", XAU, "buy", px=3800.0, sz=1000.0, state="live"))
+    bench = Bench(exchange, **roomy())
+    preview = bench.say("限价做多 BTC 0.01个 64000 止损 63000").text
+    assert "现有约 1,677.30" in preview  # (3,880.8 - 3,713.07) x 10
+    assert "没算进去（算不出）：XAU-USDT-SWAP 挂单买 3,800（1），没带止损" in preview
+
+
+def test_a_rough_liquidation_price_and_a_stop_beyond_it():
+    bench = Bench(**roomy())
+    preview = bench.say("做多 XAU 10个 止损 3600").text
+    assert "粗估强平价约 3,680.0（全仓，按账户权益亏光算；实际强平会早一点，以 OKX 显示为准）" in preview
+    assert "止损在粗估强平价外面" in preview

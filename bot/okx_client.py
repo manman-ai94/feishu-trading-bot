@@ -361,10 +361,13 @@ def attach_stops(positions: list[Position], algo_orders: list[dict]) -> list[Pos
             algo_id = str(order.get("algoId", ""))
             if algo_id in known:
                 continue
+            whole = str(order.get("closeFraction", "")) == "1"
             stop = StopOrder(
                 algo_id=algo_id,
                 sl_trigger_px=to_float(order.get("slTriggerPx")),
                 tp_trigger_px=to_float(order.get("tpTriggerPx")),
+                whole=whole,
+                size=None if whole else to_float(order.get("sz")),
             )
             if stop.sl_trigger_px or stop.tp_trigger_px:
                 extra.append(stop)

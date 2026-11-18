@@ -39,6 +39,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
 
 from .closes import Hit, hit_line, read_closed, read_triggers, stop_hits
+from .exposure import Exposure, Piece, measure
 from .config import STOP_TRIGGERS, TRADE_ACTIONS, Config
 from .instruments import ALIASES, InstrumentResolver
 from .journal import Journal
@@ -1474,6 +1475,31 @@ class TradeDesk:
                     sized += f"；这超过了{which}，按上限减到 {_contracts_text(capped, spec)}，打到止损时亏得也相应少"
                     contracts, value = capped, capped * per_contract * ref
 
+        exposure = self._exposure(state)
+        merge = bool(same) and sl is not None and px is None  # a market addition: one stop for the whole position
+        held_coins = sum((_dec(p.qty) for p in same), Decimal(0)) * per_contract
+        mark = _dec(same[0].mark_px or last) if same else last
+        others = exposure.without(inst_id, direction) if merge else exposure
+        kept = abs(mark - sl) * held_coins if merge else Decimal(0)  # the held part, under the new stop
+        total_cap = cfg.trade_max_total_risk_pct
+        if total_cap is not None and sl is not None and equity > 0:
+            line = equity * _dec(total_cap) / 100
+            room = line * (CONFIRM_RISK_SLACK if previous is not None else 1) - others.loss - kept
+            gap = abs(ref - sl)
+            if gap * contracts * per_contract > room:
+                fits = _floor_to(max(room, Decimal(0)) / gap / per_contract, spec.lot_sz)
+                where = f"账户现在所有止损都打到要亏约 {_amt(others.loss + kept)}，占权益 {(others.loss + kept) / equity * 100:.1f}%"
+                if cmd.unit == "risk" and previous is None and fits >= spec.min_sz and fits > 0:
+                    sized += f"；{where}，总风险上限 {total_cap:g}% 还剩约 {_amt(max(room, Decimal(0)))}，按它减到 {_contracts_text(fits, spec)}"
+                    contracts, value = fits, fits * per_contract * ref
+                else:
+                    most = f"按这个止损最多还能开 {_contracts_text(fits, spec)}" if fits >= spec.min_sz and fits > 0 else "按这个止损已经放不下了"
+                    raise Refused(
+                        (f"{sized}。" if sized else "")
+                        + f"{where}；加上这张会超过你定的账户总风险 {total_cap:g}%（TRADE_MAX_TOTAL_RISK_PCT）。{most}。"
+                        "可以先平掉或减掉别的仓位、撤掉挂单，或者把止损放近一点。"
+                    )
+
         if value > max_order:
             hint = f"这张单最多能开约 {_contracts_text(_floor_to(max_order / (per_contract * ref), spec.lot_sz), spec)}。"
             raise Refused(
@@ -1549,6 +1575,12 @@ class TradeDesk:
         else:
             lines.append("止盈 无")
         lines.append(f"下单后 {inst_id} 的{word}单约 {_amt(total)} {settle}（上限 {cfg.trade_max_position_usd:,.0f}）")
+        lines.extend(self._total_risk_lines(others, kept, (abs(ref - sl) * coins) if sl is not None else None, equity, settle))
+        liq = self._liquidation_estimate(state, inst_id, direction, td_mode, lever, held_coins, mark, ref, coins, equity, value)
+        if liq is not None:
+            lines.append(f"粗估强平价约 {_px(liq, spec)}（{'全仓，按账户权益亏光算' if td_mode == 'cross' else '逐仓，按这张单的保证金亏光算'}；实际强平会早一点，以 OKX 显示为准）")
+            if sl is not None and ((long and sl <= liq) or (not long and sl >= liq)):
+                lines.append("**注意：止损在粗估强平价外面，价格到止损之前可能先强平**")
         track = self._source_line(cmd.source) if previous is None else ""
         if track:
             lines.append(track)
@@ -1558,15 +1590,147 @@ class TradeDesk:
             args["px"] = _plain(px)
         if pos_side:
             args["pos_side"] = pos_side
-        if sl is not None:
-            args["sl_trigger_px"] = _plain(sl)
-        if tp is not None:
-            args["tp_trigger_px"] = _plain(tp)
-        title = f"{'限价' if px is not None else '市价'}做{word} {inst_id}"
+        steps = [Step("place_order", args, "开仓" if not same else "加仓")]
+        if merge:
+            stop_steps, stop_lines = self._merged_stop(same[0], sl, tp, td_mode, pos_side, spec, held_coins, coins, mark, ref, settle)
+            steps.extend(stop_steps)
+            lines.extend(stop_lines)
+        else:
+            if sl is not None:
+                args["sl_trigger_px"] = _plain(sl)
+            if tp is not None:
+                args["tp_trigger_px"] = _plain(tp)
+            if same and sl is not None:
+                lines.append(
+                    f"这张限价单成交后，加的这部分单独带止损；要和原来的合成一张，成交后发“止损 {base} {_plain(sl)}”"
+                )
+        title = f"{'限价' if px is not None else '市价'}{'加' if same else '做'}{word} {inst_id}"
         data = {"sz": _plain(contracts), "ref": _plain(last), "positions": self._fingerprint(held)}
         if sized:
             data["sized"] = sized
-        return Plan("open", title, tuple(lines), (Step("place_order", args, "开仓"),), inst_id, data)
+        return Plan("open", title, tuple(lines), tuple(steps), inst_id, data)
+
+    def _merged_stop(
+        self, position: Position, sl: Decimal, tp: Decimal | None, td_mode: str, pos_side: str | None, spec: InstrumentSpec,
+        held_coins: Decimal, coins: Decimal, mark: Decimal, ref: Decimal, settle: str,
+    ) -> tuple[list[Step], list[str]]:  # fmt: skip
+        """After a market addition: one stop for the whole position, at the new price."""
+        olds = "、".join(_px(s.sl_trigger_px, spec) for s in position.stops if s.sl_trigger_px) or "无"
+        tps = {s.tp_trigger_px for s in position.stops if s.tp_trigger_px}
+        keep_tp = tp if tp is not None else (_dec(next(iter(tps))) if len(tps) == 1 else None)
+        lines = [
+            f"合成一张止损：加仓成交后，整个仓位（原有 {_plain(held_coins)} + 这次 {_plain(coins)} {spec.ct_val_ccy}）"
+            f"都用止损 {_px(sl, spec)}，原来的止损（{olds}）不再用；打到时整个仓位从现在算约亏 "
+            f"{_amt(abs(mark - sl) * held_coins + abs(ref - sl) * coins)} {settle}"
+        ]
+        if tp is None and len(tps) > 1:
+            lines.append("原来几张的止盈价不一样，合成后不带止盈；要的话成交后再发“止盈 品种 价格”")
+        steps, notes = self._whole_stop_steps(position, sl, keep_tp, tp is not None, td_mode, pos_side, spec)
+        lines.extend(notes)
+        return steps, lines
+
+    def _whole_stop_steps(
+        self, position: Position, sl: Decimal | None, tp: Decimal | None, tp_given: bool, td_mode: str,
+        pos_side: str | None, spec: InstrumentSpec,
+    ) -> tuple[list[Step], list[str]]:  # fmt: skip
+        """The steps that leave the position with one stop for the whole of it, at `sl` and `tp`, whatever stops it has
+        now. A whole-position stop that has a stop-loss already is moved, so there is no moment without one; otherwise
+        the new one goes on first and the old ones (each covering only the size it came with) come off after. OKX allows
+        one whole-position stop at a time, so one without a stop-loss is taken off before the new one goes on."""
+        inst_id = position.inst_id
+        closing_side = "sell" if position.direction == "long" else "buy"
+        old = list(position.stops)
+        steps: list[Step] = []
+        notes: list[str] = []
+        whole_sl = [s for s in old if s.whole and s.sl_trigger_px]
+        if sl is not None and whole_sl:
+            keep = whole_sl[0]
+            change = {"inst_id": inst_id, "algo_id": keep.algo_id, "sl_trigger_px": _plain(sl)}
+            if tp_given and tp is not None and keep.tp_trigger_px:
+                change["tp_trigger_px"] = _plain(tp)
+            elif tp_given and tp is not None:
+                notes.append(f"止盈 {_px(tp, spec)} 这次没加上：原来那张整仓单不带止盈，改不出来；之后再发“止盈 {inst_id.split('-')[0]} {_plain(tp)}”")
+            steps.append(Step("amend_stop", change, "把整仓止损改到新价位"))
+            rest = [s for s in old if s is not keep]
+        else:
+            whole = [s for s in old if s.whole]
+            if whole:
+                steps.append(Step("cancel_stops", {"items": [[inst_id, s.algo_id] for s in whole]}, "撤掉原来的整仓止盈止损单"))
+            rest = [s for s in old if not s.whole]
+            if sl is not None or tp is not None:
+                place = {"inst_id": inst_id, "td_mode": position.mgn_mode or td_mode, "side": closing_side}
+                if pos_side:
+                    place["pos_side"] = pos_side
+                if sl is not None:
+                    place["sl_trigger_px"] = _plain(sl)
+                if tp is not None:
+                    place["tp_trigger_px"] = _plain(tp)
+                steps.append(Step("place_stop", place, "挂上整个仓位的止盈止损"))
+        if rest:
+            steps.append(Step("cancel_stops", {"items": [[inst_id, s.algo_id] for s in rest]}, "撤掉原来只管一部分的止盈止损"))
+        if steps and steps[0].call != "cancel_stops":
+            notes.append("先挂好（或改好）整仓的，再撤旧的，中间不会没有止损")
+        return steps, notes
+
+    def _exposure(self, state: AccountState) -> Exposure:
+        """Every stop on the account and what it would cost: positions, and orders waiting to open."""
+        specs: dict[str, Decimal | None] = {}
+
+        def per(inst_id: str) -> Decimal | None:
+            if inst_id not in specs:
+                try:
+                    specs[inst_id] = self._okx.instrument_spec(inst_id).coins_per_contract
+                except (OkxError, OkxNetworkError):
+                    specs[inst_id] = None
+            return specs[inst_id]
+
+        orders = self._okx.pending_orders()
+        missing: list[Piece] = []
+        try:
+            triggers = [row for row in self._okx.pending_algos("trigger") if isinstance(row, dict)]
+        except (OkxError, OkxNetworkError) as exc:
+            log.warning("could not read the trigger orders: %s", exc)
+            triggers, missing = [], [Piece("突破单（计划委托）这次没读到", None)]
+        exposure = measure(state, orders, triggers, per)
+        exposure.pieces.extend(missing)
+        return exposure
+
+    @staticmethod
+    def _total_risk_lines(others: Exposure, kept: Decimal, this: Decimal | None, equity: Decimal, settle: str) -> list[str]:
+        if this is None:
+            return []
+        now = others.loss + kept
+        total = now + this
+        share = f"，占权益 {total / equity * 100:.1f}%" if equity > 0 else ""
+        count = len([p for p in others.pieces if p.loss is not None])
+        before = f"现有约 {_amt(now)}，" if now > 0 or count else ""
+        lines = [f"账户总风险（所有止损都打到）：{before}加上这张约 {_amt(this)}，合计约 {_amt(total)} {settle}{share}"]
+        unknown = others.unknown
+        if unknown:
+            lines.append("没算进去（算不出）：" + "；".join(p.label for p in unknown[:4]))
+        return lines
+
+    def _liquidation_estimate(
+        self, state: AccountState, inst_id: str, direction: str, td_mode: str, lever: float | None,
+        held_coins: Decimal, mark: Decimal, entry: Decimal, coins: Decimal, equity: Decimal, value: Decimal,
+    ) -> Decimal | None:  # fmt: skip
+        """Where the position would be liquidated, roughly: cross, when the equity is gone (only when this is the
+        one instrument with a position); isolated, when this order's margin is gone (only for a new position)."""
+        long = direction == "long"
+        after = held_coins + coins
+        if after <= 0:
+            return None
+        if td_mode == "cross":
+            if any(p.inst_id != inst_id or p.direction != direction for p in state.positions) or equity <= 0:
+                return None
+            moved = (mark * held_coins + entry * coins - equity) if long else (mark * held_coins + entry * coins + equity)
+            estimate = moved / after
+        else:
+            if held_coins > 0 or not lever:
+                return None
+            margin = value / _dec(lever)
+            estimate = entry - margin / coins if long else entry + margin / coins
+        return estimate if estimate > 0 else None
 
     def _source_line(self, source: str) -> str:
         """How orders that came the same way have done, once there are enough of them to say."""
@@ -1834,10 +1998,7 @@ class TradeDesk:
         if not stops and clearing:
             raise Refused(f"{inst_id} {word}单上本来就没有止盈止损单。")
         if len(stops) > 1 and not (cmd.clear_sl and cmd.clear_tp):
-            raise Refused(
-                f"{inst_id} {word}单上有 {len(stops)} 张止盈止损单，我分不清你要改哪一张。"
-                f"可以先发“取消止盈止损 {inst_id.split('-')[0]}”全部撤掉再重新设，或者在 OKX 里改。"
-            )
+            return self._plan_merge(cmd, account, position, spec)
         old_sl = _dec(stops[0].sl_trigger_px) if len(stops) == 1 and stops[0].sl_trigger_px else None
         old_tp = _dec(stops[0].tp_trigger_px) if len(stops) == 1 and stops[0].tp_trigger_px else None
         new_sl = None if cmd.clear_sl else (_round_to(cmd.sl, spec.tick_sz) if cmd.sl is not None else old_sl)
@@ -1898,6 +2059,63 @@ class TradeDesk:
             *notes,
         ]
         return Plan("stop", title, tuple(lines), steps, inst_id, {"positions": self._fingerprint([position])})
+
+    def _plan_merge(self, cmd: Command, account: AccountConfig, position: Position, spec: InstrumentSpec) -> Plan:
+        """A position with several stops (each addition brought its own): one stop for the whole of it."""
+        inst_id = position.inst_id
+        base = inst_id.split("-")[0]
+        word = _side_word(position.direction)
+        stops = position.stops
+        sls = sorted({s.sl_trigger_px for s in stops if s.sl_trigger_px})
+        tps = sorted({s.tp_trigger_px for s in stops if s.tp_trigger_px})
+        if cmd.clear_sl:
+            new_sl = None
+        elif cmd.sl is not None:
+            new_sl = _round_to(cmd.sl, spec.tick_sz)
+        elif len(sls) == 1:
+            new_sl = _dec(sls[0])
+        elif sls:
+            raise Refused(
+                f"{inst_id} {word}单上有 {len(stops)} 张止盈止损单，止损价不一样（{'、'.join(self._price(v, spec) for v in sls)}）。"
+                f"要合成一张，请一起写上止损：止损 {base} 价格" + (f" 止盈 {_plain(_dec(cmd.tp))}" if cmd.tp is not None else "")
+            )
+        else:
+            new_sl = None
+        notes: list[str] = []
+        if cmd.clear_tp:
+            new_tp = None
+        elif cmd.tp is not None:
+            new_tp = _round_to(cmd.tp, spec.tick_sz)
+        elif len(tps) == 1:
+            new_tp = _dec(tps[0])
+        else:
+            new_tp = None
+            if tps:
+                notes.append(f"原来几张的止盈不一样（{'、'.join(self._price(v, spec) for v in tps)}），合成后不带止盈；要的话再发“止盈 {base} 价格”")
+        last = _dec(self._okx.ticker(inst_id).last)
+        self._check_stop_sides(position.direction, last, new_sl, new_tp, "现价", spec)
+        pos_side = position.pos_side if account.hedge_mode and position.pos_side in ("long", "short") else None
+        steps, more = self._whole_stop_steps(position, new_sl, new_tp, cmd.tp is not None, position.mgn_mode, pos_side, spec)
+        coins = _dec(position.qty) * spec.coins_per_contract
+        average = _dec(position.avg_px) if position.avg_px else None
+        old_text = "；".join(
+            "、".join(part for part in (
+                f"止损 {self._price(s.sl_trigger_px, spec)}" if s.sl_trigger_px else "",
+                f"止盈 {self._price(s.tp_trigger_px, spec)}" if s.tp_trigger_px else "",
+            ) if part) + (f"（管 {_plain(_dec(s.size) * spec.coins_per_contract)} {spec.ct_val_ccy}）" if s.size and not s.whole else "（整个仓位）")
+            for s in stops
+        )  # fmt: skip
+        lines = [
+            f"仓位 {_contracts_text(_dec(position.qty), spec)}，均价 {self._price(position.avg_px or 0, spec)}，现价 {_px(last, spec)}",
+            f"现在有 {len(stops)} 张：{old_text}",
+            f"合成一张，管整个仓位，触发后按市价全部平掉：",
+            self._stop_line("止损", None, new_sl, last, average, coins, position, spec, None).replace("止损 无 → ", "止损 "),
+            self._stop_line("止盈", None, new_tp, last, average, coins, position, spec, None).replace("止盈 无 → ", "止盈 "),
+            *notes,
+            *more,
+        ]
+        title = f"合并止盈止损 {inst_id} {word}单"
+        return Plan("stop", title, tuple(line for line in lines if line), tuple(steps), inst_id, {"positions": self._fingerprint([position])})
 
     @staticmethod
     def _stop_line(
@@ -1973,6 +2191,8 @@ class TradeDesk:
             result, heading, template = "ok", "已执行", "green"
         if plan.action == "stop" and result != "ok" and done and plan.steps[0].call == "cancel_stops" and len(plan.steps) > 1:
             lines.append("**注意：原来的止盈止损已经撤掉，新的没有挂上。现在这个仓位没有止盈止损，请马上重新设一次。**")
+        if plan.action == "open" and result in ("partial", "unknown") and done and len(plan.steps) > 1:
+            lines.append("**注意：加仓单已经下了，但整仓止损没有全部做完。请马上发“仓位”看止损，再发“止损 品种 价格”补上。**")
         if result in ("unknown", "partial"):
             lines.append("请发“仓位”和“挂单”核对实际情况。我不会自动重试。")
         now = self._clock()
