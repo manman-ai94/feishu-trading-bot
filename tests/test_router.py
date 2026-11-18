@@ -450,18 +450,20 @@ def test_a_group_registration_that_cannot_be_saved_is_flagged():
     assert "已登记本群" in reply.body and "重启后需要重新登记" in reply.body and bench.cfg.group_chat_id == "oc_new"
 
 
-def test_restart_is_for_the_owner_in_private_chat():
+def test_restart_is_for_the_owner_in_either_chat():
     bench = Bench()
     [reply] = bench.say("重启")
     assert "我现在重启" in reply.body and bench.restarts == 1
     [reply] = bench.say("/restart", message_id="om_again")
     assert bench.restarts == 2
-    [reply] = bench.say("重启", private=False)
-    assert "私聊" in reply.body and bench.restarts == 2
+    [reply] = bench.say("重启", private=False, message_id="om_group")
+    assert "我现在重启" in reply.body and "在私聊里给你发" in reply.body and bench.restarts == 3
     [reply] = bench.say("重启", sender=FRIEND)
-    assert "只响应主人" in reply.body and bench.restarts == 2
+    assert "只响应主人" in reply.body and bench.restarts == 3
+    [reply] = bench.say("重启", sender=FRIEND, private=False, message_id="om_friend")
+    assert "只响应主人" in reply.body and bench.restarts == 3
     bench.say("重启以后密钥会生效吗")  # a question, not the command
-    assert bench.restarts == 2 and len(bench.analyst.named("answer")) == 1
+    assert bench.restarts == 3 and len(bench.analyst.named("answer")) == 1
 
     bench.router._restart = None
     [reply] = bench.say("重启", message_id="om_third")
@@ -1004,3 +1006,61 @@ def test_the_order_reader_is_shown_the_earlier_answers():
     assert command == "限价做多 XAU 3850 止损 3820 止盈 3950"
     assert seen["tier"] == "quick" and "前面的对话" in seen["user"] and "交易助手答：情景一" in seen["user"]
     assert seen["user"].index("前面的对话") < seen["user"].index("他发的话：按你说的挂")
+
+
+# ------------------------------------------- the group and the private chat do the same for the owner
+
+GROUP_ONLY_LINES = ("在群里回复要先 @我；只有你本人回的确认码有效。", "在私聊里")
+
+
+def _same_everywhere(text: str) -> str:
+    for line in GROUP_ONLY_LINES:
+        text = text.replace(line, "")
+    return text
+
+
+def _conversation(private: bool, messages) -> tuple[list[tuple[str, str]], list[dict], list[dict], int]:
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    replies = []
+    for number, (text, command, reply) in enumerate(messages):
+        bench.analyst.command, bench.analyst.reply = command, reply
+        for sent in bench.say(text, private=private, message_id=f"om_{number}"):
+            replies.append((sent.title, _same_everywhere(sent.body)))
+    answers = [
+        dict({k: v for k, v in call.items() if k != "in_group"}, history=[(q, _same_everywhere(a)) for q, a in call["history"]])
+        for call in bench.analyst.named("answer")
+    ]
+    commands = bench.analyst.named("to_command")
+    return replies, answers, commands, bench.restarts
+
+
+def test_everything_the_owner_can_do_in_private_he_can_do_in_the_group_with_the_same_result():
+    plan = "情景一：回踩 3850 做多，止损 3820，目标 3950，把握约 55%。"
+    messages = [  # (what he says, what the AI's order reading gives, what the AI answers)
+        ("仓位", "", None),
+        ("黄金报价", "", None),
+        ("那白银怎么看", "", None),
+        ("查询我现在的仓位和挂单情况", "", None),
+        ("黄金现在怎么挂单比较好", "", plan),
+        ("就按你刚才说的情景一挂上", "限价做多 XAU 1张 3850 止损 3820 止盈 3950", None),
+        ("取消", "", None),
+        ("做多 XAU 1张 止损 3800", "", None),
+        ("确认 4821", "", None),
+        ("深度 黄金这周怎么看", "", None),
+        ("帮助", "", None),
+        ("交易帮助", "", None),
+        ("交易设置", "", None),
+        ("成绩单", "", None),
+        ("资料", "", None),
+        ("用量", "", None),
+        ("你好", "", None),
+        ("重启", "", None),
+    ]
+    private = _conversation(True, messages)
+    group = _conversation(False, messages)
+    assert private[0] == group[0]  # the same replies, word for word, apart from the group's reminder to @ the bot
+    assert private[1] == group[1]  # the AI gets the same account, orders, market data, history and depth
+    assert all(call["account_text"] for call in group[1])  # the account is in every group answer
+    assert [c["earlier"] for c in private[2]] == [c["earlier"] for c in group[2]]
+    assert private[3] == group[3] == 1
+    assert any(title.startswith("已执行") for title, _ in group[0])  # the order went through from the group too

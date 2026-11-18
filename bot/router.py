@@ -259,10 +259,7 @@ class Router:
         if text.startswith(BIND_WORDS):
             self._bind_group(message)
         elif lowered == "/restart" or text in RESTART_WORDS:
-            if message.is_private:
-                self._restart_bot(message)
-            else:
-                self._feishu.reply_text(message.message_id, "重启请在私聊里发给我。")
+            self._restart_bot(message)  # the group and the private chat do the same for the owner
         elif lowered in KNOWLEDGE_WORDS:
             self._reply_knowledge(message)
         elif lowered in FORGET_WORDS:
@@ -367,7 +364,8 @@ class Router:
         if self._restart is None:
             self._feishu.reply_text(message.message_id, "这种运行方式不支持在飞书里重启，请到服务器上重启。")
             return
-        self._feishu.reply_text(message.message_id, "好的，我现在重启，大约半分钟后回来。回来时会给你发“交易助手已上线”。")
+        where = "" if message.is_private else "在私聊里"
+        self._feishu.reply_text(message.message_id, f"好的，我现在重启，大约半分钟后回来。回来时会{where}给你发“交易助手已上线”。")
         log.info("the owner asked for a restart")
         self._restart()
 

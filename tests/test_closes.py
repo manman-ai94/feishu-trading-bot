@@ -11,7 +11,7 @@ from bot.monitor import Event
 from bot.okx_trade import _stop_fields
 from bot.service import Reporter
 
-from .helpers import OWNER, Clock, FakeAnalyst, FakeFeishu, FakeOkx, make_cfg
+from .helpers import GROUP, OWNER, Clock, FakeAnalyst, FakeFeishu, FakeOkx, make_cfg
 from .test_trading import XAU, Bench, FakeExchange, gold
 
 LA = ZoneInfo("America/Los_Angeles")
@@ -224,13 +224,13 @@ def test_the_owner_is_told_once_when_it_trips_and_only_if_he_could_open():
     assert tripped_bench(trading="off").desk.breaker_alert() == ""
 
 
-def test_a_close_is_followed_by_the_breaker_notice_in_the_private_chat_only():
+def test_a_close_is_followed_by_the_breaker_notice_wherever_the_account_is_shown():
     feishu = FakeFeishu()
     reporter = Reporter(make_cfg(), feishu, FakeOkx(), FakeAnalyst(), Journal(":memory:"), Clock(NOW))
     reporter.breaker_alert = lambda: "过去 24 小时内止损或强平 2 次"
     reporter.notify_event(Event(kind="closed", title="平仓：XAU-USDT-SWAP 多单", inst_id=XAU, to_group=True))
     cards = [(sent.target, sent.title) for sent in feishu.sent]
-    assert (OWNER, "熔断：开仓已暂停") in cards and len([c for c in cards if c[1] == "熔断：开仓已暂停"]) == 1
+    assert [c for c in cards if c[1] == "熔断：开仓已暂停"] == [(OWNER, "熔断：开仓已暂停"), (GROUP, "熔断：开仓已暂停")]
 
     feishu.sent.clear()
     reporter.notify_event(Event(kind="stop_changed", title="止盈止损变动", inst_id=XAU))

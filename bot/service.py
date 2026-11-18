@@ -167,11 +167,14 @@ class Reporter:
             self.to_group(title, markdown, "violet", footer=DISCLAIMER)
 
     def _tell_breaker(self) -> None:
-        """After a close: whether that stop-out tripped the circuit breaker. Only the owner hears it."""
+        """After a close: whether that stop-out tripped the circuit breaker. The owner hears it, and the group
+        when he shares the account there: the group and the private chat show the same."""
         try:
             text = self.breaker_alert()
             if text:
-                self.to_owner("熔断：开仓已暂停", text, "red")
+                self._owner_safely("熔断：开仓已暂停", text, "red")
+                if self.group_shares_account:
+                    self.to_group("熔断：开仓已暂停", text, "red", footer=DISCLAIMER)
         except Exception:
             log.exception("could not check the circuit breaker")
 
@@ -280,10 +283,12 @@ class Reporter:
         self._owner_safely(title, text, "purple")
         if shared:
             self.to_group(title, text, "purple", footer=DISCLAIMER)
-        # The week's track record goes with the review, to the owner only: figures, not AI text.
+        # The week's track record goes with the review, wherever the review went.
         if self._cfg.track_record and self._journal.analyses_between(start, end):
             record = scorecard_markdown(self._journal, self._clock(), self._cfg.tz, 7, None, self._cfg.track_window_hours)
             self._owner_safely("本周成绩单", record, "green")
+            if shared:
+                self.to_group("本周成绩单", record, "green", footer=DISCLAIMER)
 
     def send_weekend_check(self) -> None:
         """Friday, an hour before spot gold closes: what stands out in the positions that will sit through the weekend.

@@ -292,5 +292,5 @@ def test_the_weekly_review_comes_with_the_weeks_track_record():
     )
     reporter.send_weekly_review()
     record = [item for item in feishu.sent if item.title == "本周成绩单"]
-    assert [item.target for item in record] == [OWNER]  # the owner only, also when the review is shared with the group
+    assert [item.target for item in record] == [OWNER, GROUP]  # with the review, wherever it went
     assert "最近 7 天" in record[0].body and "记录了 1 次带点位的分析" in record[0].body
