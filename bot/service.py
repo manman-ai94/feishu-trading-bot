@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Callable
 
 from . import __version__
@@ -15,6 +16,7 @@ from .config import Config
 from .feishu_client import FeishuClient
 from .journal import Journal
 from .market import build_market_context
+from .exposure import card_lines, measure
 from .models import AccountState
 from .monitor import Event, Monitor, position_brief
 from .okx_client import OkxClient, OkxError, OkxNetworkError
@@ -132,6 +134,31 @@ class Reporter:
             log.exception("could not measure the positions' risk")
             return None
 
+    def exposure_lines(self, state: AccountState | None) -> list[str]:
+        """What every stop on the account would cost together, and what it is made of: for the owner's card
+        and the AI. [] when there is nothing on the account or it cannot be read."""
+        if state is None:
+            return []
+        specs: dict[str, Decimal | None] = {}
+
+        def per(inst_id: str) -> Decimal | None:
+            if inst_id not in specs:
+                try:
+                    specs[inst_id] = self._okx.instrument_spec(inst_id).coins_per_contract
+                except (OkxError, OkxNetworkError):
+                    specs[inst_id] = None
+            return specs[inst_id]
+
+        try:
+            orders = self._okx.pending_orders()
+            triggers = [row for row in self._okx.pending_algos("trigger") if isinstance(row, dict)]
+            exposure = measure(state, orders, triggers, per)
+        except Exception:  # figures beside the account: a card is never held up for them
+            log.exception("could not measure the account's total risk")
+            return []
+        equity = Decimal(str(state.snapshot.total_eq or 0))
+        return card_lines(exposure, equity, self._cfg.trade_max_total_risk_pct)
+
     def account_for_ai(self, fresh: bool = False) -> str | None:
         """The account, the positions and every order waiting on it (the bot's and those placed by hand),
         as the AI reads them. `fresh` reads the account from OKX instead of taking the monitor's last read."""
@@ -146,6 +173,9 @@ class Reporter:
         if state is None:
             return None
         text = account_text(state, self.day_change(state), self.risk(state), self._cfg.risk_per_trade_pct)
+        total = self.exposure_lines(state)
+        if total:
+            text += "\n" + "\n".join(line.replace("**", "") for line in total)
         try:
             orders = book_text(read_book(self._okx), self._okx, state.snapshot.total_eq, self._cfg.tz)
         except Exception:  # the orders sit beside the account: an answer is never held up for them

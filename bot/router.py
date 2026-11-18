@@ -596,7 +596,8 @@ class Router:
             self._feishu.reply_text(message.message_id, "当前没有持仓。")
             return
         risk = self._reporter.risk(state) if with_account else None
-        body = status_markdown(state, self._reporter.day_change(state), private=with_account, risk=risk)
+        exposure = self._reporter.exposure_lines(state) if with_account else None
+        body = status_markdown(state, self._reporter.day_change(state), private=with_account, risk=risk, exposure=exposure)
         # The owner's own numbers need no disclaimer; a friend looking at his stops may take them as a signal.
         asked_by_owner = bool(self._cfg.owner_open_id) and message.sender_open_id == self._cfg.owner_open_id
         footer = None if message.is_private or asked_by_owner else DISCLAIMER

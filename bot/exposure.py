@@ -53,11 +53,6 @@ class Exposure:
         """Without the position on this side of this instrument (its stop is about to be replaced)."""
         return Exposure([p for p in self.pieces if not (p.position and p.inst_id == inst_id and p.direction == direction)])
 
-    def share_text(self, equity: Decimal) -> str:
-        if equity <= 0:
-            return f"约 {_px(self.loss)}"
-        return f"约 {_px(self.loss)}，占权益 {self.loss / equity * 100:.1f}%"
-
 
 def _side(direction: str) -> str:
     return "多" if direction == "long" else "空"
@@ -174,9 +169,12 @@ def card_lines(exposure: Exposure, equity: Decimal, cap_pct: float | None, ccy: 
     """For the 仓位 card and the AI: the total, what it is made of, and the cap."""
     if not exposure.pieces:
         return []
-    cap = f"（上限 {cap_pct:g}%）" if cap_pct else ""
-    lines = [f"**所有止损都打到**：{exposure.share_text(equity)} {ccy}{cap}"]
+    total = f"约 {_px(exposure.loss)} {ccy}"
+    if equity > 0:
+        total += f"，占权益 {exposure.loss / equity * 100:.1f}%"
+    cap = f"（你定的上限 {cap_pct:g}%）" if cap_pct else ""
+    lines = [f"**账户总风险（所有止损都打到）**：{total}{cap}"]
     for piece in exposure.pieces:
-        amount = f"约 {_px(piece.loss)}" if piece.loss is not None else "算不出"
+        amount = f"约 {_px(piece.loss)}" if piece.loss is not None else "算不出，没算进总数"
         lines.append(f"- {piece.label}：{amount}")
     return lines
