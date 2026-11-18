@@ -161,6 +161,42 @@ class OkxTradeClient(OkxClient):
         data = self._post("/api/v5/trade/order-algo", body)
         return str(data[0].get("algoId", "")) if data else ""
 
+    def place_trigger(
+        self,
+        *,
+        inst_id: str,
+        td_mode: str,
+        side: str,
+        sz: str,
+        trigger_px: str,
+        cl_ord_id: str,
+        pos_side: str | None = None,
+        sl_trigger_px: str | None = None,
+        tp_trigger_px: str | None = None,
+    ) -> str:
+        """A trigger order (计划委托): when the price (TRADE_STOP_TRIGGER kind) reaches `trigger_px`, OKX places a market
+        order of `sz` contracts. A stop-loss / take-profit given here comes with the order once it fills.
+        Returns the algo order id. Cancelled like a stop, through cancel-algos."""
+        body: dict = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": "trigger",
+            "sz": sz,
+            "triggerPx": trigger_px,
+            "orderPx": MARKET_PRICE,
+            "triggerPxType": self.trigger_px_type,
+            "algoClOrdId": cl_ord_id,
+            "tag": ORDER_TAG,
+        }
+        if pos_side:
+            body["posSide"] = pos_side
+        attached = _stop_fields(sl_trigger_px, tp_trigger_px, prefix="", px_type=self.trigger_px_type)
+        if attached:
+            body["attachAlgoOrds"] = [attached]
+        data = self._post("/api/v5/trade/order-algo", body)
+        return str(data[0].get("algoId", "")) if data else ""
+
     def amend_stop(self, inst_id: str, algo_id: str, sl_trigger_px: str | None = None, tp_trigger_px: str | None = None) -> None:
         """Moves the trigger prices of an existing take-profit / stop-loss order."""
         body = {"instId": inst_id, "algoId": algo_id}

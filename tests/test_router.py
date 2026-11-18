@@ -566,6 +566,13 @@ def test_the_owner_places_an_order_from_the_private_chat():
     assert bench.analyst.calls == []  # the AI never sees an order, let alone decides one
 
 
+def test_a_breakout_order_is_an_order_not_a_price_alert():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    preview = bench.say("涨破 3900 做多 XAU 100张 止损 3870")[0]
+    assert preview.title == "下单预览 · 模拟盘" and "突破做多 XAU-USDT-SWAP（涨破 3900）" in preview.body
+    assert bench.journal.alerts() == [] and bench.analyst.calls == []
+
+
 def test_the_demo_rehearsal_shows_that_it_is_running():
     from .test_selftest import Demo
 

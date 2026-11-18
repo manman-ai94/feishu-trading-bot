@@ -127,6 +127,13 @@ _OPEN_VERBS = (
     ("挂多", "long", "limit"), ("挂空", "short", "limit"),
     ("加仓", "same", ""),
 )  # fmt: skip
+_BREAK_UP = ("涨破", "突破", "升破", "上破", "站上", "涨过", "涨到")
+_BREAK_DOWN = ("跌破", "跌穿", "下破", "跌到", "跌过")
+_BREAKOUT = re.compile(
+    rf"^(?:等|当|如果)?\s*(?:价格)?\s*({'|'.join(_BREAK_UP + _BREAK_DOWN)})\s*({NUM})\s*(?:点|美金|美元)?\s*"
+    r"(?:就|再|后|之后|以后|的时候|时|的话)?\s*[,，]?\s*(?:我)?\s*(?:就|再)?\s*"
+    r"(限价|市价|挂单)?\s*(做多|开多|买入|买多|做空|开空|卖空)(.*)$"
+)
 _CLOSE_ALL_VERBS = ("全部平仓", "平掉全部", "平掉所有", "全平", "清仓", "/closeall")
 _CLOSE_VERBS = (("平多", "long"), ("平空", "short"), ("平仓", ""), ("平掉", ""), ("/close", ""))
 _CANCEL_VERBS = ("撤单", "撤销挂单", "取消挂单", "撤掉挂单", "撤销委托", "取消委托", "/cancel")
@@ -143,7 +150,9 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 随单带止损止盈：在后面加“止损 3860 止盈 3950”
 - 数量带单位：“张”是合约张数，“个”是币的数量（黄金就是盎司），“U”是仓位的名义价值，不是保证金。黄金也可以写“手”，1 手 = 1 XAU
 - 只写止损不写数量：“做多 XAU 止损 3816”“限价做多 XAU 3850 止损 3820”，我按你定的单笔风险算数量，预览里写出怎么算的；算出来超过单笔上限或持仓上限时，自动减到上限以内
-- “加仓 XAU 100张”：按现有仓位的方向再开
+- “加仓 XAU 100张”：按现有仓位的方向再开。市价加仓带止损时，整个仓位合成一张止损（先挂新的再撤旧的）
+- 突破单：“涨破 3900 做多 XAU 止损 3870”“跌破 3800 做空 XAU 止损 3830”，价格到了按市价进场，没到一直挂着
+- 账户总风险：所有止损都打到合计最多亏多少（TRADE_MAX_TOTAL_RISK_PCT），每张开仓预览都写；超了就不执行，只写止损的自动减到放得下
 
 **平仓**（都按市价）
 - “平仓 XAU”平掉整个仓位；“平仓 XAU 一半”“平仓 XAU 30%”“减仓 XAU 100张”平一部分
@@ -151,11 +160,12 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 
 **挂单**
 - “挂单”看当前的挂单和止盈止损
-- “撤单 XAU”“撤单 全部”“撤单 订单号”，或按价格撤：“撤单 XAU 3788”“撤单 3788”
+- “撤单 XAU”“撤单 全部”“撤单 订单号”，或按价格撤：“撤单 XAU 3788”“撤单 3788”；突破单按触发价撤：“撤单 XAU 3900”
 - 改挂单的价格：先撤单，再重新挂
 
 **止盈止损**（对整个仓位）
 - “止损 XAU 3860”“止盈 XAU 3950”“止损 XAU 3860 止盈 3950”
+- 仓位上有好几张止损（几次加仓各带一张）时，发“止损 XAU 3860”就合成一张管整个仓位
 - 也可以像平时说话：“把止损调到 3860”“把 XAU 的止盈改成 3950”
 - “取消止损 XAU”“取消止盈 XAU”“取消止盈止损 XAU”“把止损撤掉”
 
@@ -193,7 +203,7 @@ class Command:
     kind: str  # open | close | cancel | stop | orders | pause | resume | unbreak | settings | help | selftest | confirm | abort | unclear
     inst_id: str = ""
     direction: str = ""  # open: long | short | same (加仓). close: long | short | "" (whichever there is). cancel: buy | sell | ""
-    ord_type: str = ""  # market | limit
+    ord_type: str = ""  # market | limit | trigger (a breakout: opens at market when the price reaches px)
     size: Decimal | None = None
     unit: str = ""  # contracts | coins | usd | fraction | risk (opening: sized from the stop and RISK_PER_TRADE_PCT)
     px: Decimal | None = None  # open: the limit price. cancel: the price of the resting order to cancel
@@ -310,6 +320,9 @@ class CommandParser:
             stops = self._stops_said(text)
             if stops is not None:
                 return stops
+        breakout = _BREAKOUT.match(text) if not ord_type else None
+        if breakout:
+            return self._breakout(breakout)
         for word, direction, forced in _OPEN_VERBS:
             if lowered.startswith(word):
                 return self._open(direction, forced or ord_type, text[len(word) :])
@@ -380,6 +393,24 @@ class CommandParser:
             "open", inst_id=inst_id, direction=direction, ord_type=ord_type or ("limit" if px is not None else "market"),
             size=size, unit=unit, px=px, sl=sl, tp=tp,
         )  # fmt: skip
+
+    def _breakout(self, found: re.Match) -> Command | None:
+        """"涨破 3900 做多 XAU 止损 3870": a trigger order (计划委托) that opens at market once the price gets there."""
+        word, trigger, kind, verb, rest = found.group(1), Decimal(found.group(2)), found.group(3), found.group(4), found.group(5)
+        direction = "long" if verb in ("做多", "开多", "买入", "买多") else "short"
+        up = word in _BREAK_UP
+        if up != (direction == "long"):
+            plain = "限价做多" if direction == "long" else "限价做空"
+            raise _Unclear(
+                f"“{word} {_plain(trigger)} {verb}”不是突破单：突破单是涨破某价做多、跌破某价做空。"
+                f"想在 {_plain(trigger)} 挂单等价格回来，请用“{plain} 品种 {_plain(trigger)} 止损 价格”。"
+            )
+        if kind or any(w in rest for w in ("限价", "市价", "挂单")):
+            raise _Unclear("突破单到了触发价就按市价成交，后面不用再写“限价”“市价”。")
+        command = self._open(direction, "market", rest)
+        if command is None or command.kind != "open":
+            return command
+        return replace(command, ord_type="trigger", px=trigger)
 
     def _close(
         self, rest: str, direction: str, ord_type: str, everything: bool = False, reduce: bool = False
@@ -608,7 +639,7 @@ class Refused(Exception):
 class Step:
     """One request to OKX."""
 
-    call: str  # place_order | close_position | cancel_order | place_stop | amend_stop | cancel_stops
+    call: str  # place_order | place_trigger | close_position | cancel_order | place_stop | amend_stop | cancel_stops
     args: dict
     label: str = ""  # what this step is, for the report
     independent: bool = False  # a refusal of this step does not stop the ones after it
@@ -673,6 +704,13 @@ def _px(value, spec: InstrumentSpec) -> str:
 def _at_price(order: OrderInfo, px: Decimal) -> bool:
     """Whether a resting order is the one at this price."""
     return order.px is not None and abs(_dec(order.px) - px) <= px * PRICE_MATCH
+
+
+def _attached_sl(row: dict) -> float | None:
+    for attached in row.get("attachAlgoOrds") or [row]:
+        if isinstance(attached, dict) and attached.get("slTriggerPx"):
+            return float(attached["slTriggerPx"])
+    return None
 
 
 def _side_word(direction: str) -> str:
@@ -1181,7 +1219,7 @@ class TradeDesk:
     # ------------------------------------------------------------ open orders
 
     def _list_orders(self, command: Command) -> Reply:
-        orders = self._okx.pending_orders(command.inst_id or None)
+        orders = self._okx.pending_orders(command.inst_id or None) + self._trigger_orders(command.inst_id or None)
         state = self._okx.account_state()
         lines = [f"**挂单（{len(orders)} 张）**"] if orders else ["现在没有挂单。"]
         lines.extend(f"- {self._order_line(order)}" for order in orders)
@@ -1292,11 +1330,16 @@ class TradeDesk:
         if order.reduce_only:
             side += "（只减仓）"
         price = "市价" if order.px is None else f"限价 {self._price(order.px, spec)}"
+        if order.ord_type == "trigger":
+            side = f"突破单{'做多' if order.side == 'buy' else '做空'}"
+            price = f"触发价 {self._price(order.px, spec)}" if order.px is not None else "触发价没读到"
+            if order.sl_trigger_px:
+                price += f"，成交后带止损 {self._price(order.sl_trigger_px, spec)}"
         size = f"{order.sz:g} 张"
         if spec is not None:
             size = _contracts_text(_dec(order.sz), spec)
         filled = f"，已成交 {order.filled_sz:g} 张" if order.filled_sz else ""
-        return f"{order.inst_id} {side} {price}，{size}{filled}，订单号 {order.ord_id}"
+        return f"{order.inst_id} {side} {price}，{size}{filled}，{'计划委托' if order.ord_type == 'trigger' else '订单'}号 {order.ord_id}"
 
     def _spec_or_none(self, inst_id: str) -> InstrumentSpec | None:
         try:
@@ -1404,7 +1447,19 @@ class TradeDesk:
         settle = spec.settle_ccy or "USDT"
         px: Decimal | None = None
         ref = last
-        if cmd.ord_type == "limit":
+        trigger: Decimal | None = None
+        if cmd.ord_type == "trigger":
+            trigger = _round_to(cmd.px, spec.tick_sz)
+            gap = (trigger - last) / last * 100
+            if (gap <= 0) if long else (gap >= 0):
+                raise Refused(
+                    f"突破{'做多' if long else '做空'}的触发价要{'高' if long else '低'}于现价 {_px(last, spec)}，你写的是 {_px(trigger, spec)}。"
+                    f"价格已经过了，想现在进场请用市价单；想等它回来，请用限价单。"
+                )
+            if abs(gap) > FAR_LIMIT_PCT:
+                raise Refused(f"触发价 {_px(trigger, spec)} 离现价 {_px(last, spec)} 有 {abs(gap):.1f}% 远，像是输错了。请核对后重发。")
+            ref = trigger
+        elif cmd.ord_type == "limit":
             px = _round_to(cmd.px, spec.tick_sz)
             if px <= 0:
                 raise Refused("价格要大于 0。")
@@ -1430,7 +1485,7 @@ class TradeDesk:
 
         per_contract = spec.coins_per_contract
         equity = _dec(state.snapshot.total_eq or 0)
-        entry_name = "限价" if px is not None else "现价"
+        entry_name = "触发价" if trigger is not None else "限价" if px is not None else "现价"
         sl = _round_to(cmd.sl, spec.tick_sz) if cmd.sl is not None else None
         tp = _round_to(cmd.tp, spec.tick_sz) if cmd.tp is not None else None
         sized = ""  # how a risk-sized order came to its size, for the preview and for a refusal
@@ -1464,6 +1519,12 @@ class TradeDesk:
             if account.hedge_mode and order.pos_side != direction:
                 continue
             queued += _dec(order.remaining) * per_contract * _dec(order.px)
+        for row in self._pending_triggers(inst_id):
+            if row.get("side") != side or str(row.get("reduceOnly", "")).lower() == "true":
+                continue
+            if account.hedge_mode and row.get("posSide") != direction:
+                continue
+            queued += _dec(row.get("sz") or 0) * per_contract * _dec(row.get("triggerPx") or 0)
         max_order, max_position = _dec(cfg.trade_max_order_usd), _dec(cfg.trade_max_position_usd)
         if cmd.unit == "risk" and previous is None:
             # Sized from the stop: when that comes to more than the limits allow, take as much as they allow.
@@ -1476,7 +1537,7 @@ class TradeDesk:
                     contracts, value = capped, capped * per_contract * ref
 
         exposure = self._exposure(state)
-        merge = bool(same) and sl is not None and px is None  # a market addition: one stop for the whole position
+        merge = bool(same) and sl is not None and px is None and trigger is None  # a market addition: one stop for the whole position
         held_coins = sum((_dec(p.qty) for p in same), Decimal(0)) * per_contract
         mark = _dec(same[0].mark_px or last) if same else last
         others = exposure.without(inst_id, direction) if merge else exposure
@@ -1561,6 +1622,13 @@ class TradeDesk:
             where = "高" if gap > 0 else "低"
             waits = "会立刻成交" if (gap > 0) == long and gap != 0 else "价格到了才成交"
             lines.append(f"现价 {_px(last, spec)}，限价比现价{where} {abs(gap):.2f}%，{waits}")
+        if trigger is not None:
+            gap = abs(trigger - last) / last * 100
+            kind = {"last": "最新价", "mark": "标记价", "index": "指数价"}.get(cfg.trade_stop_trigger, "最新价")
+            lines.append(
+                f"突破单（计划委托）：{kind}{'涨到' if long else '跌到'} {_px(trigger, spec)}（离现价 {_px(last, spec)} {gap:.2f}%）"
+                f"时按市价{'做多' if long else '做空'}，成交价可能比触发价差一点（滑点）；没到就一直挂着，不占保证金"
+            )
         coins = contracts * per_contract
         if sl is not None:
             loss = abs(sl - ref) * coins
@@ -1590,7 +1658,12 @@ class TradeDesk:
             args["px"] = _plain(px)
         if pos_side:
             args["pos_side"] = pos_side
-        steps = [Step("place_order", args, "开仓" if not same else "加仓")]
+        if trigger is not None:
+            args.pop("ord_type")
+            args["trigger_px"] = _plain(trigger)
+            steps = [Step("place_trigger", args, "挂突破单")]
+        else:
+            steps = [Step("place_order", args, "开仓" if not same else "加仓")]
         if merge:
             stop_steps, stop_lines = self._merged_stop(same[0], sl, tp, td_mode, pos_side, spec, held_coins, coins, mark, ref, settle)
             steps.extend(stop_steps)
@@ -1600,11 +1673,13 @@ class TradeDesk:
                 args["sl_trigger_px"] = _plain(sl)
             if tp is not None:
                 args["tp_trigger_px"] = _plain(tp)
-            if same and sl is not None:
+            if same and sl is not None and trigger is None:
                 lines.append(
                     f"这张限价单成交后，加的这部分单独带止损；要和原来的合成一张，成交后发“止损 {base} {_plain(sl)}”"
                 )
         title = f"{'限价' if px is not None else '市价'}{'加' if same else '做'}{word} {inst_id}"
+        if trigger is not None:
+            title = f"突破{'加' if same else '做'}{word} {inst_id}（{'涨破' if long else '跌破'} {_plain(trigger)}）"
         data = {"sz": _plain(contracts), "ref": _plain(last), "positions": self._fingerprint(held)}
         if sized:
             data["sized"] = sized
@@ -1671,6 +1746,27 @@ class TradeDesk:
         if steps and steps[0].call != "cancel_stops":
             notes.append("先挂好（或改好）整仓的，再撤旧的，中间不会没有止损")
         return steps, notes
+
+    def _trigger_orders(self, inst_id: str | None = None) -> list[OrderInfo]:
+        """The trigger orders waiting, in the shape of ordinary orders (the price is the trigger price), to list and cancel."""
+        return [
+            OrderInfo(
+                ord_id=str(row.get("algoId", "")), inst_id=str(row.get("instId", "")), side=str(row.get("side", "")),
+                pos_side=str(row.get("posSide") or "net"), ord_type="trigger", px=float(row["triggerPx"]) if row.get("triggerPx") else None,
+                sz=float(row.get("sz") or 0), reduce_only=str(row.get("reduceOnly", "")).lower() == "true",
+                cl_ord_id=str(row.get("algoClOrdId", "")), sl_trigger_px=_attached_sl(row),
+            )
+            for row in self._pending_triggers(inst_id)
+        ]  # fmt: skip
+
+    def _pending_triggers(self, inst_id: str | None = None) -> list[dict]:
+        """Trigger orders (计划委托) waiting, as OKX sends them; [] when they cannot be read."""
+        try:
+            rows = self._okx.pending_algos("trigger")
+        except (OkxError, OkxNetworkError) as exc:
+            log.warning("could not read the trigger orders: %s", exc)
+            return []
+        return [row for row in rows if isinstance(row, dict) and (not inst_id or row.get("instId") == inst_id)]
 
     def _exposure(self, state: AccountState) -> Exposure:
         """Every stop on the account and what it would cost: positions, and orders waiting to open."""
@@ -1938,7 +2034,7 @@ class TradeDesk:
     def _plan_cancel(self, cmd: Command, previous: Plan | None) -> Plan:
         self._account()
         allowed = self._cfg.tradable_instruments
-        everything = self._okx.pending_orders(cmd.inst_id or None)
+        everything = self._okx.pending_orders(cmd.inst_id or None) + self._trigger_orders(cmd.inst_id or None)
         orders = [order for order in everything if order.inst_id in allowed]
         skipped = len(everything) - len(orders)
         if cmd.ord_id:
@@ -1978,7 +2074,9 @@ class TradeDesk:
         if skipped and cmd.everything:
             lines.append(f"另有 {skipped} 张挂单在不允许下单的品种上，我不动它们")
         steps = tuple(
-            Step("cancel_order", {"inst_id": order.inst_id, "ord_id": order.ord_id}, f"撤单 {order.ord_id}", independent=True)
+            Step("cancel_stops", {"items": [[order.inst_id, order.ord_id]]}, f"撤突破单 {order.ord_id}", independent=True)
+            if order.ord_type == "trigger"
+            else Step("cancel_order", {"inst_id": order.inst_id, "ord_id": order.ord_id}, f"撤单 {order.ord_id}", independent=True)
             for order in orders
         )
         inst_id = orders[0].inst_id if len({order.inst_id for order in orders}) == 1 else ""
@@ -2223,6 +2321,16 @@ class TradeDesk:
             if step.call == "amend_stop":
                 self._trader.amend_stop(**args)
                 return [f"已改好：{self._stops_text(args)}"]
+            if step.call == "place_trigger":
+                algo_id = self._trader.place_trigger(cl_ord_id=self._new_id(), **args)
+                spec = self._spec_or_none(args["inst_id"])
+                long = args["side"] == "buy"
+                stops = self._stops_text(args)
+                return [
+                    f"已挂上突破单：价格{'涨到' if long else '跌到'} {self._price(args['trigger_px'], spec)} 时按市价{'做多' if long else '做空'}"
+                    + (f"，成交后带{stops}" if stops else ""),
+                    f"计划委托单号 {algo_id}",
+                ]
             if step.call == "place_stop":
                 algo_id = self._trader.place_stop(cl_ord_id=self._new_id(), **args)
                 return [f"已挂上：{self._stops_text(args)}，触发后按市价平掉整个仓位", f"止盈止损单号 {algo_id}"]

@@ -140,6 +140,18 @@ class FakeExchange:
         self._end("place_order")
         return info.ord_id
 
+    def place_trigger(self, **order) -> str:
+        self._begin("place_trigger", order)
+        self._next += 1
+        row = {"ordType": "trigger", "algoId": str(self._next), "instId": order["inst_id"], "side": order["side"],
+               "posSide": order.get("pos_side") or "net", "sz": order["sz"], "triggerPx": order["trigger_px"], "orderPx": "-1",
+               "algoClOrdId": order["cl_ord_id"]}
+        if order.get("sl_trigger_px"):
+            row["attachAlgoOrds"] = [{"slTriggerPx": order["sl_trigger_px"]}]
+        self.algos.append(row)
+        self._end("place_trigger")
+        return row["algoId"]
+
     def close_position(self, inst_id: str, mgn_mode: str, pos_side: str | None = None, cl_ord_id: str = "") -> None:
         self._begin("close_position", {"inst_id": inst_id, "mgn_mode": mgn_mode, "pos_side": pos_side, "cl_ord_id": cl_ord_id})
         closed = [p for p in self.positions if p.inst_id == inst_id and (not pos_side or p.pos_side == pos_side)]
@@ -199,6 +211,7 @@ class FakeExchange:
     def cancel_stops(self, items) -> None:
         self._begin("cancel_stops", {"items": list(items)})
         gone = {algo_id for _, algo_id in items}
+        self.algos = [row for row in self.algos if row["algoId"] not in gone]
         for inst_id in {inst_id for inst_id, _ in items}:
             self._with_stops(inst_id, lambda stops: [s for s in stops if s.algo_id not in gone])
         self._end("cancel_stops")
@@ -1609,3 +1622,59 @@ def test_a_rough_liquidation_price_and_a_stop_beyond_it():
     preview = bench.say("做多 XAU 10个 止损 3600").text
     assert "粗估强平价约 3,680.0（全仓，按账户权益亏光算；实际强平会早一点，以 OKX 显示为准）" in preview
     assert "止损在粗估强平价外面" in preview
+
+
+# ------------------------------------------------------------------ breakout orders
+
+
+@pytest.mark.parametrize(
+    "text, direction, trigger, sl",
+    [
+        ("涨破 3900 做多 XAU 止损 3870", "long", Decimal(3900), Decimal(3870)),
+        ("突破3900做多XAU 止损3870", "long", Decimal(3900), Decimal(3870)),
+        ("站上 3900 就做多 黄金 1个 止损 3870", "long", Decimal(3900), Decimal(3870)),
+        ("跌破 3800 做空 XAU 止损 3830", "short", Decimal(3800), Decimal(3830)),
+        ("等价格跌破3800再做空 XAU 止损 3830 止盈 3700", "short", Decimal(3800), Decimal(3830)),
+    ],
+)
+def test_a_breakout_is_read_as_a_trigger_order(text, direction, trigger, sl):
+    command = parser().parse(text)
+    assert (command.kind, command.ord_type, command.direction, command.px, command.sl) == ("open", "trigger", direction, trigger, sl)
+
+
+def test_a_breakout_the_wrong_way_round_is_explained():
+    command = parser().parse("跌破 3800 做多 XAU 止损 3780")
+    assert command.kind == "unclear" and "不是突破单" in command.note and "限价做多 品种 3800 止损 价格" in command.note
+    assert parser().parse("涨破 3900 限价做多 XAU 止损 3870").note.startswith("突破单到了触发价就按市价成交")
+
+
+def test_a_breakout_order_is_previewed_sized_from_the_trigger_and_sent_as_a_trigger_order():
+    bench = Bench(**roomy())
+    preview = bench.say("涨破 3900 做多 XAU 止损 3870").text
+    assert "**突破做多 XAU-USDT-SWAP（涨破 3900）**" in preview
+    assert "止损离触发价 30，最多开" in preview
+    assert "突破单（计划委托）：最新价涨到 3,900.0（离现价 3,880.0 0.52%）时按市价做多" in preview
+    reply = bench.say("确认 1111").text
+    [(call, args)] = bench.sent
+    assert call == "place_trigger" and args["trigger_px"] == "3900" and args["side"] == "buy" and args["sl_trigger_px"] == "3870"
+    assert "已挂上突破单：价格涨到 3,900.0 时按市价做多，成交后带止损 3,870.0" in reply
+    listing = bench.say("挂单").text
+    assert "XAU-USDT-SWAP 突破单做多 触发价 3,900.0，成交后带止损 3,870.0" in listing and "计划委托号 7001" in listing
+    bench.run("撤单 XAU 3900", code="2222")
+    assert bench.sent[-1] == ("cancel_stops", {"items": [(XAU, "7001")]})
+    assert bench.exchange.algos == []
+
+
+def test_a_breakout_trigger_already_passed_is_refused():
+    bench = Bench(**roomy())
+    assert "突破做多的触发价要高于现价 3,880.0，你写的是 3,870.0" in bench.say("涨破 3870 做多 XAU 止损 3850").text
+    assert bench.sent == []
+
+
+def test_a_waiting_breakout_counts_in_the_position_limit_and_the_total_risk():
+    exchange = FakeExchange()
+    exchange.algos.append({"ordType": "trigger", "algoId": "5", "instId": XAU, "side": "buy", "posSide": "net", "sz": "10000",
+                           "triggerPx": "3900", "orderPx": "-1", "attachAlgoOrds": [{"slTriggerPx": "3870"}]})
+    bench = Bench(exchange, **roomy(trade_max_position_usd=40000.0))
+    refusal = bench.say("限价做多 XAU 1个 3850 止损 3820").text
+    assert "挂单 39,000.00" in refusal and "超过了单个品种的持仓上限 40,000" in refusal

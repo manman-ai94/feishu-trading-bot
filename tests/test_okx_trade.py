@@ -39,7 +39,7 @@ PLACED = ok([{"ordId": "7001", "clOrdId": "ftb1", "sCode": "0", "sMsg": ""}])
 
 
 def test_only_the_trading_client_can_change_anything():
-    changing = {"place_order", "cancel_order", "close_position", "place_stop", "amend_stop", "cancel_stops"}
+    changing = {"place_order", "place_trigger", "cancel_order", "close_position", "place_stop", "amend_stop", "cancel_stops"}
     assert changing <= set(dir(OkxTradeClient))
     assert not changing & set(dir(OkxClient))
     # Neither of them can move funds.
@@ -175,6 +175,19 @@ def test_stop_loss_and_take_profit_together_make_an_oco_order():
     body = session.posts[0][1]
     assert body["ordType"] == "oco" and body["posSide"] == "short" and "reduceOnly" not in body
     assert body["tpTriggerPx"] == "65000" and body["tpOrdPx"] == "-1" and body["slTriggerPx"] == "69000"
+
+
+def test_a_breakout_is_a_trigger_order_at_market_with_its_stop_attached():
+    okx, session = trader({ALGO: [ok([{"algoId": "9100", "sCode": "0"}])]})
+    algo = okx.place_trigger(
+        inst_id="XAU-USDT-SWAP", td_mode="cross", side="buy", sz="1000", trigger_px="3900", cl_ord_id="ftb7", sl_trigger_px="3870",
+    )  # fmt: skip
+    assert algo == "9100"
+    assert session.posts[0][1] == {
+        "instId": "XAU-USDT-SWAP", "tdMode": "cross", "side": "buy", "ordType": "trigger", "sz": "1000", "triggerPx": "3900",
+        "orderPx": "-1", "triggerPxType": "last", "algoClOrdId": "ftb7", "tag": ORDER_TAG,
+        "attachAlgoOrds": [{"slTriggerPx": "3870", "slOrdPx": "-1", "slTriggerPxType": "last"}],
+    }  # fmt: skip
 
 
 def test_a_stop_needs_at_least_one_price():
