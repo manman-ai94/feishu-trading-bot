@@ -25,6 +25,8 @@ from bot.router import (
 )
 from bot.service import Reporter
 from bot.trading import TradeDesk
+from bot.watch import SETTING as WATCH_SETTING
+from bot.watch import PositionWatch
 
 from .helpers import BOT, FRIEND, GROUP, OPEN_GROUP, OWNER, Clock, FakeAnalyst, FakeFeishu, FakeOkx, make_cfg, make_message, make_state
 from .test_trading import XAU, FakeExchange, FakeResolver
@@ -56,10 +58,15 @@ class Bench:
             journal, self.okx, InstrumentResolver(self.okx, self.clock), lambda: "XAU-USDT-SWAP",
             lambda: self.reporter.group_shares_account, self.clock,
         )  # fmt: skip
+        self.watch = PositionWatch(
+            journal, self.okx, self.analyst, self.cfg, self.reporter.current_state, lambda state: [],
+            self.reporter.to_chat, self.clock,
+        )  # fmt: skip
         self.router = Router(
             self.cfg, self.feishu, self.okx, self.analyst, self.reporter, bot_open_id, self.clock,
             save_setting=lambda name, value: self.saved.append((name, value)), restart=self._restart,
             knowledge=knowledge, usage=usage, trade=self.desk, journal=journal, later=self._later, alerts=self.alerts,
+            watch=self.watch,
         )  # fmt: skip
 
     def _restart(self):
@@ -1185,3 +1192,62 @@ def test_the_ai_is_told_what_can_be_done_in_feishu():
     assert "不要说只能去 OKX 的 App 里操作" in SYSTEM_PROMPT and "撤单 XAU 3788" in SYSTEM_PROMPT
     assert "跌破 3800 提醒我" in SYSTEM_PROMPT and "诉求：" in SYSTEM_PROMPT
     assert "把把握提到 60%" in COMMAND_SYSTEM and "1 手 = 1 个" in COMMAND_SYSTEM
+
+
+# ------------------------------------------------------------- position watch
+
+
+def test_owner_sets_a_timed_position_check_and_gets_the_first_card():
+    bench = Bench()
+    reply, card = bench.say("每 4 小时盯一下仓位", chat_id="oc_p2p")
+    assert reply.how == "reply_text" and "每 4 小时盯一次仓位" in reply.body
+    assert card.how == "send_markdown" and card.target == "oc_p2p" and card.title.startswith("盯仓：XAU 多单")
+    assert card.footer is None and "浮动盈亏 +20.00 USDT" in card.body
+    assert bench.analyst.named("watch") and bench.journal.get_setting(WATCH_SETTING, "")
+    [status] = bench.say("盯仓")
+    assert "定时盯仓开着：每 4 小时一次，发在私聊" in status.body
+    [off] = bench.say("停止盯仓")
+    assert "停了" in off.body and bench.journal.get_setting(WATCH_SETTING, "") == ""
+
+
+def test_a_timed_position_check_set_in_the_shared_group_goes_to_the_group():
+    bench = Bench()
+    reply, card = bench.say("每 2 小时盯一下仓位", private=False, chat_id=GROUP)
+    assert card.target == GROUP and card.footer == DISCLAIMER
+
+
+def test_a_timed_position_check_set_in_another_group_goes_to_the_owner_privately():
+    bench = Bench()
+    reply, card = bench.say("每 2 小时盯一下仓位", private=False, chat_id="oc_other")
+    assert "卡片私聊发给你" in reply.body
+    assert card.target == OWNER and card.receive_id_type == "open_id"
+
+
+def test_only_the_owner_sets_the_position_watch():
+    bench = Bench(**OPEN_GROUP)
+    replies = bench.say("每 4 小时盯一下仓位", sender=FRIEND, private=False, chat_id=GROUP)
+    assert bench.journal.get_setting(WATCH_SETTING, "") == "" and not bench.analyst.named("watch")
+    assert all(not item.title.startswith("盯仓") for item in replies)
+
+
+def test_a_price_alert_is_still_a_price_alert():
+    bench = Bench()
+    [reply] = bench.say("跌破 2600 提醒我")
+    assert "2,600" in reply.everything and bench.journal.get_setting(WATCH_SETTING, "") == ""
+
+
+def test_a_question_about_the_watch_goes_to_the_ai():
+    bench = Bench()
+    bench.say("每 4 小时盯仓会不会很费额度")
+    assert bench.analyst.named("answer") and bench.journal.get_setting(WATCH_SETTING, "") == ""
+
+
+def test_the_usage_card_shows_what_the_watch_cost():
+    bench = Bench(usage=lambda start, end: {"jobs": 3, "web_searches": 0, "cost_usd": 0.5})
+    bench.journal.record_usage("position watch", "claude-sonnet-5-5", cost_usd=0.015, ts=bench.clock())
+    bench.journal.record_usage("position watch (close look)", "claude-opus-5-5", cost_usd=0.066, ts=bench.clock())
+    bench.journal.record_usage("question", "claude-opus-5-5", cost_usd=0.3, ts=bench.clock())
+    [reply] = bench.say("用量")
+    assert "其中定时盯仓本月 2 次，约 0.08 美元（例行用 Sonnet 5.5，要留意时用 Opus 5.5）" in reply.body
+    [reply] = Bench(usage=lambda start, end: {"jobs": 0, "web_searches": 0, "cost_usd": 0.0}).say("用量")
+    assert "定时盯仓" not in reply.body

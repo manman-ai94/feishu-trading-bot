@@ -13,6 +13,7 @@ from bot.analyst import (
     SEARCHED_ENOUGH_NOTE,
     SMALL_TALK_SYSTEM,
     TITLE_NOTE,
+    WATCH_SYSTEM,
     Analyst,
     AnalystUnavailable,
 )
@@ -593,3 +594,45 @@ def test_a_broken_feedback_never_stops_an_answer():
     bot, client, box, reports = tooled([reply([text_block("好")])])
     bot.attach_feedback(lambda with_account: 1 / 0)
     assert bot.answer("黄金怎么看", "行情", None, in_group=False) == "好"
+
+
+# ------------------------------------------------------------ position watch
+
+
+def test_the_routine_watch_comment_uses_the_cheap_model_at_low_effort():
+    bot, client = analyst(beta=[message("结构还在，不用动。")])
+    assert bot.watch_comment("【程序算好的数字】") == "结构还在，不用动。"
+    [call] = client.beta.messages.calls
+    assert call["model"] == "claude-sonnet-5-5" and call["output_config"] == {"effort": "low"} and call["max_tokens"] == 3000
+    assert call["system"] == WATCH_SYSTEM and "tools" not in call
+    prompt = call["messages"][0]["content"]
+    assert prompt.startswith("现在是") and "【程序算好的数字】" in prompt and prompt.endswith("请写这一次的盯仓点评。")
+
+
+def test_a_closer_look_uses_the_stronger_model():
+    bot, client = analyst(beta=[message("离止损很近。")])
+    bot.watch_comment("数字", close=True)
+    [call] = client.beta.messages.calls
+    assert call["model"] == "claude-opus-5-5" and call["output_config"] == {"effort": "medium"}
+
+
+def test_a_haiku_watch_skips_the_fallback_and_is_metered_as_the_watch():
+    reports = []
+    client = FakeClient(plain=[reply([text_block("好")], used=usage(3000, 200))])
+    bot = Analyst(make_cfg(model_watch="claude-haiku-5-5"), client, on_usage=lambda purpose, used: reports.append((purpose, used)))
+    bot.watch_comment("数字")
+    assert client.messages.calls[0]["model"] == "claude-haiku-5-5" and client.beta.messages.calls == []
+    [(purpose, used)] = reports
+    assert purpose == "position watch" and abs(used.cost_usd - (3000 * 0.10 + 200 * 0.50) / 1_000_000) < 1e-12
+
+
+def test_past_the_budget_the_watch_stays_on_its_cheap_model():
+    bot, client, _, _ = tooled([], spend=999.0)
+    client.beta.messages = FakeClient(beta=[message("便宜的点评")]).beta.messages
+    assert bot.watch_comment("数字") == "便宜的点评"
+    assert client.beta.messages.calls[0]["model"] == "claude-sonnet-5-5"
+
+
+def test_the_ai_knows_the_watch_exists():
+    assert "每 4 小时盯一下仓位" in ANALYST_SYSTEM and "停止盯仓" in ANALYST_SYSTEM
+    assert "例如按时间提醒" not in ANALYST_SYSTEM

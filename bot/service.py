@@ -105,6 +105,17 @@ class Reporter:
         self._feishu.send_markdown(self._cfg.group_chat_id, title, markdown, "chat_id", template, footer)
         return True
 
+    def to_chat(self, chat_id: str, private: bool, title: str, markdown: str, template: str = "blue") -> None:
+        """A card with amounts on it, to the chat the owner asked for it in: his private chat, or the
+        registered group while it shows the account. Anywhere else (a group registered since, a group that
+        no longer shows the account, no chat at all) it goes to him privately."""
+        if chat_id and private:
+            self._feishu.send_markdown(chat_id, title, markdown, "chat_id", template)
+        elif chat_id and chat_id == self._cfg.group_chat_id and self.group_shares_account:
+            self._feishu.send_markdown(chat_id, title, markdown, "chat_id", template, DISCLAIMER)
+        else:
+            self.to_owner(title, markdown, template)
+
     @property
     def group_shares_account(self) -> bool:
         """The owner chose to show balances and PnL in the group (GROUP_SHOW_PNL)."""

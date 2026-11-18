@@ -249,18 +249,18 @@ class Journal:
             )
             self._db.commit()
 
-    def usage_between(self, start: float, end: float) -> dict:
+    def usage_between(self, start: float, end: float, purpose_like: str = "%") -> dict:
         """AI use in [start, end): pieces of work, web searches and estimated cost in USD.
 
         Sorting a message (purpose 'routing') and self-checks count towards the
-        cost but not as pieces of work.
+        cost but not as pieces of work. `purpose_like` narrows it to some work (SQL LIKE).
         """
         with self._lock:
             row = self._db.execute(
                 "SELECT COALESCE(SUM(CASE WHEN purpose IN ('routing', 'self-check') THEN 0 ELSE 1 END), 0) AS jobs,"
                 " COALESCE(SUM(web_searches), 0) AS web_searches, COALESCE(SUM(cost_usd), 0) AS cost_usd"
-                " FROM ai_usage WHERE ts >= ? AND ts < ?",
-                (int(start), int(end)),
+                " FROM ai_usage WHERE ts >= ? AND ts < ? AND purpose LIKE ?",
+                (int(start), int(end), purpose_like),
             ).fetchone()
         return {"jobs": row["jobs"], "web_searches": row["web_searches"], "cost_usd": row["cost_usd"]}
 

@@ -42,6 +42,7 @@ from .okx_client import OkxError, OkxNetworkError
 from .reports import DISCLAIMER, status_markdown
 from .service import Reporter
 from .track import scorecard_markdown
+from .watch import PositionWatch, model_name
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 下单、平仓、撤单、设止盈止损：私聊里，或者在登记的群里 @我。每条指令我先回预览，你回复确认码才执行。发“交易帮助”看写法
 - 发“算仓位 XAU 止损 3768”：按你定的单笔风险算最多开多大，只算数不下单
 - 价格提醒：发“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了我马上告诉你（只提醒，不下单）。发“提醒”看已设的，“取消提醒 编号”取消
+- 定时盯仓：发“每 4 小时盯一下仓位”（几小时你定），持仓期间按时发卡片：离止损止盈多远、浮动盈亏、几句点评，只看不动。发“盯仓”看设置，“停止盯仓”关掉
 - 发“记个诉求：……”，把想让我做到的事记下来；我做不到的事也会自动记。发“诉求清单”看记了什么，发“诉求 3 做好了”或“诉求 3 不做了”标掉一条
 - 问题前面加“深度”，我会多查几轮、分析得更细
 - 发“记住：……”，把交易规则、心得或资料存进资料库，以后回答时我会参考。发“资料”看资料库里有什么
@@ -148,6 +150,7 @@ class Router:
         journal=None,
         later: Callable[[float, Callable[[], None]], Callable[[], None]] | None = None,
         alerts: PriceAlerts | None = None,
+        watch: PositionWatch | None = None,
     ):
         """`save_setting(name, value)` writes one line of .env, so a group the
         owner registers survives a restart. `restart()` ends the process; the
@@ -156,7 +159,7 @@ class Router:
         the trade desk (trading.py), which reads the owner's order commands.
         `journal` holds the track record the owner can ask for. `later(seconds,
         call)` runs a call after a delay and returns what cancels it. `alerts`
-        reads the owner's price alerts ("跌破 3800 提醒我")."""
+        reads the owner's price alerts ("跌破 3800 提醒我"). `watch` reads "每 4 小时盯一下仓位"."""
         self._cfg = cfg
         self._save_setting = save_setting
         self._restart = restart
@@ -173,6 +176,7 @@ class Router:
         self._journal = journal
         self._later = later or _call_later
         self._alerts = alerts
+        self._watch = watch
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
@@ -289,12 +293,25 @@ class Router:
             self._record_wish(message, wishes.wish_body(text))
         elif _note_body(text) is not None:
             self._learn(message, _note_body(text))
-        else:
+        elif not self._watch_command(message, text):  # "每 4 小时盯一下仓位" handles itself when it is one
             # Before the orders: "跌破 3800 提醒我平仓" asks to be told, never for a close.
             alert = self._alerts.handle(text, message.chat_id) if self._alerts is not None else None
             if alert is None:
                 return self._trade_command(message, text)
             self._reply_alert(message, text, alert)
+        return True
+
+    def _watch_command(self, message: IncomingMessage, text: str) -> bool:
+        """ "每 4 小时盯一下仓位", "停止盯仓", "盯仓". False when the message is none of them."""
+        if self._watch is None:
+            return False
+        reply = self._watch.handle(text, message.chat_id, message.is_private, self._shows_account(message))
+        if reply is None:
+            return False
+        self._feishu.reply_text(message.message_id, reply.text)
+        self._remember_fixed(message.chat_id, text, "", reply.text)
+        if reply.then is not None:
+            reply.then()  # the first card, right after the reply
         return True
 
     def _reply_alert(self, message: IncomingMessage, text: str, alert) -> None:
@@ -501,6 +518,17 @@ class Router:
         if cfg.ai_monthly_budget_usd is not None:
             lines.append(f"本月预算 {cfg.ai_monthly_budget_usd:g} 美元，用到这个数以后我会自动改用最省的档位。")
         lines.append(f"当前设置：平时用 {cfg.model_daily} 的 {cfg.effort_daily} 档，“深度”用 {cfg.model_deep} 的 {cfg.effort_deep} 档。")
+        if self._journal is not None:
+            try:
+                watched = self._journal.usage_between(today_start.replace(day=1).timestamp(), end, purpose_like="position watch%")
+            except Exception:
+                log.exception("could not read what the position watch cost")
+                watched = {"jobs": 0, "cost_usd": 0.0}
+            if watched["jobs"]:
+                lines.append(
+                    f"其中定时盯仓本月 {watched['jobs']} 次，约 {watched['cost_usd']:.2f} 美元"
+                    f"（例行用 {model_name(cfg.model_watch)}，要留意时用 {model_name(cfg.model_daily)}）。"
+                )
         lines.append("金额按公开价格估算，实际以 Claude Console 的账单为准。")
         self._feishu.reply_markdown(message.message_id, "AI 用量", "\n".join(lines), "grey")
 

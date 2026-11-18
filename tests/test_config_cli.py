@@ -47,6 +47,7 @@ def test_empty_configuration_lists_what_is_missing():
     assert cfg.watch_instruments == ("XAU-USDT-SWAP",)
     assert (cfg.model_quick, cfg.model_daily, cfg.model_deep) == ("claude-haiku-5-5", "claude-opus-5-5", "claude-opus-5-5")
     assert (cfg.effort_daily, cfg.effort_account, cfg.effort_deep) == ("medium", "high", "xhigh")
+    assert (cfg.model_watch, cfg.effort_watch) == ("claude-sonnet-5-5", "low")
     assert cfg.close_review is True
     assert cfg.web_search and cfg.ai_monthly_budget_usd == 180.0 and cfg.knowledge_dir == Path("knowledge")
     assert (cfg.brief_morning, cfg.brief_evening, cfg.weekly_review) == (time(6, 0), time(14, 0), (6, time(17, 0)))
@@ -78,6 +79,10 @@ def test_ai_settings_can_be_changed(tmp_path):
     cfg, _ = load_config(path)
     assert (cfg.model_daily, cfg.effort_daily, cfg.effort_deep) == ("claude-sonnet-5-5", "low", "max")
     assert not cfg.web_search and cfg.ai_monthly_budget_usd is None and cfg.knowledge_dir == Path("kb")
+
+    cfg, problems = load_config(write_env(tmp_path, "MODEL_WATCH=claude-haiku-5-5\nEFFORT_WATCH=fast\n"))
+    assert cfg.model_watch == "claude-haiku-5-5" and cfg.effort_watch == "low"
+    assert any("EFFORT_WATCH" in item for item in problems)
 
 
 def test_mistakes_in_the_ai_settings_are_explained(tmp_path):

@@ -36,6 +36,7 @@ from .track import Levels, Scorer, track_text_for_ai
 from .trading import TradeDesk
 from .releases import news_text, told
 from .upkeep import Health, Upkeep, going_round, restart_text
+from .watch import PositionWatch
 
 log = logging.getLogger(__name__)
 
@@ -258,10 +259,13 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         journal, okx, resolver, lambda: cfg.watch_instruments[0] if cfg.watch_instruments else "",
         shares_with_group=lambda: reporter.group_shares_account, tz=cfg.tz,
     )  # fmt: skip
+    watch = PositionWatch(
+        journal, okx, analyst, cfg, reporter.current_state, reporter.exposure_lines, reporter.to_chat,
+    )  # fmt: skip
     router = Router(
         cfg, feishu, okx, analyst, reporter, bot_open_id, save_setting=save_setting, restart=restart,
         resolver=resolver, knowledge=knowledge, usage=journal.usage_between, trade=desk, journal=journal,
-        alerts=alerts,
+        alerts=alerts, watch=watch,
     )  # fmt: skip
     log.info("trading: %s (instruments: %s)", desk.mode, ", ".join(cfg.tradable_instruments))
     if cfg.trading_blocked:
@@ -297,6 +301,10 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     watcher = AlertWatcher(journal, okx, reporter.send_alert, tz=cfg.tz)
     threading.Thread(target=watcher.run_forever, args=(stop,), name="alerts", daemon=True).start()
     log.info("price alerts: %d active", len(journal.alerts("active")))
+    if cfg.has_okx_keys:
+        threading.Thread(target=watch.run_forever, args=(stop,), name="watch", daemon=True).start()
+        watching = watch.watching()
+        log.info("position watch: %s", f"every {watching.hours:g} hour(s)" if watching else "off")
     if cfg.has_okx_keys:
         release_watcher = ReleaseWatcher(
             journal, okx, reporter.current_state, reporter.send_alert, cfg.tz,

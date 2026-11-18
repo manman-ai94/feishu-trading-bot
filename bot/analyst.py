@@ -1,10 +1,12 @@
 """The AI layer. Claude is the analyst and risk officer; it never trades.
 
-Four tiers:
-  quick   -> MODEL_QUICK, low effort          (sorting short messages)
-  daily   -> MODEL_DAILY at EFFORT_DAILY      (questions, pre-market brief, daily wrap, trade reviews)
-  account -> MODEL_DAILY at EFFORT_ACCOUNT    (questions about the trader's own positions and orders)
-  deep    -> MODEL_DEEP at EFFORT_DEEP        (weekly review, "深度" requests from the owner)
+The tiers:
+  quick       -> MODEL_QUICK, low effort          (sorting short messages)
+  daily       -> MODEL_DAILY at EFFORT_DAILY      (questions, pre-market brief, daily wrap, trade reviews)
+  account     -> MODEL_DAILY at EFFORT_ACCOUNT    (questions about the trader's own positions and orders)
+  deep        -> MODEL_DEEP at EFFORT_DEEP        (weekly review, "深度" requests from the owner)
+  watch       -> MODEL_WATCH at EFFORT_WATCH      (the routine comment on a timed position check, watch.py)
+  watch_close -> MODEL_DAILY at EFFORT_DAILY      (the same when a position wants a closer look)
 
 Before it answers, the AI reads its own track record and the lessons of the latest trade reviews
 (see `attach_feedback`), so an analysis starts from how the last ones went.
@@ -39,6 +41,7 @@ FALLBACK_MODEL_PREFIXES = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-
 MAX_STEPS = 8  # rounds of tool calls in one piece of work
 MAX_SOURCES = 5
 BUDGET_TIER_TOKENS = 8000
+CHEAP_TIERS = ("quick", "watch")  # already cheap: past the budget they stay as they are, not "saved" onto MODEL_DAILY
 
 # USD per million tokens: (input, output, cache read). Writing to the cache costs 1.25x input.
 PRICES = {
@@ -86,7 +89,8 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 你就是群里和私聊里的“交易助手”这个机器人，下单、提醒、简报都是你所在的这个程序做的。不要把自己和“机器人”说成两个东西，不要让他“去 @机器人”或“发给机器人”。他问到你自己（该 @ 谁、确认码怎么回、为什么刚才没执行），就照实回答：在群里 @交易助手 就是 @你。前面的对话里标着“程序自动回复的卡片”的，是这个程序不经过你自动回的，你可以照着它说明刚才发生了什么。
 程序认出下单改单的话会自己出预览，轮不到你回答。如果他要下单改单的话还是到了你这里，说明程序没认出来，就给他一句能用的标准写法，例如“止损 XAU 3806”“平仓 XAU 一半”“撤单 XAU”“限价做多 XAU 3850 止损 3820 止盈 3950”；程序会先回预览，他回四位确认码（只发数字也行）才下到 OKX。不要说没有权限。他没要下单时，不要主动推荐这些写法。价格由他定，你可以把你分析出的关键位告诉他作参考。要等价格先突破才进场的单（涨过某价再做多、跌破某价再做空）可以挂突破单，写法“涨破 3900 做多 XAU 止损 3870”“跌破 3800 做空 XAU 止损 3830”。想在几个价位分批挂的，可以分档挂单，写法“分档做多 XAU 3850 3830 3810 止损 3790”“分3档做多 XAU 3850到3810 止损 3790”，最多 5 档。
 这些在飞书里都能做，不要说只能去 OKX 的 App 里操作：开仓、平仓、撤单（也能按价格撤，例如“撤单 XAU 3788”）、改止盈止损。改挂单的价格要先撤单再重新挂，两步都能在这里做。价格提醒也能设：写法是“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了程序会马上告诉他，只提醒不下单；发“提醒”看已设的，“取消提醒 编号”取消。程序认出这些话会自己办，轮不到你；到了你这里就告诉他写法。
-他要的事这个程序确实做不到（例如按时间提醒），直说现在做不到、眼下可以怎么变通，然后在全文最后另起一行写“诉求：”，后面用一句话说他想要什么。程序会把这一行拿掉，记进诉求清单交给开发的人。做得到的事不写这一行。
+持仓期间想让你每隔几小时盯一下仓位，也能做：写法是“每 4 小时盯一下仓位”（几小时他定，最短半小时），程序会在有持仓时按时发一张卡片，带离止损止盈多远、浮动盈亏和几句点评，只看不动；发“停止盯仓”关掉，发“盯仓”看设置。到了你这里就告诉他写法。
+他要的事这个程序确实做不到，直说现在做不到、眼下可以怎么变通，然后在全文最后另起一行写“诉求：”，后面用一句话说他想要什么。程序会把这一行拿掉，记进诉求清单交给开发的人。做得到的事不写这一行。
 
 格式：
 回答显示在飞书里，多数时候在手机上看。用简体中文。重要术语第一次出现时可以在括号里附英文，因为读者在学英语，每条回答三四处就够。内容多、需要分段时可以用加粗的小标题和短横线列表，短回答用普通的句子就行；不要用表格和 # 标题。价格按该品种通常的小数位写。"""
@@ -168,6 +172,19 @@ DEEP_NOTE = (
     "这次交易员要的是深度分析：可以多查几轮数据和资料，把各周期的结构、关键事件和值得做计划的情景讲透，"
     "篇幅可以到两三屏。"
 )
+
+
+WATCH_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的行情分析助手。他持仓期间让你每隔几小时盯一下仓位。程序已经把每个持仓离止损、止盈多远，浮动盈亏多少，账户总风险，都算好放在卡片上了；你写的是卡片最下面的一小段点评。
+
+怎么写：
+- 例行的一次写两三句，不超过 120 字。第一句直接说仓位眼下怎么样：结构还在不在、动能偏哪边，和上一张卡片比有什么变化。
+- 接着给接下来最值得盯的一两个价位和条件，价位写精确数字并说明依据（例如 1 小时 EMA50、4 小时前低），用“站稳 X 上方……；跌破 Y……”这样的条件句。
+- 需不需要他现在做点什么：多数时候是不用动，就直说。离止损很近、离止盈很近、快公布重要数据、或者走势和这笔单的方向对不上时，点出来，给出你从数据里看到的参考价位（例如保本位、结构失效位）。决定留给他：不要写“把止损提到 X”“减一半”“马上平仓”这样替他拍板的话。
+- 消息最后写了“这次要多留意”时，先回应那一点，可以写到四五句、200 字以内。
+- 卡片上的数字他已经看到了，不要再列一遍，也不要重算。只用消息里给的数据；新闻和消息面这次没有，不要提，也不要编。
+- 不寒暄，不写“仅供参考”“由你决定”。不用表格、标题和加粗，不分段。用简体中文，可以给一个术语附英文。"""
+
+WATCH_TASK = "请写这一次的盯仓点评。"
 
 
 class AnalystUnavailable(Exception):
@@ -265,6 +282,8 @@ class Analyst:
             "account": Tier(cfg.model_daily, cfg.effort_account, 16000, tools=True),
             "judge": Tier(cfg.model_daily, "low", 2000),  # scores answers in `python -m bot eval`
             "deep": Tier(cfg.model_deep, cfg.effort_deep, 32000, tools=True, web_searches=WEB_SEARCHES_DEEP),
+            "watch": Tier(cfg.model_watch, cfg.effort_watch, 3000),
+            "watch_close": Tier(cfg.model_daily, cfg.effort_daily, 8000),
         }
 
     def attach_account(self, account, history) -> None:
@@ -336,7 +355,7 @@ class Analyst:
         if not self.enabled:
             raise AnalystUnavailable("还没有配置 Claude 的 API key，AI 分析暂时用不了。")
         tier = self._tiers[tier_name]
-        saving = tier_name != "quick" and self._over_budget()
+        saving = tier_name not in CHEAP_TIERS and self._over_budget()
         if saving:
             tier = Tier(self._cfg.model_daily, "low", BUDGET_TIER_TOKENS, tools=tier.tools)
         messages: list[dict] = []
@@ -653,6 +672,13 @@ class Analyst:
             parts.append(lessons + "\n这些教训已经记下了：不要重复写同一条；这笔又犯了同样的错，就直说又犯了。")
         parts.append(REVIEW_TASK + (SHARED_NOTE if shared_with_group else ""))
         return self._ask("daily", ANALYST_SYSTEM, "\n\n".join(parts), purpose="trade review", account=True)
+
+    def watch_comment(self, facts: str, close: bool = False) -> str:
+        """A few sentences under a timed position check (watch.py). `close`: a position wants a closer look,
+        so the stronger model writes them. No tools: everything it needs is in `facts`."""
+        tier = "watch_close" if close else "watch"
+        user = f"{self._now_line()}\n\n{facts}\n\n{WATCH_TASK}"
+        return self._ask(tier, WATCH_SYSTEM, user, purpose="position watch" + (" (close look)" if close else ""))
 
     def grade(self, system: str, user: str) -> str:
         """One answer scored against its points, for `python -m bot eval`. No tools; metered as "eval judge"."""

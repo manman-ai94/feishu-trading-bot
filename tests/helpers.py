@@ -259,6 +259,10 @@ class FakeAnalyst:
         text = self._record("review", figures=figures, lessons=lessons, shared_with_group=shared_with_group)
         return text if self.reply is None else self.reply
 
+    def watch_comment(self, facts, close=False):
+        text = self._record("watch", facts=facts, close=close)
+        return text if self.reply is None else self.reply
+
 
 class Clock:
     """A clock the test moves by hand."""
