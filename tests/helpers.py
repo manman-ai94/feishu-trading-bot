@@ -94,6 +94,14 @@ class FakeFeishu:
         self.sent: list[Sent] = []
         self.reactions: list[tuple[str, str, str]] = []  # (added | removed, message id, emoji or reaction id)
         self.reaction_error: Exception | None = None
+        self.members: list[tuple[str, str]] | None = None  # None: the app may not read group members
+
+    def chat_members(self, chat_id):
+        if self.members is None:
+            from bot.feishu_client import FeishuError
+
+            raise FeishuError(99991672, "Access denied: im:chat.members:read")
+        return list(self.members)
 
     def add_reaction(self, message_id, emoji):
         if self.reaction_error:

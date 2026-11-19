@@ -1,5 +1,7 @@
 """The router decides who gets what. These tests pin down the privacy rules."""
 from __future__ import annotations
+import re
+
 import pytest
 
 from bot.alerts import PriceAlerts
@@ -1257,6 +1259,12 @@ def test_the_usage_card_shows_what_the_watch_cost():
 # ------------------------------------------------------- a second owner (v0.17.0)
 
 BUDDY = "ou_buddy"
+OTHER = "ou_other"
+
+
+def plain(sent) -> str:
+    """A reply as Feishu shows it: an @ tag reads as the person's name."""
+    return re.sub(r'<at user_id="[^"]*">([^<]*)</at>', lambda m: m.group(1) or "@某人", sent.body)
 
 
 _said = iter(range(1, 10_000))
@@ -1270,7 +1278,7 @@ def test_the_owner_makes_someone_in_the_group_an_owner_too():
     bench = Bench()
     assert bench.say("现在黄金怎么看", sender=BUDDY, private=False)[0].body == OWNER_ONLY_TEXT
     [reply] = _make_owner(bench)
-    assert "阿强 现在也是主人" in reply.body and "确认码" in reply.body
+    assert "阿强 现在也是主人" in plain(reply) and "确认码" in reply.body and '<at user_id="ou_buddy">' in reply.body
     assert bench.saved == [("CO_OWNER_OPEN_IDS", BUDDY)] and bench.cfg.is_owner(BUDDY)
     assert not bench.cfg.is_owner(FRIEND)
 
@@ -1289,10 +1297,10 @@ def test_the_list_of_owners_and_making_the_same_person_twice():
     bench = Bench()
     assert "只有你一位主人" in bench.say("主人", private=False)[0].body
     _make_owner(bench)
-    assert "阿强 已经是主人了" in _make_owner(bench)[0].body
+    assert "阿强 已经是主人了" in plain(_make_owner(bench)[0])
     assert bench.saved == [("CO_OWNER_OPEN_IDS", BUDDY)]  # written once
     [reply] = bench.say("主人", sender=BUDDY, private=False)
-    assert "还有 1 位主人：阿强" in reply.body
+    assert "还有 1 位主人：阿强" in plain(reply)
 
 
 def test_only_the_first_owner_makes_or_unmakes_owners():
@@ -1309,9 +1317,9 @@ def test_only_the_first_owner_makes_or_unmakes_owners():
 
 def test_making_an_owner_needs_someone_mentioned_and_has_a_limit():
     bench = Bench()
-    assert "要在群里 @ 上那个人" in bench.say("设为主人", private=False)[0].body
+    assert "我还不认识他" in bench.say("设为主人", private=False)[0].body
     # Mentioning the bot or himself does not count.
-    assert "要在群里 @ 上那个人" in bench.say("设为主人", private=False, mentions=(BOT, OWNER), message_id="om_self")[0].body
+    assert "我还不认识他" in bench.say("设为主人", private=False, mentions=(BOT, OWNER), message_id="om_self")[0].body
     for number in range(3):
         _make_owner(bench, who=f"ou_extra{number}", name=f"人{number}")
     assert "最多再设 3 位主人" in _make_owner(bench)[0].body and not bench.cfg.is_owner(BUDDY)
@@ -1356,7 +1364,7 @@ def test_unmaking_an_owner_voids_his_preview():
     _make_owner(bench)
     bench.say("做多 XAU 100张 止损 3860", sender=BUDDY, private=False)
     [reply] = _make_owner(bench, words="取消主人")
-    assert "阿强 不再是主人了" in reply.body and "作废" in reply.body
+    assert "阿强 不再是主人了" in plain(reply) and "作废" in reply.body
     assert bench.saved[-1] == ("CO_OWNER_OPEN_IDS", "") and not bench.cfg.is_owner(BUDDY)
     assert bench.say("确认 4821", sender=BUDDY, private=False)[0].body == OWNER_ONLY_TEXT
     assert bench.say("确认 4821", private=False)[0].body == "现在没有等待确认的指令。"
@@ -1372,3 +1380,125 @@ def test_a_saved_owner_list_is_read_back():
     assert bench.analyst.named("answer")
     # Without the names kept in the journal, the list still shows who.
     assert "ou_buddy" in bench.say("主人", private=False)[0].body
+
+
+# --------------------------------------- one message is enough to make an owner (v0.17.1)
+
+_heard = iter(range(1, 10_000))
+
+
+def _say(bench, text, **kwargs):
+    return bench.say(text, message_id=f"om_heard_{next(_heard)}", **kwargs)
+
+
+def test_any_wording_with_the_person_mentioned_makes_him_an_owner():
+    for words in ("设置主人", "设置他也为主人", "让他当主人", "给他主人权限", "他也是主人"):
+        bench = Bench()
+        [reply] = _make_owner(bench, words=words)
+        assert "阿强 现在也是主人" in plain(reply), words
+        assert bench.cfg.is_owner(BUDDY)
+
+
+def test_a_question_about_owners_still_goes_to_the_ai():
+    bench = Bench()
+    _say(bench, "主人能做什么？", private=False)
+    _say(bench, "设置主人是什么意思", private=False)
+    # Mentioning someone while talking about "主人" does not make him one.
+    _say(bench, "主人让你看下仓位", private=False, mentions=(BOT, BUDDY), mentioned_names=("交易助手", "阿强"))
+    assert len(bench.analyst.named("answer")) == 3 and not bench.saved
+    _say(bench, "可以把他设为主人吗", private=False, mentions=(BOT, BUDDY), mentioned_names=("交易助手", "阿强"))
+    assert bench.cfg.is_owner(BUDDY)
+
+
+def test_the_only_other_person_who_spoke_to_the_bot_is_made_an_owner_without_naming_him():
+    bench = Bench()
+    assert _say(bench, "现在黄金怎么看", sender=BUDDY, private=False)[0].body == OWNER_ONLY_TEXT
+    [reply] = _say(bench, "设置主人", private=False)
+    assert '<at user_id="ou_buddy">' in reply.body and "现在也是主人" in reply.body
+    assert bench.cfg.is_owner(BUDDY) and bench.saved == [("CO_OWNER_OPEN_IDS", BUDDY)]
+    # The same from the private chat, for the next one.
+    bench = Bench()
+    _say(bench, "在吗", sender=BUDDY, private=False)
+    _say(bench, "设置主人")
+    assert bench.cfg.is_owner(BUDDY)
+
+
+def test_a_typed_name_finds_the_person():
+    bench = Bench()
+    _say(bench, "在吗", sender=BUDDY, private=False)
+    _say(bench, "在吗", sender=OTHER, private=False)
+    # His name became known when someone @-mentioned him in the group.
+    _say(bench, "你看下", private=False, mentions=(BOT, BUDDY), mentioned_names=("交易助手", "恶霸十七号"))
+    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
+    assert "恶霸十七号 现在也是主人" in plain(reply) and bench.cfg.is_owner(BUDDY) and not bench.cfg.is_owner(OTHER)
+    # Part of the name is enough.
+    bench.say("取消主人", private=False, message_id="om_remove_all")
+    assert not bench.cfg.is_owner(BUDDY)
+    _say(bench, "把十七号设为主人", private=False)
+    assert bench.cfg.is_owner(BUDDY)
+
+
+def test_a_name_the_bot_has_never_seen_is_not_guessed():
+    bench = Bench()
+    _say(bench, "在吗", sender=OTHER, private=False)  # someone else spoke to the bot; he did not
+    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
+    assert reply.body.startswith("没找到“恶霸十七号”。是哪一位？") and '1. <at user_id="ou_other">' in reply.body
+    assert not bench.saved and not bench.cfg.is_owner(OTHER)
+    _say(bench, "设为主人 1", private=False)
+    assert bench.cfg.is_owner(OTHER)
+    # The list is good for a few minutes only.
+    bench = Bench()
+    _say(bench, "在吗", sender=OTHER, private=False)
+    _say(bench, "在吗", sender=BUDDY, private=False)
+    _say(bench, "设置主人 恶霸十七号", private=False)
+    bench.clock.advance(601)
+    assert "是哪一位" in _say(bench, "设为主人 1", private=False)[0].body and not bench.saved
+
+
+def test_with_several_people_the_bot_asks_which_one():
+    bench = Bench()
+    _say(bench, "黄金怎么看", sender=BUDDY, private=False)
+    bench.clock.advance(60)
+    _say(bench, "仓位", sender=OTHER, private=False)
+    [reply] = _say(bench, "设置主人", private=False)
+    assert "是哪一位" in reply.body and not bench.saved
+    assert "1. " in reply.body and "2. " in reply.body and "最近 @我 说“" in reply.body
+    order = re.findall(r'\d\. <at user_id="(ou_\w+)">', reply.body)
+    assert sorted(order) == [BUDDY, OTHER]
+    _say(bench, "设为主人 2", private=False)
+    assert bench.cfg.co_owner_open_ids == (order[1],)
+    # A name that matches nobody shows the list again.
+    [reply] = _say(bench, "设置主人 张三", private=False)
+    assert reply.body.startswith("没找到“张三”。是哪一位？") and len(bench.cfg.co_owner_open_ids) == 1
+
+
+def test_nobody_known_explains_both_ways():
+    bench = Bench()
+    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
+    assert "我还不认识“恶霸十七号”" in reply.body and "设置主人 @恶霸十七号" in reply.body and not bench.saved
+
+
+def test_the_group_member_list_is_used_when_feishu_allows_it():
+    bench = Bench()
+    bench.feishu.members = [(OWNER, "peng"), (BUDDY, "恶霸十七号"), (BOT, "交易助手")]
+    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
+    assert "恶霸十七号 现在也是主人" in plain(reply) and bench.cfg.is_owner(BUDDY)
+    other = Bench()
+    other.feishu.members = [(OWNER, "peng"), (BUDDY, "恶霸十七号")]
+    _say(other, "设置主人", private=False)
+    assert other.cfg.is_owner(BUDDY)
+
+
+def test_unmaking_the_only_other_owner_needs_no_name():
+    bench = Bench()
+    _make_owner(bench)
+    [reply] = _say(bench, "取消主人", private=False)
+    assert "阿强 不再是主人了" in plain(reply) and not bench.cfg.is_owner(BUDDY)
+    assert _say(bench, "取消主人", private=False)[0].body == "现在除了你没有别的主人。"
+
+
+def test_the_tags_stay_out_of_the_chat_history():
+    bench = Bench()
+    _make_owner(bench)
+    [(question, answer)] = bench.journal.recent_dialog(GROUP, 0, 5)
+    assert "<at" not in answer and "阿强 现在也是主人" in answer

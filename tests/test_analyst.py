@@ -641,4 +641,4 @@ def test_the_ai_knows_the_watch_exists():
 def test_the_instructions_know_about_fill_notices_and_other_owners():
     # Wish of 2026-11-18: the AI said it could not announce a filled limit order, which the program already does.
     assert "挂单成交就是一张“开仓”或“加仓”卡片" in ANALYST_SYSTEM and "不要说做不到" in ANALYST_SYSTEM
-    assert "设成主人" in ANALYST_SYSTEM
+    assert "设成主人" in ANALYST_SYSTEM and "设置主人 @某人" in ANALYST_SYSTEM and "没有确认卡片" in ANALYST_SYSTEM

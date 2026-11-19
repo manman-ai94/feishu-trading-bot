@@ -204,6 +204,31 @@ class FeishuClient:
 
     # ------------------------------------------------------------- bot info
 
+    def chat_members(self, chat_id: str) -> list[tuple[str, str]]:
+        """(open_id, name) of the people in a group. Needs the app's permission to read group members
+        (im:chat.members:read or im:chat:readonly); without it Feishu refuses and FeishuError is raised."""
+        members: list[tuple[str, str]] = []
+        page_token = ""
+        for _ in range(5):  # 100 a page; a trading group is far smaller
+            uri = f"/open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id&page_size=100"
+            if page_token:
+                uri += f"&page_token={page_token}"
+            request = lark.BaseRequest.builder().http_method(lark.HttpMethod.GET).uri(uri).token_types({lark.AccessTokenType.TENANT}).build()
+            response = self._client.request(request)
+            if not response.success():
+                raise FeishuError(response.code, response.msg)
+            try:
+                data = json.loads(response.raw.content).get("data") or {}
+            except (ValueError, AttributeError, TypeError):
+                break
+            for item in data.get("items") or []:
+                if item.get("member_id"):
+                    members.append((str(item["member_id"]), str(item.get("name") or "")))
+            page_token = data.get("page_token") or ""
+            if not data.get("has_more") or not page_token:
+                break
+        return members
+
     def bot_open_id(self) -> str | None:
         """The bot's own open_id, used to tell whether a group message @-mentions it."""
         request = (

@@ -70,7 +70,7 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 发“成绩单”，看我给过的点位事后对了多少（可以加品种和天数，例如“成绩单 XAU 90天”）
 - 在群里 @我 发“登记本群”，简报和提醒就会发到那个群
 - 私聊我发“重启”，我会重新启动并读取新的配置
-- 在群里发“@我 设为主人 @某人”，他就和你有一样的权限（提问、看账户、下单，每单照样要他自己回确认码）；“取消主人 @某人”拿掉，发“主人”看名单。只有你能设
+- 在群里发“@我 设置主人 @某人”（也可以写他的名字），他就和你有一样的权限（提问、看账户、下单，每单照样要他自己回确认码）；“取消主人”拿掉，发“主人”看名单。只有你能设
 
 我每天定时发盘前简报和收盘小结，仓位有变动时会自动提醒。我只做分析、提醒和执行主人确认过的指令，不替任何人做买卖决定。"""
 
@@ -113,10 +113,37 @@ HELP_WORDS = ("/help", "help", "帮助", "你能做什么", "怎么用")
 DEEP_PREFIXES = ("深度", "/deep")
 BIND_WORDS = ("/bindgroup", "登记本群", "登记这个群", "绑定本群", "绑定这个群")
 RESTART_WORDS = ("/restart", "重启", "重新启动")
-ADD_OWNER_WORDS = ("设为主人", "设成主人", "设置为主人", "加为主人", "添加主人", "加主人")
-REMOVE_OWNER_WORDS = ("取消主人", "移除主人", "删除主人", "去掉主人", "不再是主人")
-OWNER_LIST_WORDS = ("主人", "主人列表", "主人名单", "谁是主人", "有哪些主人")
+OWNER_LIST_WORDS = ("主人", "主人列表", "主人名单", "谁是主人", "有哪些主人", "看主人", "查主人")
+# "设为主人", "把他设成主人", "让阿强当主人", "给他主人权限", "取消他的主人", "他不再是主人", "主人 2"
+_ADD_OWNER = re.compile(r"(?:设|加|添|当|成为|升|做|给|授权|开通|也是)[^，。,.!！?？]{0,8}主人|主人[^，。,.]{0,3}(?:权限)")
+_REMOVE_OWNER = re.compile(r"(?:取消|移除|删除|删掉|去掉|撤销|撤掉|拿掉|收回|解除)[^，。,.!！?？]{0,8}主人|不再是主人|主人[^，。,.]{0,3}(?:取消|去掉|拿掉|撤掉)")
+_NOT_A_COMMAND = re.compile(r"[?？吗]|怎么|如何|什么|哪|为啥|为什么|讲讲|介绍|区别|解释")
+_OPEN_ID = re.compile(r"ou_[0-9a-z]{16,}")
+_AT_TAG = re.compile(r'<at user_id="[^"]*">([^<]*)</at>')
+_FILLER_WORDS = re.compile(
+    "|".join(
+        (
+            "设置为", "设置成", "设置", "设为", "设成", "置为", "成为", "加为", "添加", "加入", "给予", "授权", "开通", "权限",
+            "主人", "和我", "跟我", "一样", "同样", "相同", "帮我", "帮忙", "麻烦", "一下", "这个人", "那个人", "这位", "那位",
+            "群里", "唯一", "取消", "移除", "删除", "删掉", "去掉", "撤销", "撤掉", "拿掉", "收回", "解除", "不再是", "不再",
+            "升级", "一位", "也是",
+        )
+    )
+)  # fmt: skip
+_FILLER_CHARS = "把将让当也为给他她是的设加请吧啊呀呢"
+
+
+def _typed_name(text: str) -> str:
+    """The name in "设置主人 恶霸十七号" or "把阿强设成主人"; "" when only the command words are there."""
+    rest = _FILLER_WORDS.sub(" ", _OPEN_ID.sub(" ", text))
+    rest = re.sub(r"[\s\d，。,.!！?？~：:“”\"'、@()（）]+", " ", rest)
+    parts = [part.strip(_FILLER_CHARS) for part in rest.split()]
+    parts = [part for part in parts if len(part) >= 2]
+    return max(parts, key=len) if parts else ""
 OWNER_NAMES_SETTING = "co_owner_names"  # open_id -> the name Feishu showed when he was made an owner
+PEOPLE_SETTING = "group_people"  # open_id -> name, when last seen, what he said: people who @-ed the bot in the group
+PEOPLE_DAYS = 30  # someone not seen for this long is no longer offered
+PICK_SECONDS = 600  # how long "设为主人 2" picks from the list just shown
 MAX_CO_OWNERS = 3
 LEARN_PREFIXES = ("记住", "/learn", "投喂")
 KNOWLEDGE_WORDS = ("资料", "资料库", "知识库", "/kb")
@@ -140,6 +167,22 @@ _MARKDOWN = re.compile(r"\*\*|\]\(|`|^\s*(?:[-*+]|\d+[.、]|#+|>)\s", re.MULTILI
 _QUOTE_FILLER = re.compile(
     r"[a-z0-9/\-\s，,。.?？!！、:：]+|现在|当前|最新|实时|目前|看下|看看|一下|给我|帮我|查|发|和|与|跟|及|的|是|呢|啊"
 )
+
+
+def owners_intent(text: str, others_mentioned: bool = False) -> str:
+    """'list', 'add' or 'remove' when the message changes or asks who the owners are; '' otherwise.
+    Loose on purpose: "设为主人 @阿强", "把阿强设成主人", "让他当主人 @阿强", "给他主人权限", "取消阿强的主人"
+    all count. A question about owners ("主人能做什么？") is left to the AI."""
+    bare = text.strip(" 。.!！?？~")
+    if bare in OWNER_LIST_WORDS:
+        return "list"
+    if len(text) > 40 or "主人" not in text:
+        return ""
+    if _REMOVE_OWNER.search(text):
+        return "remove"
+    if _NOT_A_COMMAND.search(text) and not others_mentioned:
+        return ""  # "可以把他设为主人吗 @阿强" is still a request
+    return "add" if _ADD_OWNER.search(text) else ""
 
 
 class Router:
@@ -192,6 +235,7 @@ class Router:
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
         self._history: dict[str, deque[tuple[float, str, str]]] = {}  # chat_id -> (time, question, answer)
+        self._owner_pick: tuple[float, list[str]] | None = None  # (when, open_ids) of the list "设为主人 2" picks from
         self._dialog_pruned_at = 0.0
 
     # ------------------------------------------------------------------ entry
@@ -225,6 +269,7 @@ class Router:
                 return
             if not self._bot_open_id and not message.mentioned_open_ids:
                 return
+            self._note_people(message)
 
         text = message.text.strip()
         lowered = text.lower()
@@ -284,9 +329,9 @@ class Router:
 
     def _owner_command(self, message: IncomingMessage, text: str, lowered: str) -> bool:
         """Handles the commands only the owner has. False when the message is not one of them."""
-        bare = text.strip(" 。.!！?？~")
-        if len(text) <= 30 and (any(word in text for word in ADD_OWNER_WORDS + REMOVE_OWNER_WORDS) or bare in OWNER_LIST_WORDS):
-            self._owners_command(message, text, bare)
+        intent = owners_intent(text, bool(self._others_mentioned(message)))
+        if intent:
+            self._owners_command(message, text, intent)
         elif text.startswith(BIND_WORDS):
             self._bind_group(message)
         elif lowered == "/restart" or text in RESTART_WORDS:
@@ -330,46 +375,183 @@ class Router:
 
     # --------------------------------------------------------------- owners
 
-    def _owners_command(self, message: IncomingMessage, text: str, bare: str) -> None:
-        """ "设为主人 @某人", "取消主人 @某人", "主人". Only the owner himself changes who is an owner."""
-        cfg = self._cfg
-        if bare in OWNER_LIST_WORDS:
+    def _others_mentioned(self, message: IncomingMessage) -> list[tuple[str, str]]:
+        """(open_id, name) of the people @-mentioned besides the bot and the first owner."""
+        names = message.mentioned_names or ("",) * len(message.mentioned_open_ids)
+        skip = {self._bot_open_id, self._cfg.owner_open_id, ""}
+        return [(open_id, name) for open_id, name in zip(message.mentioned_open_ids, names) if open_id not in skip]
+
+    def _owners_command(self, message: IncomingMessage, text: str, intent: str) -> None:
+        """ "设为主人 @某人", "取消主人", "主人". Only the first owner changes who is an owner. One message is
+        enough: the person can be @-mentioned, named, picked by number from the list the bot just showed,
+        or left out when there is only one person it could be."""
+        if intent == "list":
             reply = self._owners_text()
-        elif message.sender_open_id != cfg.owner_open_id:
+        elif message.sender_open_id != self._cfg.owner_open_id:
             reply = "设主人、取消主人只有最早登记的那位主人能做。"
         else:
-            people = [
-                (open_id, name)
-                for open_id, name in zip(message.mentioned_open_ids, message.mentioned_names or ("",) * len(message.mentioned_open_ids))
-                if open_id and open_id not in (self._bot_open_id, cfg.owner_open_id)
-            ]
-            removing = any(word in text for word in REMOVE_OWNER_WORDS)
-            if not people:
-                reply = f"要在群里 @ 上那个人，例如：@交易助手 {'取消主人' if removing else '设为主人'} @张三。"
-            elif removing:
-                reply = self._remove_owners(people)
-            else:
-                reply = self._add_owners(people)
+            people, reply = self._owner_targets(message, text, intent)
+            if people:
+                reply = self._remove_owners(people) if intent == "remove" else self._add_owners(people)
         self._feishu.reply_text(message.message_id, reply)
-        self._remember_fixed(message.chat_id, text, "", reply)
+        self._remember_fixed(message.chat_id, text, "", _AT_TAG.sub(lambda m: m.group(1) or "他", reply))
+
+    def _owner_targets(self, message: IncomingMessage, text: str, intent: str) -> tuple[list[tuple[str, str]], str]:
+        """Whom "设为主人" or "取消主人" is about, or why that is not clear (and what to send instead)."""
+        cfg = self._cfg
+        mentioned = self._others_mentioned(message)
+        if mentioned:
+            return mentioned, ""
+        skip = {self._bot_open_id, cfg.owner_open_id, ""}
+        typed = [open_id for open_id in dict.fromkeys(_OPEN_ID.findall(text)) if open_id not in skip]
+        if typed:
+            return [(open_id, "") for open_id in typed], ""
+        # "设为主人 2": a number from the list just shown.
+        pick = re.findall(r"\d+", text)
+        if self._owner_pick is not None and len(pick) == 1 and self._clock() - self._owner_pick[0] <= PICK_SECONDS:
+            listed = self._owner_pick[1]
+            if 1 <= int(pick[0]) <= len(listed):
+                self._owner_pick = None
+                return [(listed[int(pick[0]) - 1], "")], ""
+        name = _typed_name(text)
+        people = self._people()
+        if intent == "add" and (name or not any(open_id not in skip for open_id in people)):
+            people = self._learn_members(message, people)  # the group's member list, when the app may read it
+        names = {**{open_id: item.get("name", "") for open_id, item in people.items()}, **self._owner_names()}
+        if intent == "remove":
+            pool = list(cfg.co_owner_open_ids)
+        else:
+            cutoff = self._clock() - PEOPLE_DAYS * 86400
+            seen = sorted(people.items(), key=lambda item: -float(item[1].get("last", 0) or 0))
+            pool = [
+                open_id
+                for open_id, item in seen
+                if open_id not in skip and open_id not in cfg.co_owner_open_ids
+                and (item.get("member") or float(item.get("last", 0) or 0) >= cutoff)
+            ]  # fmt: skip
+        if name:
+            # "设置主人 恶霸十七号": a name the bot has seen, written in full or in part.
+            named = [
+                (open_id, known)
+                for open_id, known in names.items()
+                if open_id not in skip and known and (known in text or name in known)
+            ]
+            if named:
+                return named, ""
+            # Never guessed: the list @-mentions each person, so Feishu shows his real name to pick by number.
+            return [], self._not_found(name, intent, pool, people, names)
+        if intent == "remove" and not pool:
+            return [], "现在除了你没有别的主人。"
+        if not pool:
+            return [], self._not_found("", intent, pool, people, names)
+        if len(pool) == 1:
+            return [(pool[0], names.get(pool[0], ""))], ""
+        return [], self._choose(intent, pool, people, names)
+
+    def _choose(self, intent: str, pool: list[str], people: dict[str, dict], names: dict[str, str]) -> str:
+        self._owner_pick = (self._clock(), pool)
+        word = "取消主人" if intent == "remove" else "设为主人"
+        lines = [f"是哪一位？回“@交易助手 {word} 编号”："]
+        for number, open_id in enumerate(pool, 1):
+            item = people.get(open_id, {})
+            said = f"，最近 @我 说“{item['said']}”" if item.get("said") else ""
+            lines.append(f"{number}. {self._at(open_id, names)}{said}")
+        return "\n".join(lines)
+
+    def _not_found(self, name: str, intent: str, pool: list[str], people: dict[str, dict], names: dict[str, str]) -> str:
+        if pool:
+            head = f"没找到“{name}”。" if name else ""
+            return head + self._choose(intent, pool, people, names)
+        who = f"“{name}”" if name else "他"
+        if intent == "remove":
+            return f"{who}本来就不是主人。发“主人”看名单。"
+        return (
+            f"我还不认识{who}：群里只有 @过我 的人我才知道是谁。两个办法，任选一个：\n"
+            f"1. 发“@交易助手 设置主人 @{name or '他'}”，第二个 @ 要从弹出的成员列表里点他的名字，变成蓝色再发。\n"
+            f"2. 让他在群里 @我 随便说一句，你再发“@交易助手 设置主人{(' ' + name) if name else ''}”。"
+        )
+
+    def _learn_members(self, message: IncomingMessage, people: dict[str, dict]) -> dict[str, dict]:
+        """Adds the registered group's members to the people the bot knows. Feishu refuses unless the app was
+        given the permission to read group members; then the bot goes by the people it has seen."""
+        chat_id = self._cfg.group_chat_id or ("" if message.is_private else message.chat_id)
+        if not chat_id or self._journal is None:
+            return people
+        try:
+            members = self._feishu.chat_members(chat_id)
+        except Exception as exc:
+            log.info("could not read the group's members (%s); going by the people seen", exc)
+            return people
+        for open_id, name in members:
+            if open_id and open_id != self._bot_open_id:
+                item = people.setdefault(open_id, {})
+                item["member"] = True
+                if name:
+                    item["name"] = name
+        try:
+            self._journal.set_setting(PEOPLE_SETTING, json.dumps(people, ensure_ascii=False))
+        except Exception:
+            log.exception("could not keep the group's members")
+        return people
+
+    def _note_people(self, message: IncomingMessage) -> None:
+        """Remembers who @-mentions the bot in the registered group, and the names Feishu shows for the people
+        mentioned there, so that "设为主人" can find the person without his name being typed."""
+        if message.is_private or not message.chat_id or message.chat_id != self._cfg.group_chat_id or self._journal is None:
+            return
+        try:
+            people = self._people()
+            now = self._clock()
+            sender = message.sender_open_id
+            if sender and sender != self._bot_open_id:
+                item = people.setdefault(sender, {})
+                item["last"] = now
+                said = " ".join(message.text.split())
+                item["said"] = said[:12] + ("…" if len(said) > 12 else "")
+            names = message.mentioned_names or ("",) * len(message.mentioned_open_ids)
+            for open_id, name in zip(message.mentioned_open_ids, names):
+                if open_id and open_id != self._bot_open_id and name:
+                    people.setdefault(open_id, {})["name"] = name
+            cutoff = now - PEOPLE_DAYS * 86400
+            kept = {
+                open_id: item
+                for open_id, item in people.items()
+                if float(item.get("last", now) or now) >= cutoff or open_id in self._cfg.co_owner_open_ids
+            }
+            self._journal.set_setting(PEOPLE_SETTING, json.dumps(kept, ensure_ascii=False))
+        except Exception:
+            log.exception("could not note who is in the group")
+
+    def _people(self) -> dict[str, dict]:
+        if self._journal is None:
+            return {}
+        try:
+            people = json.loads(self._journal.get_setting(PEOPLE_SETTING, "") or "{}")
+            return {str(open_id): dict(item) for open_id, item in people.items() if isinstance(item, dict)}
+        except (ValueError, TypeError, AttributeError):
+            return {}
 
     def _owner_names(self) -> dict[str, str]:
         if self._journal is None:
             return {}
         try:
-            return dict(json.loads(self._journal.get_setting(OWNER_NAMES_SETTING, "") or "{}"))
+            return {key: value for key, value in dict(json.loads(self._journal.get_setting(OWNER_NAMES_SETTING, "") or "{}")).items() if value}
         except (ValueError, TypeError):
             return {}
 
-    def _who(self, open_id: str, names: dict[str, str]) -> str:
-        return names.get(open_id) or f"{open_id[:10]}…"
+    def _known_names(self) -> dict[str, str]:
+        return {**{open_id: item.get("name", "") for open_id, item in self._people().items()}, **self._owner_names()}
+
+    def _at(self, open_id: str, names: dict[str, str]) -> str:
+        """The person as Feishu shows an @: his name, even when the bot never saw it written."""
+        return f'<at user_id="{open_id}">{names.get(open_id, "")}</at>'
 
     def _owners_text(self) -> str:
-        names = self._owner_names()
+        names = self._known_names()
         others = self._cfg.co_owner_open_ids
         if not others:
             return "现在只有你一位主人。在群里发“@交易助手 设为主人 @某人”，他就和你有一样的权限。"
-        listed = "、".join(self._who(open_id, names) for open_id in others)
+        listed = "、".join(self._at(open_id, names) for open_id in others)
         return (
             f"除了你，还有 {len(others)} 位主人：{listed}。他们和你的权限一样：提问、看账户、下单改单撤单，"
             "每单都要他们自己回确认码。提醒和简报的私聊卡片只发给你。"
@@ -402,16 +584,17 @@ class Router:
             if open_id not in current:
                 current.append(open_id)
                 added.append(open_id)
+        shown = {**self._known_names(), **names}
         if len(current) > MAX_CO_OWNERS:
             return f"除了你最多再设 {MAX_CO_OWNERS} 位主人。发“主人”看名单，取消几位再设。"
         if not added:
-            return f"{'、'.join(self._who(open_id, names) for open_id, _ in people)} 已经是主人了。"
+            return f"{'、'.join(self._at(open_id, shown) for open_id, _ in people)} 已经是主人了。"
         saved = self._save_owners(tuple(current), names)
-        who = "、".join(self._who(open_id, names) for open_id in added)
+        who = "、".join(self._at(open_id, shown) for open_id in added)
         lines = [
             f"好，{who} 现在也是主人，和你的权限一样：在这里和私聊里 @我 提问、看账户和仓位分析、设提醒和盯仓，"
             "也能下单、改单、撤单。每张单照样先出预览，只认发指令的人自己回的确认码。",
-            "提醒和简报的私聊卡片还是只发给你，群里照常都能看到。只有你能设或取消主人，发“取消主人 @他”拿掉。",
+            "提醒和简报的私聊卡片还是只发给你，群里照常都能看到。只有你能设或取消主人，发“取消主人”拿掉。",
         ]
         if not saved:
             lines.append("注意：这次没能写进配置文件，机器人重启后要重新设。")
@@ -419,10 +602,11 @@ class Router:
 
     def _remove_owners(self, people: list[tuple[str, str]]) -> str:
         names = self._owner_names()
+        shown = {**self._known_names(), **{open_id: name for open_id, name in people if name}}
         gone = [open_id for open_id, _ in people if open_id in self._cfg.co_owner_open_ids]
         if not gone:
-            return f"{'、'.join(name or self._who(open_id, names) for open_id, name in people)} 本来就不是主人。"
-        who = "、".join(self._who(open_id, names) for open_id in gone)
+            return f"{'、'.join(self._at(open_id, shown) for open_id, _ in people)} 本来就不是主人。"
+        who = "、".join(self._at(open_id, shown) for open_id in gone)
         remaining = tuple(open_id for open_id in self._cfg.co_owner_open_ids if open_id not in gone)
         for open_id in gone:
             names.pop(open_id, None)
