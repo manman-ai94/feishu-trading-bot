@@ -268,6 +268,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         alerts=alerts, watch=watch,
     )  # fmt: skip
     log.info("trading: %s (instruments: %s)", desk.mode, ", ".join(cfg.tradable_instruments))
+    log.info("owners: the owner and %d other(s) with the same rights", len(cfg.co_owner_open_ids))
     if cfg.trading_blocked:
         log.warning("trading stays off: the TRADING setting in .env cannot be honoured")
     log.info(

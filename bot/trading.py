@@ -75,6 +75,8 @@ _CONFIRM = re.compile(r"(?:/confirm|确认|确定)\s*(\d{1,8})?")
 # Such a reply voids the preview; it is never taken as the confirmation, whatever code is in it.
 _REFUSAL = re.compile(r"取消|不|别|算了|等|停|撤|作废|放弃|慢|错|(?<![a-z])(?:no|not|don'?t|wait|cancel|stop|hold)(?![a-z])")
 REFUSED_NOTE = "refused"
+NOT_YOURS_NOTE = "not yours"  # a code typed by one owner for the preview another owner asked for
+NOT_YOURS_TEXT = "这个确认码是另一位主人那张预览的。谁发的指令只认谁回的码，没有执行。"
 _POLITE = re.compile(r"^(?:请|麻烦|帮我|给我|帮忙)+\s*")
 _LATIN = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[-/][A-Za-z0-9]+){0,2}")
 _NOT_INSTRUMENTS = {"u", "usdt", "usdc", "usd", "sl", "tp", "oz", "all"}
@@ -806,9 +808,11 @@ class TradeDesk:
         self._new_id = new_id or (lambda: "ftb" + uuid.uuid4().hex[:24])
         self._day_change = day_change
         self._parser = CommandParser(resolver or InstrumentResolver(reader, clock), lambda: cfg.tradable_instruments)
-        self._lock = threading.Lock()  # guards the pending confirmation
+        self._lock = threading.Lock()  # guards the pending confirmations
         self._sending = threading.Lock()  # one order at a time
-        self._pending: _Pending | None = None
+        # Who asked -> the preview waiting for his code. With more than one owner, each has his own: a code
+        # counts only from the person who sent the command, wherever it is typed.
+        self._pending: dict[str, _Pending] = {}
         self._last_sizing: tuple[str, float] | None = None  # (instrument, when) of the last "算仓位" answered
         self._account_config: tuple[float, AccountConfig] | None = None
         self.stream_status: Callable[[], str] | None = None  # set by the app: whether OKX's push stream is up
@@ -820,28 +824,36 @@ class TradeDesk:
         return self._mode
 
     def is_command(self, text: str) -> bool:
-        return self._read(text) is not None
+        """Whether a message reads as an order or as the code of any preview waiting: what the router turns
+        away when it comes from someone who is not an owner."""
+        return self._read(text, None) is not None
 
-    def _read(self, text: str) -> Command | None:
-        """The command in a message: one of the fixed patterns, or the code of the preview that is waiting."""
+    def _read(self, text: str, sender: str | None = "") -> Command | None:
+        """The command in a message: one of the fixed patterns, or the code of the preview that is waiting.
+        `sender` None: anyone's preview counts (for `is_command`)."""
         command = self._parser.parse(text)
         if command is None or command.kind == "unclear":
-            return self._code_reply(text) or command
+            return self._code_reply(text, sender) or command
         return command
 
-    def _code_reply(self, text: str) -> Command | None:
+    def _code_reply(self, text: str, sender: str | None = "") -> Command | None:
         """While a preview waits, a short message with its code in it is the confirmation, however it is
         put: "4812", "确认4812执行", "好 4812". A four-digit number with "确认" in front that is not the
         code is a wrong code, and is answered as one, never passed on as a question. A reply to the card
-        with a "no" in it ("取消 4812", "4812 先别执行", "不确认") voids the preview instead."""
+        with a "no" in it ("取消 4812", "4812 先别执行", "不确认") voids the preview instead.
+        The code of another owner's preview is answered as not his, never carried out."""
         with self._lock:
-            pending = self._pending
-        if pending is None:
+            pending = self._pending.get(sender) if sender is not None else None
+            others = [item for who, item in self._pending.items() if sender is None or who != sender]
+        if pending is None and not others:
             return None
         plain = normalise(text).lower()
         if len(plain) > 24 or "?" in plain:
             return None
         numbers = re.findall(r"\d+", plain)
+        if pending is None:
+            theirs = next((item for item in others if item.code in numbers), None)
+            return Command("confirm", code=theirs.code, note=NOT_YOURS_NOTE) if theirs is not None else None
         about_the_card = any(len(number) == len(pending.code) for number in numbers) or any(
             word in plain for word in ("确认", "确定", "执行")
         )
@@ -854,11 +866,16 @@ class TradeDesk:
                 return Command("confirm", code=numbers[0])
         return None
 
+    def forget_preview(self, sender: str) -> None:
+        """Voids the preview waiting for this person's code: he is no longer an owner."""
+        with self._lock:
+            self._pending.pop(sender, None)
+
     def positions_text(self) -> str:
         """The positions and their stops, for reading a command that names a stop relative to the current one."""
         return self._stops_now().replace("\n现在：\n", "").strip() or "现在没有持仓。"
 
-    def handle_understood(self, said: str, command_text: str, in_group: bool = False) -> Reply | None:
+    def handle_understood(self, said: str, command_text: str, in_group: bool = False, sender: str = "") -> Reply | None:
         """A command the AI wrote out from the owner's own words. It goes through the same reading,
         checks, preview and code as one he typed; the preview starts with what it was taken to mean.
         Only orders: a confirmation, a cancellation or a switch is never taken from the AI."""
@@ -869,7 +886,7 @@ class TradeDesk:
         command = replace(command, source=sources.of_words(said))
         heading = f"我把“{said.strip()[:60]}”理解为：**{command_text}**"
         try:
-            reply = self._dispatch(command, in_group)
+            reply = self._dispatch(command, in_group, sender)
         except Refused as exc:
             reply = Reply(str(exc))
         except OkxError as exc:
@@ -879,30 +896,31 @@ class TradeDesk:
         ending = "" if command.kind == "orders" else "\n不是这个意思就回“取消”，再换个说法。" if reply.title.startswith("下单预览") else ""
         return Reply(f"{heading}\n\n{reply.text}{ending}", title=reply.title, template=reply.template)
 
-    def takes_long(self, text: str) -> bool:
+    def takes_long(self, text: str, sender: str = "") -> bool:
         """Whether answering this message takes a while: the confirmation that starts the demo rehearsal."""
-        command = self._read(text)
+        command = self._read(text, sender)
         with self._lock:
-            pending = self._pending
+            pending = self._pending.get(sender)
         return command is not None and command.kind == "confirm" and pending is not None and pending.command.kind == "selftest"
 
     # ------------------------------------------------------------------ entry
 
-    def handle(self, text: str, refused_here: str = "", in_group: bool = False) -> Reply | None:
+    def handle(self, text: str, refused_here: str = "", in_group: bool = False, sender: str = "") -> Reply | None:
         """Answers an order command. None when the message is not one.
 
         `refused_here` is what to say instead when commands are not carried out
         where this one was sent. The router decides that: the owner's private
-        chat always, the registered group when GROUP_TRADING is on.
+        chat always, the registered group when GROUP_TRADING is on. `sender` is who sent it: his preview
+        waits for his code alone.
         """
-        command = self._read(text)
+        command = self._read(text, sender)
         if command is None:
             return None
         if refused_here:
             return Reply(refused_here)
         command = self._tagged(command)
         try:
-            return self._dispatch(command, in_group)
+            return self._dispatch(command, in_group, sender)
         except Refused as exc:
             return Reply(str(exc))
         except OkxError as exc:
@@ -922,7 +940,7 @@ class TradeDesk:
             return replace(command, source="sized")
         return replace(command, source="own")
 
-    def _dispatch(self, command: Command, in_group: bool = False) -> Reply:
+    def _dispatch(self, command: Command, in_group: bool = False, sender: str = "") -> Reply:
         kind = command.kind
         if kind == "help":
             return Reply(HELP_TEXT + f"\n\n现在的状态：{self._mode_line()}", title="下单指令", template="turquoise")
@@ -935,9 +953,9 @@ class TradeDesk:
         if kind == "resume":
             return self._resume()
         if kind == "confirm":
-            return self._confirm(command)
+            return self._confirm(command, sender)
         if kind == "abort":
-            return self._abort(command.note == REFUSED_NOTE)
+            return self._abort(command.note == REFUSED_NOTE, sender)
         if kind == "size":
             reply = self._size(command)
             self._last_sizing = (command.inst_id, self._clock())
@@ -948,11 +966,12 @@ class TradeDesk:
             where_now = self._stops_now() if command.note == STOP_PRICE_MISSING else ""
             return Reply(f"{command.note}{where_now}\n没有执行任何操作。发“交易帮助”可以看全部写法。", unclear=True)
         if kind == "unbreak":
-            return self._ask_unbreak(command, in_group)
+            return self._ask_unbreak(command, in_group, sender)
         if kind == "selftest":
             plan = self._selftest(command.inst_id).plan()
             return self._ask_to_confirm(
-                command, plan, "模拟盘自测 · 预览", "回复 **确认 {code}** 开始，回复“取消”作废。{seconds} 秒内有效。", in_group
+                command, plan, "模拟盘自测 · 预览", "回复 **确认 {code}** 开始，回复“取消”作废。{seconds} 秒内有效。", in_group,
+                sender,
             )
         action = _action(command)
         if action not in self._cfg.trade_actions:
@@ -963,15 +982,17 @@ class TradeDesk:
         plan = self._plan(command)
         return self._ask_to_confirm(
             command, plan, f"下单预览 · {MODE_LABELS[self._mode]}",
-            "回复 **确认 {code}** 执行，回复“取消”作废。{seconds} 秒内有效，过期要重新发指令。", in_group,
+            "回复 **确认 {code}** 执行，回复“取消”作废。{seconds} 秒内有效，过期要重新发指令。", in_group, sender,
         )  # fmt: skip
 
-    def _ask_to_confirm(self, command: Command, plan: Plan, title: str, ending: str, in_group: bool = False) -> Reply:
-        """Shows the owner what would be done and holds it until the code comes back."""
+    def _ask_to_confirm(
+        self, command: Command, plan: Plan, title: str, ending: str, in_group: bool = False, sender: str = ""
+    ) -> Reply:
+        """Shows the owner what would be done and holds it until the code comes back from him."""
         code = self._new_code()
         seconds = self._cfg.trade_confirm_seconds
         with self._lock:
-            self._pending = _Pending(code, self._clock() + seconds, command, plan)
+            self._pending[sender] = _Pending(code, self._clock() + seconds, command, plan)
         log.info("preview (%s) %s %s: waiting for the code", self._mode, command.kind, command.inst_id or "-")
         ending = ending.format(code=code, seconds=seconds)
         if in_group:
@@ -981,14 +1002,18 @@ class TradeDesk:
 
     # ----------------------------------------------------------- confirmation
 
-    def _confirm(self, command: Command) -> Reply:
+    def _confirm(self, command: Command, sender: str = "") -> Reply:
         with self._lock:
-            pending = self._pending
+            pending = self._pending.get(sender)
             if pending is None:
+                theirs = command.code and any(item.code == command.code for who, item in self._pending.items() if who != sender)
+                if command.note == NOT_YOURS_NOTE or theirs:
+                    log.info("a code came from an owner for a preview another owner asked for")
+                    return Reply(NOT_YOURS_TEXT)
                 log.info("a confirmation came with no preview waiting")
                 return Reply("现在没有等待确认的指令。")
             if self._clock() > pending.expires_at:
-                self._pending = None
+                del self._pending[sender]
                 log.info("a confirmation came after the preview had expired")
                 return Reply("这个预览已经过期了，没有执行。请重新发指令。")
             if not command.code:
@@ -997,10 +1022,10 @@ class TradeDesk:
                 log.info("a confirmation came with the wrong code")
                 pending.wrong += 1
                 if pending.wrong >= MAX_WRONG_CODES:
-                    self._pending = None
+                    del self._pending[sender]
                     return Reply("确认码连续错了三次，这个预览已作废，没有执行。请重新发指令。")
                 return Reply("确认码不对，没有执行。请核对预览卡片上的四位数。")
-            self._pending = None  # a code works once
+            del self._pending[sender]  # a code works once
         if pending.command.kind == "unbreak":
             return self._unbreak()
         with self._sending:
@@ -1034,9 +1059,9 @@ class TradeDesk:
             )  # fmt: skip
         return self._twin
 
-    def _abort(self, refused: bool = False) -> Reply:
+    def _abort(self, refused: bool = False, sender: str = "") -> Reply:
         with self._lock:
-            pending, self._pending = self._pending, None
+            pending = self._pending.pop(sender, None)
         if pending is None:
             return Reply("现在没有等待确认的指令。")
         if refused:
@@ -1050,7 +1075,7 @@ class TradeDesk:
     def _pause(self) -> Reply:
         self._journal.set_setting(PAUSED_SETTING, "1")
         with self._lock:
-            self._pending = None
+            self._pending.clear()
         log.info("the owner paused trading")
         return Reply(
             "已暂停：从现在起不接受开仓指令，等待确认的预览也作废了。\n"
@@ -1099,7 +1124,7 @@ class TradeDesk:
                 "平仓、撤单、改止损照常可用。要恢复开仓，发“解除熔断”，再回确认码。"
             )
 
-    def _ask_unbreak(self, command: Command, in_group: bool) -> Reply:
+    def _ask_unbreak(self, command: Command, in_group: bool, sender: str = "") -> Reply:
         cfg = self._cfg
         if cfg.trade_breaker_stops <= 0:
             return Reply("熔断没有打开（TRADE_BREAKER_STOPS=0），不用解除。")
@@ -1115,7 +1140,7 @@ class TradeDesk:
         )
         plan = Plan("unbreak", "解除熔断", lines, ())
         return self._ask_to_confirm(
-            command, plan, "解除熔断 · 预览", "回复 **确认 {code}** 解除，回复“取消”作废。{seconds} 秒内有效。", in_group
+            command, plan, "解除熔断 · 预览", "回复 **确认 {code}** 解除，回复“取消”作废。{seconds} 秒内有效。", in_group, sender
         )
 
     def _unbreak(self) -> Reply:

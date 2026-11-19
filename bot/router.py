@@ -3,6 +3,10 @@
 Rules that matter:
   * By default the bot takes instructions from the owner only, in the private
     chat and in the group (GROUP_OWNER_ONLY=true). Everyone else is told so.
+  * The owner can make someone an owner too ("设为主人 @某人" in the group). Such
+    an owner has the same rights, orders included; his previews wait for his own
+    code. Only the owner himself makes or unmakes owners, and the private cards
+    (alerts, briefs) still go to him alone.
   * Account details (balance, PnL) are shown in the owner's private chat, and
     in the registered group when GROUP_SHOW_PNL=true (the default). There the
     AI is also given the account, so it can analyse the positions.
@@ -23,6 +27,7 @@ and only a longer answer becomes a card, under the title the AI gave it.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -65,6 +70,7 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 发“成绩单”，看我给过的点位事后对了多少（可以加品种和天数，例如“成绩单 XAU 90天”）
 - 在群里 @我 发“登记本群”，简报和提醒就会发到那个群
 - 私聊我发“重启”，我会重新启动并读取新的配置
+- 在群里发“@我 设为主人 @某人”，他就和你有一样的权限（提问、看账户、下单，每单照样要他自己回确认码）；“取消主人 @某人”拿掉，发“主人”看名单。只有你能设
 
 我每天定时发盘前简报和收盘小结，仓位有变动时会自动提醒。我只做分析、提醒和执行主人确认过的指令，不替任何人做买卖决定。"""
 
@@ -107,6 +113,11 @@ HELP_WORDS = ("/help", "help", "帮助", "你能做什么", "怎么用")
 DEEP_PREFIXES = ("深度", "/deep")
 BIND_WORDS = ("/bindgroup", "登记本群", "登记这个群", "绑定本群", "绑定这个群")
 RESTART_WORDS = ("/restart", "重启", "重新启动")
+ADD_OWNER_WORDS = ("设为主人", "设成主人", "设置为主人", "加为主人", "添加主人", "加主人")
+REMOVE_OWNER_WORDS = ("取消主人", "移除主人", "删除主人", "去掉主人", "不再是主人")
+OWNER_LIST_WORDS = ("主人", "主人列表", "主人名单", "谁是主人", "有哪些主人")
+OWNER_NAMES_SETTING = "co_owner_names"  # open_id -> the name Feishu showed when he was made an owner
+MAX_CO_OWNERS = 3
 LEARN_PREFIXES = ("记住", "/learn", "投喂")
 KNOWLEDGE_WORDS = ("资料", "资料库", "知识库", "/kb")
 FORGET_WORDS = ("删除上一条", "删除上一条笔记", "撤销上一条", "/forget")
@@ -206,7 +217,7 @@ class Router:
 
     def _handle(self, message: IncomingMessage) -> None:
         cfg = self._cfg
-        is_owner = bool(cfg.owner_open_id) and message.sender_open_id == cfg.owner_open_id
+        is_owner = cfg.is_owner(message.sender_open_id)
 
         if not message.is_private:
             # In a group, only answer when the bot itself is @-mentioned.
@@ -273,7 +284,10 @@ class Router:
 
     def _owner_command(self, message: IncomingMessage, text: str, lowered: str) -> bool:
         """Handles the commands only the owner has. False when the message is not one of them."""
-        if text.startswith(BIND_WORDS):
+        bare = text.strip(" 。.!！?？~")
+        if len(text) <= 30 and (any(word in text for word in ADD_OWNER_WORDS + REMOVE_OWNER_WORDS) or bare in OWNER_LIST_WORDS):
+            self._owners_command(message, text, bare)
+        elif text.startswith(BIND_WORDS):
             self._bind_group(message)
         elif lowered == "/restart" or text in RESTART_WORDS:
             self._restart_bot(message)  # the group and the private chat do the same for the owner
@@ -313,6 +327,111 @@ class Router:
         if reply.then is not None:
             reply.then()  # the first card, right after the reply
         return True
+
+    # --------------------------------------------------------------- owners
+
+    def _owners_command(self, message: IncomingMessage, text: str, bare: str) -> None:
+        """ "设为主人 @某人", "取消主人 @某人", "主人". Only the owner himself changes who is an owner."""
+        cfg = self._cfg
+        if bare in OWNER_LIST_WORDS:
+            reply = self._owners_text()
+        elif message.sender_open_id != cfg.owner_open_id:
+            reply = "设主人、取消主人只有最早登记的那位主人能做。"
+        else:
+            people = [
+                (open_id, name)
+                for open_id, name in zip(message.mentioned_open_ids, message.mentioned_names or ("",) * len(message.mentioned_open_ids))
+                if open_id and open_id not in (self._bot_open_id, cfg.owner_open_id)
+            ]
+            removing = any(word in text for word in REMOVE_OWNER_WORDS)
+            if not people:
+                reply = f"要在群里 @ 上那个人，例如：@交易助手 {'取消主人' if removing else '设为主人'} @张三。"
+            elif removing:
+                reply = self._remove_owners(people)
+            else:
+                reply = self._add_owners(people)
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember_fixed(message.chat_id, text, "", reply)
+
+    def _owner_names(self) -> dict[str, str]:
+        if self._journal is None:
+            return {}
+        try:
+            return dict(json.loads(self._journal.get_setting(OWNER_NAMES_SETTING, "") or "{}"))
+        except (ValueError, TypeError):
+            return {}
+
+    def _who(self, open_id: str, names: dict[str, str]) -> str:
+        return names.get(open_id) or f"{open_id[:10]}…"
+
+    def _owners_text(self) -> str:
+        names = self._owner_names()
+        others = self._cfg.co_owner_open_ids
+        if not others:
+            return "现在只有你一位主人。在群里发“@交易助手 设为主人 @某人”，他就和你有一样的权限。"
+        listed = "、".join(self._who(open_id, names) for open_id in others)
+        return (
+            f"除了你，还有 {len(others)} 位主人：{listed}。他们和你的权限一样：提问、看账户、下单改单撤单，"
+            "每单都要他们自己回确认码。提醒和简报的私聊卡片只发给你。"
+        )
+
+    def _save_owners(self, open_ids: tuple[str, ...], names: dict[str, str]) -> bool:
+        saved = True
+        if self._save_setting is not None:
+            try:
+                self._save_setting("CO_OWNER_OPEN_IDS", ",".join(open_ids))
+            except Exception:
+                saved = False
+                log.exception("could not write CO_OWNER_OPEN_IDS to the configuration file")
+        self._cfg.set_co_owners(open_ids)
+        if self._journal is not None:
+            try:
+                self._journal.set_setting(OWNER_NAMES_SETTING, json.dumps(names, ensure_ascii=False))
+            except Exception:
+                log.exception("could not keep the owners' names")
+        log.info("owners: the owner now shares his rights with %d other(s)", len(open_ids))
+        return saved
+
+    def _add_owners(self, people: list[tuple[str, str]]) -> str:
+        current = list(self._cfg.co_owner_open_ids)
+        names = self._owner_names()
+        added = []
+        for open_id, name in people:
+            if name:
+                names[open_id] = name
+            if open_id not in current:
+                current.append(open_id)
+                added.append(open_id)
+        if len(current) > MAX_CO_OWNERS:
+            return f"除了你最多再设 {MAX_CO_OWNERS} 位主人。发“主人”看名单，取消几位再设。"
+        if not added:
+            return f"{'、'.join(self._who(open_id, names) for open_id, _ in people)} 已经是主人了。"
+        saved = self._save_owners(tuple(current), names)
+        who = "、".join(self._who(open_id, names) for open_id in added)
+        lines = [
+            f"好，{who} 现在也是主人，和你的权限一样：在这里和私聊里 @我 提问、看账户和仓位分析、设提醒和盯仓，"
+            "也能下单、改单、撤单。每张单照样先出预览，只认发指令的人自己回的确认码。",
+            "提醒和简报的私聊卡片还是只发给你，群里照常都能看到。只有你能设或取消主人，发“取消主人 @他”拿掉。",
+        ]
+        if not saved:
+            lines.append("注意：这次没能写进配置文件，机器人重启后要重新设。")
+        return "\n".join(lines)
+
+    def _remove_owners(self, people: list[tuple[str, str]]) -> str:
+        names = self._owner_names()
+        gone = [open_id for open_id, _ in people if open_id in self._cfg.co_owner_open_ids]
+        if not gone:
+            return f"{'、'.join(name or self._who(open_id, names) for open_id, name in people)} 本来就不是主人。"
+        who = "、".join(self._who(open_id, names) for open_id in gone)
+        remaining = tuple(open_id for open_id in self._cfg.co_owner_open_ids if open_id not in gone)
+        for open_id in gone:
+            names.pop(open_id, None)
+        saved = self._save_owners(remaining, names)
+        reply = f"好，{who} 不再是主人了。他在等确认的预览也作废了。" if self._trade is not None else f"好，{who} 不再是主人了。"
+        if self._trade is not None:
+            for open_id in gone:
+                self._trade.forget_preview(open_id)
+        return reply + ("" if saved else "\n注意：这次没能写进配置文件，机器人重启后他会恢复成主人，请再取消一次。")
 
     def _reply_alert(self, message: IncomingMessage, text: str, alert) -> None:
         if alert.title:
@@ -370,16 +489,21 @@ class Router:
             return False
         refused_here = "" if message.is_private else self._group_trade_refusal(message)
         # An order answers in a second or two. Only the rehearsal on the demo account takes long enough for a sign.
-        done = self._show_working(message, slow_text=SLOW_TEXT_SELFTEST) if not refused_here and self._trade.takes_long(text) else None
+        sender = message.sender_open_id
+        done = (
+            self._show_working(message, slow_text=SLOW_TEXT_SELFTEST)
+            if not refused_here and self._trade.takes_long(text, sender)
+            else None
+        )
         try:
-            reply = self._trade.handle(text, refused_here=refused_here, in_group=not message.is_private)
+            reply = self._trade.handle(text, refused_here=refused_here, in_group=not message.is_private, sender=sender)
         finally:
             if done is not None:
                 done()
         if (reply is None or reply.unclear) and not refused_here and self._sounds_like_an_order(text):
             # "止损减两点": an order the patterns could not read in full. The AI may make it out from the
             # current stop; when it cannot either, the desk's own question stands.
-            understood = self._order_in_own_words(text, message.chat_id, in_group=not message.is_private)
+            understood = self._order_in_own_words(text, message.chat_id, in_group=not message.is_private, sender=sender)
             if understood is None and reply is not None and reply.unclear:
                 # Neither could read it: worth a look at how he puts his orders.
                 self._note_wish(message.chat_id, f"下单的话没看懂：{text}", "unclear")
@@ -404,7 +528,7 @@ class Router:
             return False  # "把把握提到 60%，要确保单子挂上" talks the plan over; the AI answers it
         return any(word in lowered for word in ORDER_WORDS)
 
-    def _order_in_own_words(self, text: str, chat_id: str, in_group: bool):
+    def _order_in_own_words(self, text: str, chat_id: str, in_group: bool, sender: str = ""):
         """The AI writes the owner's words out as a fixed-pattern command; the trade desk reads, checks and
         previews it like any other, and nothing is sent without his code. None when they are not an order.
         The last few answers of the chat go along, so "按刚才的情景一挂上" can take its prices from them."""
@@ -412,7 +536,7 @@ class Router:
         command_text = self._analyst.to_command(text, self._trade.positions_text(), earlier)
         if not command_text:
             return None
-        return self._trade.handle_understood(text, command_text, in_group=in_group)
+        return self._trade.handle_understood(text, command_text, in_group=in_group, sender=sender)
 
     def _group_trade_refusal(self, message: IncomingMessage) -> str:
         """Why the owner's order command is not carried out in this group; "" when it is.
@@ -627,7 +751,7 @@ class Router:
         exposure = self._reporter.exposure_lines(state) if with_account else None
         body = status_markdown(state, self._reporter.day_change(state), private=with_account, risk=risk, exposure=exposure)
         # The owner's own numbers need no disclaimer; a friend looking at his stops may take them as a signal.
-        asked_by_owner = bool(self._cfg.owner_open_id) and message.sender_open_id == self._cfg.owner_open_id
+        asked_by_owner = self._cfg.is_owner(message.sender_open_id)
         footer = None if message.is_private or asked_by_owner else DISCLAIMER
         self._feishu.reply_markdown(message.message_id, "当前持仓", body, "blue", footer=footer)
         self._remember_fixed(message.chat_id, message.text.strip(), "当前持仓", body)
@@ -734,7 +858,7 @@ class Router:
     def _shows_account(self, message: IncomingMessage) -> bool:
         """Whether balances and PnL may appear in the answer to this message.
 
-        Yes in the owner's private chat (nobody else gets this far in one), and
+        Yes in an owner's private chat (nobody else gets this far in one), and
         in the registered group when the owner opted in. Never in other groups.
         """
         if message.is_private:

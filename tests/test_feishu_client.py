@@ -151,3 +151,13 @@ def test_the_connection_is_down_until_listen_has_opened_it():
     assert client.connected() is False
     client._ws._conn = object()
     assert client.connected() is True
+
+
+def test_the_people_mentioned_come_with_their_names():
+    mentions = [
+        SimpleNamespace(key="@_user_1", id=SimpleNamespace(open_id="ou_bot"), name="交易助手"),
+        SimpleNamespace(key="@_user_2", id=SimpleNamespace(open_id="ou_buddy"), name="阿强"),
+    ]
+    message = parse_message(event('{"text":"@_user_1 设为主人 @_user_2"}', mentions=mentions))
+    assert message.text == "设为主人"
+    assert message.mentioned_open_ids == ("ou_bot", "ou_buddy") and message.mentioned_names == ("交易助手", "阿强")

@@ -100,6 +100,7 @@ class Config:
     feishu_domain: str = FEISHU_DOMAINS["feishu"]
     owner_open_id: str = ""
     group_chat_id: str = ""
+    co_owner_open_ids: tuple[str, ...] = ()  # people the owner made owners too ("设为主人 @某人"): the same rights, orders included
 
     # OKX
     okx_api_key: str = field(default="", repr=False)
@@ -201,6 +202,17 @@ class Config:
     @property
     def tradable_instruments(self) -> tuple[str, ...]:
         return self.trade_instruments or self.watch_instruments
+
+    def is_owner(self, open_id: str) -> bool:
+        """The owner, or someone he made an owner too. Both have every right, orders included; only the
+        owner himself makes or unmakes owners, and the private cards (alerts, briefs) go to him alone."""
+        if not open_id:
+            return False
+        return open_id == self.owner_open_id or open_id in self.co_owner_open_ids
+
+    def set_co_owners(self, open_ids: tuple[str, ...]) -> None:
+        """Changes while the bot runs, like the group: the owner names them from inside Feishu."""
+        object.__setattr__(self, "co_owner_open_ids", tuple(open_ids))
 
     def register_group(self, chat_id: str) -> None:
         """The one setting that changes while the bot runs: the owner registers
@@ -365,6 +377,9 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         feishu_app_secret=secrets["FEISHU_APP_SECRET"],
         feishu_domain=FEISHU_DOMAINS[domain_key],
         owner_open_id=_get("OWNER_OPEN_ID"),
+        co_owner_open_ids=tuple(
+            dict.fromkeys(item.strip() for item in _get("CO_OWNER_OPEN_IDS").split(",") if item.strip())
+        ),
         group_chat_id=_get("GROUP_CHAT_ID"),
         okx_api_key=secrets["OKX_API_KEY"],
         okx_secret_key=secrets["OKX_SECRET_KEY"],

@@ -97,6 +97,8 @@ def test_marked_requests_and_the_card_of_the_version_that_did_them():
     releases.told(journal, "0.15.0")
     assert "定时盯仓" in releases.news_text(journal, "9.9.9")  # and so was 0.16.0
     releases.told(journal, "0.16.0")
+    assert "设为主人" in releases.news_text(journal, "9.9.9")  # and 0.17.0
+    releases.told(journal, "0.17.0")
     assert releases.news_text(journal, "9.9.9") == ""  # a version with no notes and nothing done says nothing
 
 

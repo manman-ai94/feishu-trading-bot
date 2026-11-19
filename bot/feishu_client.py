@@ -42,6 +42,7 @@ class IncomingMessage:
     text: str
     is_text: bool = True
     mentioned_open_ids: tuple[str, ...] = ()
+    mentioned_names: tuple[str, ...] = ()  # the same people's names, in the same order
 
     @property
     def is_private(self) -> bool:
@@ -91,6 +92,7 @@ def parse_message(data: P2ImMessageReceiveV1) -> IncomingMessage | None:
         text=text,
         is_text=is_text,
         mentioned_open_ids=tuple(m.id.open_id for m in mentions if m.id and m.id.open_id),
+        mentioned_names=tuple((getattr(m, "name", "") or "") for m in mentions if m.id and m.id.open_id),
     )
 
 

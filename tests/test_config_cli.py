@@ -12,7 +12,7 @@ from bot.okx_client import OkxNetworkError
 
 PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING", "TRACK_", "HEARTBEAT_", "BACKUP_")
 NAMES = (
-    "OWNER_OPEN_ID", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
+    "OWNER_OPEN_ID", "CO_OWNER_OPEN_IDS", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
     "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR",
 )  # fmt: skip
 ROOT = Path(__file__).resolve().parent.parent
@@ -475,3 +475,12 @@ def test_requests_are_marked_done_with_the_version_from_the_command_line(tmp_pat
     assert [w["note"] for w in journal.wishes(0, "done")] == [f"v{__version__}"] * 2
     assert main(["--env", str(env), "wishes", "--drop", "7"]) == 1
     assert "#7: not found" in capsys.readouterr().out
+
+
+def test_co_owners_are_read_from_the_file(tmp_path):
+    cfg, _ = load_config(write_env(tmp_path, "OWNER_OPEN_ID=ou_1\nCO_OWNER_OPEN_IDS= ou_2 , ou_3,ou_2,\n"))
+    assert cfg.co_owner_open_ids == ("ou_2", "ou_3")
+    assert cfg.is_owner("ou_1") and cfg.is_owner("ou_3") and not cfg.is_owner("ou_4") and not cfg.is_owner("")
+    os.environ.pop("CO_OWNER_OPEN_IDS", None)  # loading put it in the environment
+    cfg, _ = load_config(write_env(tmp_path, "OWNER_OPEN_ID=ou_1\nCO_OWNER_OPEN_IDS=\n"))
+    assert cfg.co_owner_open_ids == () and not cfg.is_owner("")

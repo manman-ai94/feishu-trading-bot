@@ -40,6 +40,14 @@
 
 机器人只响应你本人的指令。群里其他人 @ 它，只会得到一句“我只响应主人的指令”。自动的提醒和简报照常发到群里，大家都看得到。
 
+### 第二位主人 (co-owner)
+
+你在群里发“@交易助手 设为主人 @某人”，这个人就和你有一样的权限：在群里和他自己的私聊里 @机器人 提问、看账户和仓位分析、设价格提醒和定时盯仓，也能下单、改单、撤单。每张单照样先出预览，只认发这条指令的人自己回的四位确认码：你回他那张预览的码，或者他回你那张的码，都不执行，机器人会说“这个确认码是另一位主人那张预览的”。两个人可以各有一张预览同时等着确认。
+
+- 只有你（`.env` 里 `OWNER_OPEN_ID` 那位）能设和取消主人。发“取消主人 @某人”拿掉，他在等确认的预览一起作废。发“主人”看名单。除你以外最多 3 位。
+- 名单写进 `.env` 的 `CO_OWNER_OPEN_IDS`（逗号分隔的 open_id），重启不丢。也可以手填：让那个人私聊机器人发 `/whoami` 拿到 open_id。
+- 自动的提醒、简报、风险卡片的私聊版本还是只发给你；群里那一份大家都看得到，和以前一样。
+
 这两条规则在 `.env` 里可以改：
 
 - `GROUP_SHOW_PNL=false`：群里不再显示资金和盈亏金额，只显示品种、方向和价位，AI 在群里也不再看你的账户，风险提醒和周复盘只发给你。
@@ -598,6 +606,8 @@ tests/                自动测试，运行方式：python -m pytest
 | 止损 / 止盈 | stop-loss / take-profit | Where is your stop-loss? |
 | 保证金率 | margin ratio | My margin ratio is getting low. |
 | 强平价 | liquidation price | The price is far from my liquidation price. |
+| 共同主人、第二位主人 | co-owner | He is a co-owner of this bot now. |
+| 权限 | permission / rights | He has the same rights as me. |
 | 浮动盈亏 | unrealized PnL | My unrealized PnL is positive today. |
 | 盘前简报 | pre-market brief | Did you read the pre-market brief? |
 | 自检 | self-check | Run the self-check first. |

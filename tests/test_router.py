@@ -12,6 +12,7 @@ from bot.reports import DISCLAIMER
 from bot.router import (
     HELLO_TEXT,
     HELP_TEXT,
+    OWNER_ONLY_TEXT,
     SLOW_SECONDS,
     SLOW_SECONDS_NO_SIGN,
     SLOW_TEXT,
@@ -24,7 +25,7 @@ from bot.router import (
     split_title,
 )
 from bot.service import Reporter
-from bot.trading import TradeDesk
+from bot.trading import NOT_YOURS_TEXT, TradeDesk
 from bot.watch import SETTING as WATCH_SETTING
 from bot.watch import PositionWatch
 
@@ -1251,3 +1252,123 @@ def test_the_usage_card_shows_what_the_watch_cost():
     assert "其中定时盯仓本月 2 次，约 0.08 美元（例行用 Sonnet 5.5，要留意时用 Opus 5.5）" in reply.body
     [reply] = Bench(usage=lambda start, end: {"jobs": 0, "web_searches": 0, "cost_usd": 0.0}).say("用量")
     assert "定时盯仓" not in reply.body
+
+
+# ------------------------------------------------------- a second owner (v0.17.0)
+
+BUDDY = "ou_buddy"
+
+
+_said = iter(range(1, 10_000))
+
+
+def _make_owner(bench, who=BUDDY, name="阿强", words="设为主人"):
+    return bench.say(words, private=False, mentions=(BOT, who), mentioned_names=("交易助手", name), message_id=f"om_owners_{next(_said)}")
+
+
+def test_the_owner_makes_someone_in_the_group_an_owner_too():
+    bench = Bench()
+    assert bench.say("现在黄金怎么看", sender=BUDDY, private=False)[0].body == OWNER_ONLY_TEXT
+    [reply] = _make_owner(bench)
+    assert "阿强 现在也是主人" in reply.body and "确认码" in reply.body
+    assert bench.saved == [("CO_OWNER_OPEN_IDS", BUDDY)] and bench.cfg.is_owner(BUDDY)
+    assert not bench.cfg.is_owner(FRIEND)
+
+    # From now on he is answered like the owner, with the account, in the group and in his private chat.
+    bench.say("我的仓位风险大吗", sender=BUDDY, private=False)
+    [call] = bench.analyst.named("answer")
+    assert call["in_group"] is True and "账户权益 10,000.00 USD" in call["account_text"]
+    [reply] = bench.say("仓位", sender=BUDDY, private=True, chat_id="oc_buddy_private")
+    assert "10,000.00 USD" in reply.body and reply.footer is None
+
+    # Others are still turned away.
+    assert bench.say("现在黄金怎么看", sender=FRIEND, private=False)[0].body == OWNER_ONLY_TEXT
+
+
+def test_the_list_of_owners_and_making_the_same_person_twice():
+    bench = Bench()
+    assert "只有你一位主人" in bench.say("主人", private=False)[0].body
+    _make_owner(bench)
+    assert "阿强 已经是主人了" in _make_owner(bench)[0].body
+    assert bench.saved == [("CO_OWNER_OPEN_IDS", BUDDY)]  # written once
+    [reply] = bench.say("主人", sender=BUDDY, private=False)
+    assert "还有 1 位主人：阿强" in reply.body
+
+
+def test_only_the_first_owner_makes_or_unmakes_owners():
+    bench = Bench()
+    _make_owner(bench)
+    [reply] = bench.say("设为主人", sender=BUDDY, private=False, mentions=(BOT, FRIEND), mentioned_names=("交易助手", "小李"))
+    assert "只有最早登记的那位主人能做" in reply.body and not bench.cfg.is_owner(FRIEND)
+    [reply] = bench.say("取消主人", sender=BUDDY, private=False, mentions=(BOT, BUDDY), mentioned_names=("交易助手", "阿强"))
+    assert "只有最早登记的那位主人能做" in reply.body and bench.cfg.is_owner(BUDDY)
+    # A stranger saying it is just turned away.
+    assert bench.say("设为主人", sender=FRIEND, private=False, mentions=(BOT, FRIEND))[0].body == OWNER_ONLY_TEXT
+    assert bench.saved == [("CO_OWNER_OPEN_IDS", BUDDY)]
+
+
+def test_making_an_owner_needs_someone_mentioned_and_has_a_limit():
+    bench = Bench()
+    assert "要在群里 @ 上那个人" in bench.say("设为主人", private=False)[0].body
+    # Mentioning the bot or himself does not count.
+    assert "要在群里 @ 上那个人" in bench.say("设为主人", private=False, mentions=(BOT, OWNER), message_id="om_self")[0].body
+    for number in range(3):
+        _make_owner(bench, who=f"ou_extra{number}", name=f"人{number}")
+    assert "最多再设 3 位主人" in _make_owner(bench)[0].body and not bench.cfg.is_owner(BUDDY)
+    assert len(bench.cfg.co_owner_open_ids) == 3
+
+
+def test_each_owner_confirms_only_his_own_order():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    _make_owner(bench)
+    preview = bench.say("做多 XAU 100张 止损 3860", sender=BUDDY, private=False)[0]
+    assert preview.title == "下单预览 · 模拟盘" and "确认 4821" in preview.body
+
+    # The first owner typing the code he can see in the group does not carry it out.
+    assert bench.say("确认 4821", private=False)[0].body == NOT_YOURS_TEXT
+    assert bench.say("4821")[0].body == NOT_YOURS_TEXT
+    assert bench.exchange.changes == []
+    # A stranger still gets the usual answer.
+    open_bench = Bench(exchange=FakeExchange(), **TRADING, group_owner_only=False, group_show_pnl=True)
+    _make_owner(open_bench)
+    open_bench.say("做多 XAU 100张", sender=BUDDY, private=False)
+    assert open_bench.say("确认 4821", sender=FRIEND, private=False)[0].body == TRADE_OWNER_ONLY_TEXT
+
+    done = bench.say("确认 4821", sender=BUDDY, private=False)[0]
+    assert done.title == "已执行 · 模拟盘" and [name for name, _ in bench.exchange.changes] == ["place_order"]
+
+
+def test_two_owners_can_each_have_a_preview_waiting():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    _make_owner(bench)
+    bench.say("做多 XAU 100张 止损 3860", private=False)
+    bench.say("做多 XAU 50张 止损 3850", sender=BUDDY, private=False)
+    # His "no" voids his own preview only.
+    assert bench.say("取消", sender=BUDDY, private=False)[0].body.startswith("已作废：市价做多")
+    # The code (always 4821 here) is now only the first owner's.
+    assert bench.say("确认 4821", sender=BUDDY, private=False)[0].body == NOT_YOURS_TEXT
+    assert bench.say("确认 4821", private=False)[0].title == "已执行 · 模拟盘"
+    assert len(bench.exchange.changes) == 1
+
+
+def test_unmaking_an_owner_voids_his_preview():
+    bench = Bench(exchange=FakeExchange(), **TRADING)
+    _make_owner(bench)
+    bench.say("做多 XAU 100张 止损 3860", sender=BUDDY, private=False)
+    [reply] = _make_owner(bench, words="取消主人")
+    assert "阿强 不再是主人了" in reply.body and "作废" in reply.body
+    assert bench.saved[-1] == ("CO_OWNER_OPEN_IDS", "") and not bench.cfg.is_owner(BUDDY)
+    assert bench.say("确认 4821", sender=BUDDY, private=False)[0].body == OWNER_ONLY_TEXT
+    assert bench.say("确认 4821", private=False)[0].body == "现在没有等待确认的指令。"
+    assert bench.exchange.changes == []
+    assert "本来就不是主人" in _make_owner(bench, words="取消主人")[0].body
+
+
+def test_a_saved_owner_list_is_read_back():
+    cfg = make_cfg(co_owner_open_ids=(BUDDY,))
+    assert cfg.is_owner(BUDDY) and cfg.is_owner(OWNER) and not cfg.is_owner(FRIEND) and not cfg.is_owner("")
+    bench = Bench(co_owner_open_ids=(BUDDY,))
+    bench.say("我的仓位风险大吗", sender=BUDDY, private=False)
+    assert bench.analyst.named("answer")
+    # Without the names kept in the journal, the list still shows who.
+    assert "ou_buddy" in bench.say("主人", private=False)[0].body
