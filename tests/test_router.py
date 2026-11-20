@@ -1428,21 +1428,21 @@ def test_a_typed_name_finds_the_person():
     _say(bench, "在吗", sender=BUDDY, private=False)
     _say(bench, "在吗", sender=OTHER, private=False)
     # His name became known when someone @-mentioned him in the group.
-    _say(bench, "你看下", private=False, mentions=(BOT, BUDDY), mentioned_names=("交易助手", "恶霸十七号"))
-    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
-    assert "恶霸十七号 现在也是主人" in plain(reply) and bench.cfg.is_owner(BUDDY) and not bench.cfg.is_owner(OTHER)
+    _say(bench, "你看下", private=False, mentions=(BOT, BUDDY), mentioned_names=("交易助手", "张小明"))
+    [reply] = _say(bench, "设置主人 张小明", private=False)
+    assert "张小明 现在也是主人" in plain(reply) and bench.cfg.is_owner(BUDDY) and not bench.cfg.is_owner(OTHER)
     # Part of the name is enough.
     bench.say("取消主人", private=False, message_id="om_remove_all")
     assert not bench.cfg.is_owner(BUDDY)
-    _say(bench, "把十七号设为主人", private=False)
+    _say(bench, "把小明设为主人", private=False)
     assert bench.cfg.is_owner(BUDDY)
 
 
 def test_a_name_the_bot_has_never_seen_is_not_guessed():
     bench = Bench()
     _say(bench, "在吗", sender=OTHER, private=False)  # someone else spoke to the bot; he did not
-    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
-    assert reply.body.startswith("没找到“恶霸十七号”。是哪一位？") and '1. <at user_id="ou_other">' in reply.body
+    [reply] = _say(bench, "设置主人 张小明", private=False)
+    assert reply.body.startswith("没找到“张小明”。是哪一位？") and '1. <at user_id="ou_other">' in reply.body
     assert not bench.saved and not bench.cfg.is_owner(OTHER)
     _say(bench, "设为主人 1", private=False)
     assert bench.cfg.is_owner(OTHER)
@@ -1450,7 +1450,7 @@ def test_a_name_the_bot_has_never_seen_is_not_guessed():
     bench = Bench()
     _say(bench, "在吗", sender=OTHER, private=False)
     _say(bench, "在吗", sender=BUDDY, private=False)
-    _say(bench, "设置主人 恶霸十七号", private=False)
+    _say(bench, "设置主人 张小明", private=False)
     bench.clock.advance(601)
     assert "是哪一位" in _say(bench, "设为主人 1", private=False)[0].body and not bench.saved
 
@@ -1474,17 +1474,17 @@ def test_with_several_people_the_bot_asks_which_one():
 
 def test_nobody_known_explains_both_ways():
     bench = Bench()
-    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
-    assert "我还不认识“恶霸十七号”" in reply.body and "设置主人 @恶霸十七号" in reply.body and not bench.saved
+    [reply] = _say(bench, "设置主人 张小明", private=False)
+    assert "我还不认识“张小明”" in reply.body and "设置主人 @张小明" in reply.body and not bench.saved
 
 
 def test_the_group_member_list_is_used_when_feishu_allows_it():
     bench = Bench()
-    bench.feishu.members = [(OWNER, "peng"), (BUDDY, "恶霸十七号"), (BOT, "交易助手")]
-    [reply] = _say(bench, "设置主人 恶霸十七号", private=False)
-    assert "恶霸十七号 现在也是主人" in plain(reply) and bench.cfg.is_owner(BUDDY)
+    bench.feishu.members = [(OWNER, "主人本人"), (BUDDY, "张小明"), (BOT, "交易助手")]
+    [reply] = _say(bench, "设置主人 张小明", private=False)
+    assert "张小明 现在也是主人" in plain(reply) and bench.cfg.is_owner(BUDDY)
     other = Bench()
-    other.feishu.members = [(OWNER, "peng"), (BUDDY, "恶霸十七号")]
+    other.feishu.members = [(OWNER, "主人本人"), (BUDDY, "张小明")]
     _say(other, "设置主人", private=False)
     assert other.cfg.is_owner(BUDDY)
 

@@ -134,7 +134,7 @@ _FILLER_CHARS = "把将让当也为给他她是的设加请吧啊呀呢"
 
 
 def _typed_name(text: str) -> str:
-    """The name in "设置主人 恶霸十七号" or "把阿强设成主人"; "" when only the command words are there."""
+    """The name in "设置主人 张小明" or "把阿强设成主人"; "" when only the command words are there."""
     rest = _FILLER_WORDS.sub(" ", _OPEN_ID.sub(" ", text))
     rest = re.sub(r"[\s\d，。,.!！?？~：:“”\"'、@()（）]+", " ", rest)
     parts = [part.strip(_FILLER_CHARS) for part in rest.split()]
@@ -430,7 +430,7 @@ class Router:
                 and (item.get("member") or float(item.get("last", 0) or 0) >= cutoff)
             ]  # fmt: skip
         if name:
-            # "设置主人 恶霸十七号": a name the bot has seen, written in full or in part.
+            # "设置主人 张小明": a name the bot has seen, written in full or in part.
             named = [
                 (open_id, known)
                 for open_id, known in names.items()

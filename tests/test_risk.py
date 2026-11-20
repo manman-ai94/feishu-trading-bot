@@ -574,7 +574,7 @@ def kinds(events, *wanted):
 
 def test_a_stop_in_front_of_liquidation_raises_no_risk_card():
     monitor, okx, events, clock, _, _ = watch(bracket(3873.0))
-    for mark in (3873.0, 3869.0, 3880.0, 3871.0):  # the night peng saw three identical warnings
+    for mark in (3873.0, 3869.0, 3880.0, 3871.0):  # the night the owner saw three identical warnings
         okx.state = make_state([bracket(mark)], total_eq=1850.0)
         clock.advance(1900)
         monitor.poll_once()
