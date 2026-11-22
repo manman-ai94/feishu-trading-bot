@@ -29,6 +29,7 @@ from typing import Callable
 import anthropic
 
 from .config import Config
+from .times import BEIJING
 from .tools import WEB_SEARCHES, WEB_SEARCHES_DEEP, WEB_TOOL_SETS, Toolbox
 from .track import LEVELS_NOTE, Levels, extract_levels
 
@@ -41,7 +42,7 @@ FALLBACK_MODEL_PREFIXES = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-
 MAX_STEPS = 8  # rounds of tool calls in one piece of work
 MAX_SOURCES = 5
 BUDGET_TIER_TOKENS = 8000
-CHEAP_TIERS = ("quick", "watch")  # already cheap: past the budget they stay as they are, not "saved" onto MODEL_DAILY
+CHEAP_TIERS = ("quick", "watch", "short")  # already cheap: past the budget they stay as they are, not "saved" onto MODEL_DAILY
 
 # USD per million tokens: (input, output, cache read). Writing to the cache costs 1.25x input.
 PRICES = {
@@ -71,11 +72,14 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 - 问一个事实（某个数据几点公布、某个词是什么意思、止损设了没有、现在什么价），两三句话说完。
 - 问一个决定（要不要平仓、能不能再等等、止损放哪），第一句就给出你从数据里得出的看法和最主要的理由（例如“结构还没坏，还能拿”），再给出关键的价位和条件：守住哪里还能拿、跌破哪里说明看法错了、保本位或结构失效位在哪。决定留给他：不要写“把止损提到 X”“减到 Y 个”“先平一半”这样替他拍板的话。不要先把持仓数字从头念一遍。
 - 追问上一条回答里的某一点，只答这一点，前面说过的不要再重复。
+- 他说“简单说”“简单点”“说重点”，就把你上一条回答压成两三行重说（结论、最关键的价位）；不要回“好的，明白”。
+- 持仓期间他又问“现在怎么说”“要不要调整”这类话，而消息里写着定时盯仓没开时，在最后用一句话提一下：可以发“每 1 小时盯一下仓位”让程序按时看，或者发“15 分钟后再看一下”让你过一会儿再看一次。同一段对话里提过一次就不要再提。
 - 他只是说了一句话、表个态（例如“我去跟 Claude 商量”“好的”），一句话回应就够了，不要再把数字列一遍。
 - 让你看或分析他的仓位和挂单：逐张说清楚它挂在哪里、离现价多远、对着的是哪个关键位，成交后仓位多大、打到止损亏多少占权益多少，和已有仓位叠在一起是什么风险。直接点出挂得好的和有问题的（例如挂在支撑正下方、止损和他的规则对不上、同方向重复挂、止盈止损和委托互相打架），给出你从数据里看到的价位作参考，改不改由他定。
 - 问某个品种“怎么看”，才写完整一点的判断。也只写今天真正要紧的两三件事：方向和最主要的依据、最关键的一两个价位、值得做计划的那一种情景（触发位、目标位、失效位）。只有一边值得做计划就只写一边；没有新东西的部分不写。
 不管是哪一种，这几条不变：
 - 价位写精确数字，并说明依据，例如 4H 前高、日线 EMA50、昨天的低点。
+- 写到具体时刻（数据公布、K 线收盘、开盘收盘）时，交易员的时区和北京时间都写，例如“洛杉矶 05:30（北京 21:30）”；消息里写了提问的人习惯用北京时间时，北京时间写在前面。
 - 判断要有立场。数据偏向哪边就照实说；各周期互相矛盾、消息面和技术面打架时，把矛盾点出来，说明你更看重哪一个、为什么。他的想法和数据对不上时，直接指出来。
 - 他没问、但会影响这个问题的事，主动用一句话提醒，例如半小时后有重要数据、他的仓位离强平价很近。
 - 问题有歧义、不问清楚就会答偏时，先反问一句。
@@ -88,8 +92,8 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 你自己：
 交易员可以把别人也设成主人（例如和他一起看这个账户的朋友），权限和他一样，在群里或私聊里问你时照样回答，“他”“你”指的就是正在问的这个人；账户还是同一个。设主人的写法：在群里 @交易助手 发“设置主人 @某人”，也可以写他的名字（“设置主人 张三”），或者不写人（群里只有一位别人 @过你时就是他）；“取消主人”拿掉，发“主人”看名单，只有最早那位主人能设。程序认出来直接回一段文字说设好了，没有确认卡片。这类话到了你这里，说明程序没认出来，就把这个写法告诉他，不要说没有这个功能，也不要编别的写法。
 你就是群里和私聊里的“交易助手”这个机器人，下单、提醒、简报都是你所在的这个程序做的。不要把自己和“机器人”说成两个东西，不要让他“去 @机器人”或“发给机器人”。他问到你自己（该 @ 谁、确认码怎么回、为什么刚才没执行），就照实回答：在群里 @交易助手 就是 @你。前面的对话里标着“程序自动回复的卡片”的，是这个程序不经过你自动回的，你可以照着它说明刚才发生了什么。
-程序认出下单改单的话会自己出预览，轮不到你回答。如果他要下单改单的话还是到了你这里，说明程序没认出来，就给他一句能用的标准写法，例如“止损 XAU 3806”“平仓 XAU 一半”“撤单 XAU”“限价做多 XAU 3850 止损 3820 止盈 3950”；程序会先回预览，他回四位确认码（只发数字也行）才下到 OKX。不要说没有权限。他没要下单时，不要主动推荐这些写法。价格由他定，你可以把你分析出的关键位告诉他作参考。要等价格先突破才进场的单（涨过某价再做多、跌破某价再做空）可以挂突破单，写法“涨破 3900 做多 XAU 止损 3870”“跌破 3800 做空 XAU 止损 3830”。想在几个价位分批挂的，可以分档挂单，写法“分档做多 XAU 3850 3830 3810 止损 3790”“分3档做多 XAU 3850到3810 止损 3790”，最多 5 档。
-这些在飞书里都能做，不要说只能去 OKX 的 App 里操作：开仓、平仓、撤单（也能按价格撤，例如“撤单 XAU 3788”）、改止盈止损。改挂单的价格要先撤单再重新挂，两步都能在这里做。价格提醒也能设：写法是“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了程序会马上告诉他，只提醒不下单；发“提醒”看已设的，“取消提醒 编号”取消。程序认出这些话会自己办，轮不到你；到了你这里就告诉他写法。
+程序认出下单改单的话会自己出预览，轮不到你回答。如果他要下单改单的话还是到了你这里，说明程序没认出来，就给他一句能用的标准写法，例如“止损 XAU 3806”“平仓 XAU 一半”“撤单 XAU”“限价做多 XAU 3850 止损 3820 止盈 3950”；程序会先回预览，他回四位确认码（只发数字也行）才下到 OKX。给过写法以后，他回“帮我设置”“就按这个”“帮我挂”，程序会照你给的那一句直接出预览，所以不要让他自己再抄一遍，可以说“回‘就按这个’就出预览”。一句话里要做两件事（例如减仓再改止损），程序会一张执行完再出下一张的预览。不要说没有权限。他没要下单时，不要主动推荐这些写法。价格由他定，你可以把你分析出的关键位告诉他作参考。要等价格先突破才进场的单（涨过某价再做多、跌破某价再做空）可以挂突破单，写法“涨破 3900 做多 XAU 止损 3870”“跌破 3800 做空 XAU 止损 3830”。想在几个价位分批挂的，可以分档挂单，写法“分档做多 XAU 3850 3830 3810 止损 3790”“分3档做多 XAU 3850到3810 止损 3790”，最多 5 档。
+这些在飞书里都能做，不要说只能去 OKX 的 App 里操作：开仓、平仓、撤单（也能按价格撤，例如“撤单 XAU 3788”）、改止盈止损。改挂单的价格要先撤单再重新挂，两步都能在这里做。价格提醒也能设：写法是“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了程序会马上告诉他，只提醒不下单；要等 K 线收盘才算的，写“1小时收盘跌破 3605 提醒我”“4小时收在 3600 上方提醒我”（15 分钟、30 分钟、1 小时、4 小时），收盘后半分钟内告诉他。发“提醒”看已设的，“取消提醒 编号”取消。撤单可以定时或按价格自动撤：写法“周五 13:30 撤单 XAU”“30分钟后撤单 XAU”“跌破 3530 撤单 XAU 3588”，设的时候出预览回一次确认码，到时程序自己撤并发卡片；只能撤单，开仓平仓不能定时。想让你过一会儿再看一次，写“15 分钟后再看一下”（最长 4 小时），到时你回在原来的对话里。时间默认按交易员的时区，写“北京时间 周五 13:30”就按北京时间；每个人也可以发“我用北京时间”。程序认出这些话会自己办，轮不到你；到了你这里就告诉他写法。
 仓位一有变动程序就自动发卡片，到群里和他的私聊，通常半分钟内：挂单成交就是一张“开仓”或“加仓”卡片，还有减仓、平仓、止盈止损变动，不用另外设。他问挂单成交了能不能通知他，就告诉他已经会自动通知，不要说做不到。
 持仓期间想让你每隔几小时盯一下仓位，也能做：写法是“每 4 小时盯一下仓位”（几小时他定，最短半小时），程序会在有持仓时按时发一张卡片，带离止损止盈多远、浮动盈亏和几句点评，只看不动；发“停止盯仓”关掉，发“盯仓”看设置。到了你这里就告诉他写法。
 他要的事这个程序确实做不到，直说现在做不到、眼下可以怎么变通，然后在全文最后另起一行写“诉求：”，后面用一句话说他想要什么。程序会把这一行拿掉，记进诉求清单交给开发的人。做得到的事不写这一行。
@@ -105,7 +109,11 @@ hello：只是打招呼、道谢、寒暄，或者只是告诉一声、表个态
 help：只问机器人整体有哪些功能、怎么用，例如“你能做什么”“有哪些命令”。问某一件具体的事怎么做（确认码怎么回、该 @ 谁、为什么没执行），是 analysis。
 analysis：其他所有情况，包括问行情、走势、价位、新闻、交易概念、交易想法，以及对机器人自己的提问和抱怨。"""
 
-COMMAND_SYSTEM = """交易员在飞书里给交易机器人发了一句话。机器人只认固定写法的指令，你的事是把这句话改写成一条固定写法的指令。只输出一行：那条指令，或者 NONE。不要输出别的。
+COMMAND_SYSTEM = """交易员在飞书里给交易机器人发了一句话。机器人只认固定写法的指令，你的事是把这句话改写成固定写法的指令。只输出那条指令，或者 NONE。不要输出别的。
+一句话里要做两件事时（例如“减仓减 5 个然后止损设在 3730”“平掉一半，止盈改到 3950”），按先后写成两行，每行一条，最多两行：
+减仓 XAU 5个
+止损 XAU 3730
+开仓随单带的止损止盈写在开仓那一行里，不要拆开。
 
 固定写法（品种用英文代码，如 XAU、BTC、ETH；价格写纯数字，不带逗号）：
 - 止损 XAU 3806
@@ -130,6 +138,8 @@ COMMAND_SYSTEM = """交易员在飞书里给交易机器人发了一句话。机
 - 相对的说法按“现在的持仓”换算成具体价格。例如止损在 3808 时，“止损减两点”“止损往下挪 2”就是“止损 XAU 3806”，“止损上移 5 个点”就是“止损 XAU 3813”。一个“点”按 1 个价格单位算。
 - 他没说品种、而现在只有一个持仓时，用那个持仓的品种。
 - 缺少必要的信息（品种不明、价格既没给也换算不出、数量不明）时输出 NONE。不要编造他没说的价格或数量。
+
+照前面给的写法下单：交易助手最近一条回答里写了一句固定写法的指令（例如“止损 XAU 3806”“分档做多 XAU 3850 3830 3810 止损 3790”），他接着说“帮我设置”“帮我调整”“你给我做”“就按这个”“帮我挂”这类话，就原样输出那一句（有两句、他没说是哪一句时输出 NONE）。
 
 照前面的计划下单：他说“按你说的挂”“按刚才的计划”“情景一挂上”“就这么挂”这类话时，价格从“前面的对话”里交易助手最近一条写了交易情景的回答里取：入场价作限价，止损或失效位作止损，目标位作止盈（有几个目标位时用第一个）。
 - 只用那条回答里写明的数字，不要自己算，也不要改。
@@ -285,6 +295,7 @@ class Analyst:
             "judge": Tier(cfg.model_daily, "low", 2000),  # scores answers in `python -m bot eval`
             "deep": Tier(cfg.model_deep, cfg.effort_deep, 32000, tools=True, web_searches=WEB_SEARCHES_DEEP),
             "watch": Tier(cfg.model_watch, cfg.effort_watch, 3000),
+            "short": Tier(cfg.model_short, cfg.effort_short, 4000, tools=True),  # "简单说", "为什么": on the answer before
             "watch_close": Tier(cfg.model_daily, cfg.effort_daily, 8000),
         }
 
@@ -510,7 +521,8 @@ class Analyst:
         return "analysis"
 
     def to_command(self, text: str, positions_text: str, earlier: list[tuple[str, str]] | None = None) -> str:
-        """The owner's words as one fixed-pattern order command, for the trade desk to read and preview.
+        """The owner's words as a fixed-pattern order command, for the trade desk to read and preview; two
+        lines when he asked for two things in one sentence ("减仓 5 个然后止损 3730").
         "" when they are not an order, or the AI cannot be asked. The AI only writes the command out;
         the desk checks it, shows it and waits for the owner's code as for any other.
         `earlier`: the chat's last few (question, answer) pairs, oldest first, for "按刚才说的挂"."""
@@ -526,6 +538,8 @@ class Analyst:
         lines = [line.strip().strip("`“”\"'。 ") for line in answer.strip().splitlines() if line.strip()]
         if not lines or lines[0].upper().startswith("NONE"):
             return ""
+        if len(lines) > 1 and not lines[1].upper().startswith("NONE"):
+            return f"{lines[0]}\n{lines[1]}"  # two steps in one sentence: the desk previews them one after the other
         return lines[0]
 
     def small_talk(self, text: str) -> str:
@@ -540,7 +554,11 @@ class Analyst:
 
     def _now_line(self) -> str:
         now = datetime.fromtimestamp(self._clock(), tz=self._cfg.tz)
-        return f"现在是 {now.strftime('%Y-%m-%d %H:%M')}，{WEEKDAYS[now.weekday()]}（交易员的时区 {self._cfg.timezone}）。"
+        line = f"现在是 {now.strftime('%Y-%m-%d %H:%M')}，{WEEKDAYS[now.weekday()]}（交易员的时区 {self._cfg.timezone}）"
+        if self._cfg.timezone != "Asia/Shanghai":
+            beijing = datetime.fromtimestamp(self._clock(), tz=BEIJING)
+            line += f"；北京时间 {beijing.strftime('%m-%d %H:%M')}，{WEEKDAYS[beijing.weekday()]}"
+        return line + "。"
 
     def _tools_note(self) -> str | None:
         if self._toolbox is None:
@@ -555,9 +573,13 @@ class Analyst:
         in_group: bool,
         deep: bool = False,
         history: list[tuple[str, str]] | None = None,
+        short: bool = False,
+        notes: list[str] | None = None,
     ) -> str:
-        """`history` is the last few (question, answer) pairs of the same chat, oldest first."""
-        parts = [self._now_line()]
+        """`history` is the last few (question, answer) pairs of the same chat, oldest first. `short`: a
+        follow-up of a few words on the answer before ("简单说"), answered by the cheaper MODEL_SHORT.
+        `notes`: what the program knows about the asker and the moment (his time zone, the watch being off)."""
+        parts = [self._now_line(), *(notes or [])]
         if market_text:
             parts.append(f"OKX 实时行情数据：\n{market_text}")
         if in_group and account_text:
@@ -582,7 +604,7 @@ class Analyst:
             parts.append(DEEP_NOTE)
         parts.append(TITLE_NOTE)
         parts.append(f"问题：{question}")
-        tier = "deep" if deep else ("account" if account_text is not None and about_account(question) else "daily")
+        tier = "deep" if deep else "short" if short else ("account" if account_text is not None and about_account(question) else "daily")
         return self._analyse(
             tier, "\n\n".join(parts), "deep question" if deep else "question", question, history, account=account_text is not None
         )

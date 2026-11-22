@@ -1502,3 +1502,85 @@ def test_the_tags_stay_out_of_the_chat_history():
     _make_owner(bench)
     [(question, answer)] = bench.journal.recent_dialog(GROUP, 0, 5)
     assert "<at" not in answer and "阿强 现在也是主人" in answer
+
+
+# ------------------------------------------- times, a second look, short follow-ups, "帮我设置"
+
+
+def test_the_time_is_told_by_the_program_in_both_zones():
+    bench = Bench()
+    [reply] = bench.say("现在几点")
+    assert reply.body == "现在是 洛杉矶 01-15 00:00 周五｜北京 01-15 16:00 周五。"
+    assert bench.say("北京时间几点了？")[0].body.startswith("现在是 北京 01-15 16:00 周五｜洛杉矶")
+    bench.clock.advance(15 * 60)
+    assert bench.say("1小时K线几点收盘")[0].body == "这根 1 小时 K 线 01:00（北京 17:00）收盘，还有 45 分钟。"
+    assert "还有 3 小时 45 分钟" in bench.say("4h收盘还有多久")[0].body
+    assert bench.analyst.named("answer") == [] and bench.analyst.named("route") == []
+
+
+def test_each_owner_may_read_beijing_time_first():
+    bench = Bench()
+    assert "以后跟你说时间先写北京时间" in bench.say("我用北京时间")[0].body
+    assert bench.say("现在几点")[0].body.startswith("现在是 北京")
+    bench.say("黄金今晚怎么看")
+    assert "提问的人习惯用北京时间，写时刻时北京时间写在前面。" in bench.analyst.named("answer")[-1]["notes"]
+
+
+def test_a_second_look_is_kept_and_answered_where_it_was_asked():
+    bench = Bench()
+    [reply] = bench.say("现在能进场吗，15分钟后给我答复", message_id="om_ask")
+    assert reply.body.startswith("好，到 00:15（北京 16:15），我再看一次，结果回在这里。") and "取消提醒 1" in reply.body
+    assert bench.analyst.named("answer") == []
+    [job] = bench.journal.alerts()
+    assert (job["direction"], job["price"], job["action"], job["said"]) == ("at", 1_800_000_900.0, "recheck", "现在能进场吗")
+    bench.router.recheck(job)
+    [call] = bench.analyst.named("answer")
+    assert call["question"] == "（15 分钟前他让你过一会儿再看一次，现在到时间了）现在能进场吗"
+    assert bench.feishu.sent[-1].target == "om_ask"
+    assert "最长 4 小时" in bench.say("300分钟后再看")[0].body
+    bench.say("过半小时再看一下")
+    assert bench.journal.alerts()[-1]["said"] == "再看一次行情和仓位"
+
+
+def test_a_few_words_on_the_answer_before_go_to_the_cheaper_model():
+    bench = Bench()
+    bench.say("简单说", message_id="om_short_1")  # nothing before it: an ordinary question
+    bench.say("黄金今晚怎么看")
+    bench.say("简单说", message_id="om_short_2")
+    bench.say("为什么？")
+    bench.say("那白银呢")
+    assert [call["short"] for call in bench.analyst.named("answer")] == [False, False, True, True, False]
+
+
+def test_the_ai_is_told_when_the_watch_is_off_while_something_is_held():
+    bench = Bench()
+    bench.say("现在怎么说")
+    assert "定时盯仓现在没开。" in bench.analyst.named("answer")[-1]["notes"]
+    bench.journal.set_setting(WATCH_SETTING, '{"hours": 1, "chat": "oc_private", "since": 0}')
+    bench.say("现在怎么说呢")
+    assert "定时盯仓现在没开。" not in bench.analyst.named("answer")[-1]["notes"]
+
+
+def test_help_me_set_it_turns_the_line_just_given_into_a_preview():
+    from bot.models import StopOrder
+
+    from .test_trading import gold
+
+    bench = Bench(exchange=FakeExchange([gold(stops=(StopOrder("a1", 3808.0, 3938.0),))]), **TRADING)
+    bench.analyst.command = "止损 XAU 3806"
+    for words in ("帮我设置一下", "你帮我调整吧", "就按这个"):
+        [preview] = bench.say(words)
+        assert preview.title == "下单预览 · 模拟盘" and "理解为：**止损 XAU 3806**" in preview.body, words
+    bench.analyst.command = ""
+    bench.say("你帮我分析一下")  # asks for a view: not an order
+    assert len(bench.analyst.named("to_command")) == 3
+
+
+def test_the_flat_card_shows_the_last_close():
+    from .test_closes import closed_row
+
+    bench = Bench(state=make_state([]))
+    bench.okx.closed = [closed_row(1_799_990_000.0, realized="130.70", direction="short", openAvgPx="3588", closeAvgPx="3546")]
+    [reply] = bench.say("仓位")
+    assert "当前没有持仓。" in reply.body and "**最近一笔平仓**：" in reply.body and "XAU 空单 10,000 张" in reply.body
+    assert "已实现盈亏 +130.70 USDT" in reply.body

@@ -122,6 +122,8 @@ class Config:
     effort_deep: str = "xhigh"
     model_watch: str = "claude-sonnet-5-5"  # the routine comment on a timed position check ("每 4 小时盯一下仓位")
     effort_watch: str = "low"
+    model_short: str = "claude-sonnet-5-5"  # a follow-up of a few words ("简单说", "为什么") on the answer before
+    effort_short: str = "low"
     web_search: bool = True  # the AI may search the web for news and economic data
     ai_monthly_budget_usd: float | None = 180.0  # above this the AI switches to its cheapest setting
     knowledge_dir: Path = Path("knowledge")
@@ -398,6 +400,8 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         effort_deep=_effort("EFFORT_DEEP", "xhigh"),
         model_watch=_get("MODEL_WATCH", "claude-sonnet-5-5"),
         effort_watch=_effort("EFFORT_WATCH", "low"),
+        model_short=_get("MODEL_SHORT", "claude-sonnet-5-5"),
+        effort_short=_effort("EFFORT_SHORT", "low"),
         web_search=_get_bool("WEB_SEARCH", True),
         ai_monthly_budget_usd=_get_float("AI_MONTHLY_BUDGET_USD", 180.0, problems),
         knowledge_dir=Path(_get("KNOWLEDGE_DIR", "knowledge")),

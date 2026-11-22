@@ -98,7 +98,7 @@ def selfcheck(cfg: Config, problems: list[str]) -> int:
         analyst.ping()
         _print("[OK]", f"Claude 接口可用（{cfg.model_quick}）")
         _print("[OK]", f"平时用 {cfg.model_daily} 的 {cfg.effort_daily} 档，“深度”用 {cfg.model_deep} 的 {cfg.effort_deep} 档，"
-               f"定时盯仓的例行点评用 {cfg.model_watch} 的 {cfg.effort_watch} 档")
+               f"定时盯仓的例行点评用 {cfg.model_watch} 的 {cfg.effort_watch} 档，几个字的追问用 {cfg.model_short} 的 {cfg.effort_short} 档")
         try:
             analyst.check_web_search()
             _print("[OK]", "联网搜索可用，AI 能查新闻和经济数据")

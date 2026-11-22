@@ -236,10 +236,10 @@ class FakeAnalyst:
         self.calls.append(("route", {"text": text}))
         return self.intent
 
-    def answer(self, question, market_text, account_text, in_group, deep=False, history=None):
+    def answer(self, question, market_text, account_text, in_group, deep=False, history=None, short=False, notes=None):
         text = self._record(
             "answer", question=question, market_text=market_text, account_text=account_text, in_group=in_group,
-            deep=deep, history=list(history or []),
+            deep=deep, history=list(history or []), short=short, notes=list(notes or []),
         )  # fmt: skip
         return text if self.reply is None else self.reply
 

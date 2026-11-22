@@ -11,7 +11,7 @@ from typing import Callable
 from . import __version__
 from .analyst import Analyst, AnalystUnavailable
 from .book import book_text, read_book
-from .closes import history_text, read_closed, read_triggers
+from .closes import close_lines, history_text, read_closed, read_triggers
 from .config import Config
 from .feishu_client import FeishuClient
 from .journal import Journal
@@ -24,9 +24,12 @@ from .reports import DISCLAIMER, account_text, equity_text, event_markdown, jour
 from .review import week_text
 from .risk import AccountRisk, weekend_lines
 from .track import scorecard_markdown
+from .times import both
 from .upkeep import downtime_text
+from .watch import SETTING as WATCH_SETTING
 
 log = logging.getLogger(__name__)
+WATCH_HINT = "想让我持仓期间按时盯着，发“每 1 小时盯一下仓位”；只想过一会儿再看一次，发“15 分钟后再看一下”。"
 
 EVENT_COLOURS = {
     "near_stop": "orange",
@@ -218,12 +221,28 @@ class Reporter:
             return f"这次没读到 OKX 的平仓记录：{exc}"
         return history_text(closed, triggers, self._cfg.tz, self._clock() - days * 86400)
 
+    def last_close_lines(self) -> list[str]:
+        """The latest close, for the status card while nothing is held: "刚平仓赚了多少" answered on the card."""
+        try:
+            closed, triggers = read_closed(self._okx), read_triggers(self._okx)
+        except (OkxError, OkxNetworkError, AttributeError) as exc:
+            log.info("no close history for the status card: %s", exc)
+            return []
+        if not closed:
+            return []
+        last = closed[-1]
+        side = "多" if last.direction == "long" else "空"
+        size = f" {last.closed_size:,.10g} 张" if last.closed_size else ""
+        head = f"**最近一笔平仓**：{both(last.closed_at, self._cfg.tz)} {last.inst_id.split('-')[0]} {side}单{size}"
+        return [head, *(f"- {line}" for line in close_lines(last, triggers))]
+
     # ----------------------------------------------------------------- events
 
     def notify_event(self, event: Event) -> None:
         template = "red" if event.warning else EVENT_COLOURS.get(event.kind, "blue")
+        hint = self._watch_hint(event)
         try:
-            self.to_owner(event.title, event_markdown(event, private=True), template)
+            self.to_owner(event.title, event_markdown(event, private=True) + hint, template)
         except Exception:  # still tell the group if the private chat fails
             log.exception("could not send event %s to the owner", event.kind)
         # Position changes always go to the group. Risk warnings go there too
@@ -231,11 +250,23 @@ class Reporter:
         shared = self.group_shares_account
         if self._cfg.group_chat_id and (event.to_group or (shared and event.kind in RISK_KINDS)):
             body = event_markdown(event, private=shared)
-            self.to_group(event.title, body or "（无更多信息）", template, footer=DISCLAIMER)
+            self.to_group(event.title, (body or "（无更多信息）") + hint, template, footer=DISCLAIMER)
         if event.kind in ("closed", "reduced") and self.breaker_alert is not None:
             self._tell_breaker()
         if event.kind == "closed" and self.reviewer is not None:
             self.reviewer.on_close(event.inst_id)
+
+    def _watch_hint(self, event: Event) -> str:
+        """Under an open or an addition, while the timed position watch is off: how to have the position
+        watched, so that "现在怎么说" need not be asked again and again."""
+        if event.kind not in ("opened", "increased"):
+            return ""
+        try:
+            if self._journal.get_setting(WATCH_SETTING, ""):
+                return ""
+        except Exception:
+            return ""
+        return f"\n\n{WATCH_HINT}"
 
     def send_review(self, title: str, markdown: str) -> None:
         """A closed position's review: to the owner, and to the group when the owner shares the account there."""

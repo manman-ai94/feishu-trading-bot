@@ -13,7 +13,7 @@ from bot.okx_client import OkxNetworkError
 PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING", "TRACK_", "HEARTBEAT_", "BACKUP_")
 NAMES = (
     "OWNER_OPEN_ID", "CO_OWNER_OPEN_IDS", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
-    "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR",
+    "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR", "MODEL_SHORT", "EFFORT_SHORT",
 )  # fmt: skip
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -48,6 +48,7 @@ def test_empty_configuration_lists_what_is_missing():
     assert (cfg.model_quick, cfg.model_daily, cfg.model_deep) == ("claude-haiku-5-5", "claude-opus-5-5", "claude-opus-5-5")
     assert (cfg.effort_daily, cfg.effort_account, cfg.effort_deep) == ("medium", "high", "xhigh")
     assert (cfg.model_watch, cfg.effort_watch) == ("claude-sonnet-5-5", "low")
+    assert (cfg.model_short, cfg.effort_short) == ("claude-sonnet-5-5", "low")
     assert cfg.close_review is True
     assert cfg.web_search and cfg.ai_monthly_budget_usd == 180.0 and cfg.knowledge_dir == Path("knowledge")
     assert (cfg.brief_morning, cfg.brief_evening, cfg.weekly_review) == (time(6, 0), time(14, 0), (6, time(17, 0)))
@@ -83,6 +84,10 @@ def test_ai_settings_can_be_changed(tmp_path):
     cfg, problems = load_config(write_env(tmp_path, "MODEL_WATCH=claude-haiku-5-5\nEFFORT_WATCH=fast\n"))
     assert cfg.model_watch == "claude-haiku-5-5" and cfg.effort_watch == "low"
     assert any("EFFORT_WATCH" in item for item in problems)
+
+    cfg, problems = load_config(write_env(tmp_path, "MODEL_SHORT=claude-opus-5-5\nEFFORT_SHORT=medium\n"))
+    assert (cfg.model_short, cfg.effort_short) == ("claude-opus-5-5", "medium")
+    assert not any("EFFORT_SHORT" in item for item in problems)
 
 
 def test_mistakes_in_the_ai_settings_are_explained(tmp_path):

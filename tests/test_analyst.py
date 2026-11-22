@@ -642,3 +642,48 @@ def test_the_instructions_know_about_fill_notices_and_other_owners():
     # Wish of 2026-11-18: the AI said it could not announce a filled limit order, which the program already does.
     assert "挂单成交就是一张“开仓”或“加仓”卡片" in ANALYST_SYSTEM and "不要说做不到" in ANALYST_SYSTEM
     assert "设成主人" in ANALYST_SYSTEM and "设置主人 @某人" in ANALYST_SYSTEM and "没有确认卡片" in ANALYST_SYSTEM
+
+
+# ------------------------------------------------------------------ v0.18.0
+
+
+def test_a_few_words_on_the_answer_before_use_the_cheaper_model():
+    bot, client, _, _ = tooled([reply([text_block("结论：还能拿，守 3,605。")])])
+    bot.answer("简单说", "", None, in_group=False, history=[("怎么看", "很长的回答")], short=True)
+    [call] = client.messages.calls
+    assert call["model"] == "claude-sonnet-5-5" and call["output_config"] == {"effort": "low"} and call["max_tokens"] == 4000
+    deep, deep_client, _, _ = tooled([reply([text_block("好")])])
+    deep.answer("简单说", "", None, in_group=False, deep=True, short=True)  # "深度" wins
+    assert deep_client.messages.calls[0]["output_config"] == {"effort": "xhigh"}
+
+
+def test_past_the_budget_a_short_follow_up_stays_on_its_cheap_model():
+    bot, client, _, _ = tooled([reply([text_block("短")])], spend=999.0)
+    bot.answer("为什么", "", None, in_group=False, short=True)
+    assert client.messages.calls[0]["model"] == "claude-sonnet-5-5"
+
+
+def test_the_prompt_has_beijing_time_and_the_programs_notes():
+    bot, client, _, _ = tooled([reply([text_block("好")])])
+    bot.answer("几点公布", "", None, in_group=False, notes=["提问的人习惯用北京时间，写时刻时北京时间写在前面。"])
+    prompt = client.messages.calls[0]["messages"][-1]["content"]
+    assert "（交易员的时区 America/Los_Angeles）；北京时间 01-15 16:00，星期五。" in prompt
+    assert "\n\n提问的人习惯用北京时间" in prompt
+    assert "北京时间都写" in ANALYST_SYSTEM and "简单说" in ANALYST_SYSTEM and "定时盯仓没开" in ANALYST_SYSTEM
+
+
+def test_the_ai_knows_the_new_wordings():
+    for words in ("1小时收盘跌破 3605 提醒我", "周五 13:30 撤单 XAU", "跌破 3530 撤单 XAU 3588", "15 分钟后再看一下", "我用北京时间", "就按这个"):
+        assert words in ANALYST_SYSTEM, words
+
+
+def test_two_steps_in_one_sentence_come_back_as_two_lines():
+    from bot.analyst import COMMAND_SYSTEM
+
+    def fake_ask(self, tier, system, user, purpose=""):
+        return "减仓 XAU 5个\n止损 XAU 3730\n多余的一行"
+
+    bot = Analyst.__new__(Analyst)
+    bot._ask = fake_ask.__get__(bot)
+    assert bot.to_command("减仓减5 xau 然后止损设在3730", "（持仓）") == "减仓 XAU 5个\n止损 XAU 3730"
+    assert "按先后写成两行" in COMMAND_SYSTEM and "帮我设置" in COMMAND_SYSTEM

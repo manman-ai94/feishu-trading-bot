@@ -18,7 +18,8 @@ from bot.models import (
     Ticker,
 )
 from bot.okx_client import OkxError, OkxNetworkError
-from bot.trading import PAUSED_SETTING, Command, CommandParser, TradeDesk, new_confirmation_code
+from bot.times import set_zone
+from bot.trading import PAUSED_SETTING, Command, CommandParser, Reply, TradeDesk, new_confirmation_code
 
 from .helpers import Clock, make_cfg, make_position
 
@@ -353,6 +354,13 @@ def parser(instruments=(XAU, BTC)) -> CommandParser:
 )
 def test_commands_are_read_exactly(text, expected):
     assert parser().parse(text) == expected
+
+
+def test_a_command_sent_with_the_quotes_it_was_copied_with_is_read_the_same():
+    read = parser()
+    plain = read.parse("止损 XAU 3806")
+    for quoted in ("“止损 XAU 3806”", '"止损 XAU 3806"', "「止损 XAU 3806」", "‘止损 XAU 3806’"):
+        assert read.parse(quoted) == plain, quoted
 
 
 @pytest.mark.parametrize(
@@ -1012,10 +1020,10 @@ def test_closing_everything_leaves_other_instruments_alone():
 
 def test_closing_what_is_not_there_or_not_allowed():
     bench = Bench(FakeExchange([small(inst_id="ETH-USDT-SWAP")]))
-    assert "没有找到" in bench.say("平仓 XAU").text
+    assert "现在没有 XAU-USDT-SWAP 的仓位，没有可以平的" in bench.say("平仓 XAU").text
     assert "我不动它的仓位" in bench.say("平仓 ETH").text
     assert "现在没有可以平的仓位" in bench.say("全部平仓").text
-    assert "没有找到" in bench.say("平仓").text
+    assert "现在没有仓位，没有可以平的" in bench.say("平仓").text  # no instrument named: no gap where it would be
     assert bench.sent == []
 
 
@@ -1351,7 +1359,7 @@ def test_a_stop_that_would_trigger_at_once_is_refused():
     bench = Bench(FakeExchange([gold()]))
     assert "多单的止损要低于现价 3,880.0，你写的是 3,890.0" in bench.say("止损 XAU 3890").text
     assert "多单的止盈要高于现价" in bench.say("止盈 XAU 3870").text
-    assert "没有找到" in Bench().say("止损 XAU 3860").text
+    assert "现在没有 XAU-USDT-SWAP 的仓位" in Bench().say("止损 XAU 3860").text
     assert bench.sent == []
 
 
@@ -1611,6 +1619,179 @@ def test_a_stated_size_over_the_total_risk_is_refused_with_what_still_fits():
     refusal = bench.say("限价做多 BTC 0.2个 64000 止损 63000").text
     assert "加上这张会超过你定的账户总风险 25%（TRADE_MAX_TOTAL_RISK_PCT）。按这个止损最多还能开 10 张（合 0.1 BTC）" in refusal
     assert bench.sent == []
+
+
+def test_an_open_alone_over_the_total_risk_is_measured_by_itself_not_by_a_zero():
+    bench = Bench(**roomy(trade_max_total_risk_pct=25.0))
+    refusal = bench.say("做多 XAU 15个 止损 3830").text  # 750 USDT at the stop, nothing else at risk
+    assert "这张单打到止损要亏约 750.00 USDT，占权益 37.5%，超过了你定的账户总风险 25%（约 500.00 USDT" in refusal
+    assert "要亏约 0.00" not in refusal and "按这个止损最多还能开 10000 张（合 10 XAU）。可以少开一点" in refusal
+
+
+# ------------------------------------------------------------------ a refused open, mended in a word
+
+
+def test_a_stop_sent_after_an_open_refused_for_lacking_one_completes_that_open():
+    bench = Bench(**roomy(trade_max_risk_pct=25.0))
+    refusal = bench.say("做多 XAU 1个").text
+    assert "开仓必须带止损" in refusal and "补一句“止损 价格”（可以连止盈一起写），我就按这张单出预览" in refusal
+    preview = bench.say("止损 3830 止盈 3950").text
+    assert preview.startswith("接着刚才被拦下的那张开仓单，加上止损 3830、止盈 3950：")
+    assert "数量 1000 张" in preview and "确认 1111" in preview
+    assert bench.say("确认 1111").title.startswith("已执行")
+    order = bench.exchange.named("place_order")[0]
+    assert (order["sz"], order["sl_trigger_px"], order["tp_trigger_px"]) == ("1000", "3830", "3950")
+
+
+def test_a_refused_open_is_mended_only_while_fresh_and_never_instead_of_a_held_position():
+    bench = Bench(**roomy(trade_max_risk_pct=25.0))
+    bench.say("做多 XAU 1个")
+    bench.clock.advance(11 * 60)
+    assert bench.say("止损 3830").text.startswith("现在没有仓位，没有可以设止盈止损的")  # too late: a stop, as ever
+    held = Bench(FakeExchange([small()]), **roomy(trade_max_risk_pct=25.0))
+    assert "开仓必须带止损" in held.say("做多 XAU 1个").text
+    preview = held.say("止损 3830").text  # there is a position: the stop is for it
+    assert "接着刚才" not in preview and "确认 1111" in preview
+    other = Bench(**roomy(trade_max_risk_pct=25.0))
+    other.say("做多 XAU 1个")
+    other.say("做空 XAU 1个 止损 3990")  # a new open lets the refused one go, whatever comes of it
+    other.say("取消")
+    assert "接着刚才" not in other.say("止损 3830").text
+
+
+def test_at_the_cap_reopens_an_open_refused_for_a_limit_with_what_fits():
+    exchange = FakeExchange([gold(stops=(StopOrder("w1", 3840.8, None),))])
+    bench = Bench(exchange, **roomy(trade_max_total_risk_pct=25.0))
+    refusal = bench.say("限价做多 BTC 0.2个 64000 止损 63000").text
+    assert refusal.endswith("回“按上限”，我就按 10 张重新出预览。10 分钟内有效。")
+    preview = bench.say("就按上限开吧").text
+    assert preview.startswith("按上限把数量改成 10 张，重新出预览：") and "确认 1111" in preview
+    assert bench.say("按上限") is None  # used once; now it is just words, for the rest of the bot
+    big = Bench(**roomy(trade_max_order_usd=5000.0))
+    assert "回“按上限”，我就按 1288 张" in big.say("做多 XAU 2个 止损 3830").text  # 5,000 / 3,880 = 1.288 XAU
+    assert "按上限把数量改成 1288 张" in big.say("按上限").text
+
+
+def test_at_the_cap_means_nothing_without_a_refusal_or_with_other_words():
+    bench = Bench(**roomy(trade_max_total_risk_pct=25.0))
+    assert bench.say("按上限") is None
+    bench.say("做多 XAU 15个 止损 3830")
+    for words in ("按上限吗", "不按上限", "用最大杠杆", "按上限 5 张", "上限是多少"):
+        assert bench.say(words) is None or "按上限把数量改成" not in bench.say(words).text, words
+    assert bench.desk.is_command("按最多的开")
+
+
+def test_an_order_the_ai_wrote_out_is_mended_the_same_way():
+    bench = Bench(**roomy(trade_max_risk_pct=25.0))
+    first = bench.desk.handle_understood("帮我买一个黄金", "做多 XAU 1个")
+    assert "补一句“止损 价格”" in first.text
+    assert bench.say("止损 3830").text.startswith("接着刚才被拦下的那张开仓单，加上止损 3830：")
+
+
+# ------------------------------------------------------------------ two orders in one sentence
+
+
+def test_two_steps_in_one_sentence_are_previewed_one_after_the_other():
+    bench = Bench(FakeExchange([gold()]), **roomy())
+    first = bench.desk.handle_understood("减仓减5 xau 然后止损设在3730", "减仓 XAU 5个\n止损 XAU 3730")
+    assert first.text.startswith("我把“减仓减5 xau 然后止损设在3730”理解为：**减仓 XAU 5个**，然后 **止损 XAU 3730**")
+    assert "这张执行完，我接着出第二张预览：**止损 XAU 3730**，同样要你回确认码。" in first.text
+    done = bench.say("确认 1111")
+    assert done.title.startswith("已执行") and "**第二步：止损 XAU 3730**" in done.text and "确认 2222" in done.text
+    assert bench.say("确认 2222").title.startswith("已执行")
+    assert [name for name, _ in bench.sent][-1] in ("place_stop", "amend_stop")
+
+
+def test_a_stop_price_a_partial_close_left_out_becomes_the_second_step():
+    bench = Bench(FakeExchange([gold()]), **roomy())
+    first = bench.desk.handle_understood("减仓减5 xau 然后止损设在3730", "减仓 XAU 5个")  # the AI wrote one line
+    assert "我接着出第二张预览：**止损 XAU 3730**" in first.text
+    assert "**第二步：止损 XAU 3730**" in bench.say("确认 1111").text
+    whole = Bench(FakeExchange([gold()]), **roomy())
+    assert "第二张" not in whole.desk.handle_understood("全平了，止损 3730 不用了", "平仓 XAU").text  # nothing left to stop
+
+
+def test_a_second_step_goes_with_the_first_when_that_is_called_off_or_refused():
+    bench = Bench(FakeExchange([gold()]), **roomy())
+    bench.desk.handle_understood("减仓减5 xau 然后止损设在3730", "减仓 XAU 5个\n止损 XAU 3730")
+    bench.say("取消")
+    assert bench.say("确认 1111").text == "现在没有等待确认的指令。" and bench.sent == []
+    empty = Bench(**roomy())
+    refused = empty.desk.handle_understood("减仓 5 个然后止损 3730", "减仓 XAU 5个\n止损 XAU 3730").text
+    assert "第二步“止损 XAU 3730”也没有做" in refused
+
+
+# ------------------------------------------------------------------ cancellations set for later
+
+
+def waiting_orders(*orders):
+    exchange = FakeExchange()
+    for n, px in enumerate(orders or (3800.0,), 9):
+        exchange.pending.append(OrderInfo(str(n), XAU, "buy", px=px, sz=1000.0, state="live"))
+    return exchange
+
+
+def test_a_cancel_set_for_a_time_is_confirmed_once_and_run_by_the_bot_when_due():
+    bench = Bench(waiting_orders())
+    preview = bench.say("周五 13:30 撤单 XAU")
+    assert preview.title == "定时撤单预览 · 模拟盘"
+    assert "**到 洛杉矶 01-15 周五 13:30（北京 01-16 周六 05:30）撤单（1 张）**" in preview.text
+    assert "那一刻不再问你" in preview.text and "不会下任何新单" in preview.text and "确认 1111" in preview.text
+    done = bench.say("确认 1111")
+    assert done.title == "定时撤单已设好" and "取消提醒 1" in done.text and bench.sent == []
+    [job] = bench.journal.alerts()
+    assert (job["direction"], job["price"], job["action"]) == ("at", 1_800_048_600.0, "cancel")
+    ran = bench.desk.run_job(job)
+    assert ran.title.startswith("定时撤单 #1：已执行") and [name for name, _ in bench.sent] == ["cancel_order"]
+
+
+def test_the_alert_watcher_runs_a_scheduled_cancel_once_when_it_is_due():
+    from bot.alerts import AlertWatcher
+
+    bench = Bench(waiting_orders())
+    bench.say("30分钟后撤单 XAU")
+    bench.say("确认 1111")
+    told = []
+    watcher = AlertWatcher(bench.journal, bench.exchange, lambda title, text: None, bench.clock, act=lambda job: told.append(bench.desk.run_job(job)))
+    assert watcher.check_once() == 0 and bench.sent == []
+    bench.clock.advance(30 * 60)
+    assert watcher.check_once() == 1 and [name for name, _ in bench.sent] == ["cancel_order"]
+    assert watcher.check_once() == 0 and len(told) == 1 and told[0].title.startswith("定时撤单 #1：已执行")
+
+
+def test_the_ways_to_say_when():
+    bench = Bench(waiting_orders())
+    bench.say("30分钟后撤单 XAU")
+    bench.say("确认 1111")
+    bench.desk.handle("北京时间 周五 13:30 撤单 XAU", sender="ou_a")  # already past in Beijing: next Friday
+    bench.desk.handle("确认 2222", sender="ou_a")
+    set_zone(bench.journal, "ou_b", "Asia/Shanghai")  # "我用北京时间"
+    reply = bench.desk.handle("明天下午3点撤单 XAU", sender="ou_b")
+    assert "到 北京 01-16 周六 15:00（洛杉矶 01-15 周五 23:00）" in reply.text
+    bench.desk.handle("确认 3333", sender="ou_b")
+    assert [job["price"] for job in bench.journal.alerts()] == [1_800_001_800.0, 1_800_595_800.0, 1_800_082_800.0]
+
+
+def test_a_cancel_set_on_a_price_waits_for_the_price():
+    bench = Bench(waiting_orders(3800.0, 3790.0))
+    preview = bench.say("跌破 3530 撤单 XAU 3800")
+    assert "**XAU 跌破 3530 时撤单（1 张）**" in preview.text
+    bench.say("确认 1111")
+    [job] = bench.journal.alerts()
+    assert (job["inst_id"], job["direction"], job["price"], job["action"]) == (XAU, "below", 3530.0, "cancel")
+    bench.exchange.pending[:] = [order for order in bench.exchange.pending if order.ord_id != "9"]  # it filled meanwhile
+    ran = bench.desk.run_job(job)
+    assert ran.title == "定时撤单 #1：没有执行" and "已经不在了" in ran.text and bench.sent == []
+
+
+def test_only_cancellations_are_set_for_later_and_a_time_gone_by_is_refused():
+    bench = Bench(waiting_orders())
+    assert "定时" not in (bench.say("周五 13:30 平仓 XAU") or Reply("")).text
+    assert "读不准（或者已经过了）" in bench.say("今天 0点 撤单 XAU").text
+    assert "只写一个" in bench.say("周五 13:30 跌破 3530 撤单 XAU").text
+    assert "1 分钟以后、30 天以内" in bench.say("0.5分钟后撤单 XAU").text
+    assert bench.say("撤单 XAU 3800").title.startswith("下单预览")  # no time, no price: now, as ever
+    assert bench.journal.alerts() == []
 
 
 def test_what_cannot_be_measured_is_named_and_a_bare_position_counts_to_its_liquidation():

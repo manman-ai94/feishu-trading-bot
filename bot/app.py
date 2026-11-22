@@ -272,9 +272,9 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     if cfg.trading_blocked:
         log.warning("trading stays off: the TRADING setting in .env cannot be honoured")
     log.info(
-        "AI: questions on %s (%s, own positions %s), deep on %s (%s), web search %s, crowd data %s, macro data %s, "
-        "%d knowledge file(s), close reviews %s",
-        cfg.model_daily, cfg.effort_daily, cfg.effort_account, cfg.model_deep, cfg.effort_deep,
+        "AI: questions on %s (%s, own positions %s), short follow-ups on %s (%s), deep on %s (%s), web search %s, "
+        "crowd data %s, macro data %s, %d knowledge file(s), close reviews %s",
+        cfg.model_daily, cfg.effort_daily, cfg.effort_account, cfg.model_short, cfg.effort_short, cfg.model_deep, cfg.effort_deep,
         "on" if cfg.web_search else "off", "on" if crowd is not None else "off",
         "on" if macro is not None else "off", len(knowledge.summary()), "on" if cfg.close_review else "off",
     )  # fmt: skip
@@ -299,7 +299,15 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         },
     )
     threading.Thread(target=scheduler.run_forever, args=(stop,), name="scheduler", daemon=True).start()
-    watcher = AlertWatcher(journal, okx, reporter.send_alert, tz=cfg.tz)
+    def run_job(job: dict) -> None:
+        """A job in the alert table is due: a cancellation confirmed when it was set, or a second look."""
+        if job.get("action") == "cancel":
+            done = desk.run_job(job)
+            reporter.send_alert(done.title, done.text)
+        elif job.get("action") == "recheck":
+            router.recheck(job)
+
+    watcher = AlertWatcher(journal, okx, reporter.send_alert, tz=cfg.tz, act=run_job)
     threading.Thread(target=watcher.run_forever, args=(stop,), name="alerts", daemon=True).start()
     log.info("price alerts: %d active", len(journal.alerts("active")))
     if cfg.has_okx_keys:

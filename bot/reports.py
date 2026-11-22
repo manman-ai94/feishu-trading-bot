@@ -107,9 +107,10 @@ def position_lines(position: Position, with_amounts: bool, risk: PositionRisk | 
 
 def status_markdown(
     state: AccountState, day_change: float | None, private: bool, show_amounts_in_group: bool = False, risk: AccountRisk | None = None,
-    exposure: list[str] | None = None,
+    exposure: list[str] | None = None, last_close: list[str] | None = None,
 ) -> str:
-    """The status card body. `exposure`: what every stop would cost together (exposure.card_lines), shown with the amounts."""
+    """The status card body. `exposure`: what every stop would cost together (exposure.card_lines), shown with the
+    amounts. `last_close`: the latest close, shown while nothing is held."""
     with_amounts = private or show_amounts_in_group
     lines: list[str] = []
     if with_amounts:
@@ -130,6 +131,8 @@ def status_markdown(
             lines.append("")
     if not state.positions:
         lines.append("当前没有持仓。")
+        if with_amounts and last_close:
+            lines.extend(["", *last_close])
     for position in state.positions:
         lines.extend(position_lines(position, with_amounts, risk.of(position) if risk is not None else None))
         lines.append("")

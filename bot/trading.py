@@ -26,6 +26,7 @@ Rules that matter:
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import secrets
@@ -34,9 +35,10 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from .closes import Hit, hit_line, read_closed, read_triggers, stop_hits
 from .exposure import Exposure, Piece, measure
@@ -46,6 +48,7 @@ from .journal import Journal
 from .models import AccountConfig, AccountState, InstrumentSpec, OrderInfo, Position
 from .okx_client import OkxError, OkxNetworkError
 from .reports import currency_lines
+from .times import BEIJING, LOS_ANGELES, when_text, zone_of
 from . import sources
 
 log = logging.getLogger(__name__)
@@ -75,6 +78,7 @@ _CONFIRM = re.compile(r"(?:/confirm|确认|确定)\s*(\d{1,8})?")
 # Such a reply voids the preview; it is never taken as the confirmation, whatever code is in it.
 _REFUSAL = re.compile(r"取消|不|别|算了|等|停|撤|作废|放弃|慢|错|(?<![a-z])(?:no|not|don'?t|wait|cancel|stop|hold)(?![a-z])")
 REFUSED_NOTE = "refused"
+REFUSED_FOLLOW_SECONDS = 600  # how long "止损 3560" or "按上限" still mends the open just refused
 NOT_YOURS_NOTE = "not yours"  # a code typed by one owner for the preview another owner asked for
 NOT_YOURS_TEXT = "这个确认码是另一位主人那张预览的。谁发的指令只认谁回的码，没有执行。"
 _POLITE = re.compile(r"^(?:请|麻烦|帮我|给我|帮忙)+\s*")
@@ -159,6 +163,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - 突破单：“涨破 3900 做多 XAU 止损 3870”“跌破 3800 做空 XAU 止损 3830”，价格到了按市价进场，没到一直挂着
 - 分档挂单：“分档做多 XAU 3850 3830 3810 止损 3790”“分3档做多 XAU 3850到3810 止损 3790”，最多 5 档，每档一样多、各带同一个止损；不写数量时，几档全部成交再打到止损合计亏你定的单笔风险
 - 账户总风险：所有止损都打到合计最多亏多少（TRADE_MAX_TOTAL_RISK_PCT），每张开仓预览都写；超了就不执行，只写止损的自动减到放得下
+- 被拒以后补一句：没带止损被拒，10 分钟内发“止损 3560”就按原单出预览；超过上限被拒，回“按上限”就按最多能开的数量出预览
 
 **平仓**（都按市价）
 - “平仓 XAU”平掉整个仓位；“平仓 XAU 一半”“平仓 XAU 30%”“减仓 XAU 100张”平一部分
@@ -168,6 +173,7 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - “挂单”看当前的挂单和止盈止损
 - “撤单 XAU”“撤单 全部”“撤单 订单号”，或按价格撤：“撤单 XAU 3788”“撤单 3788”；突破单按触发价撤：“撤单 XAU 3900”
 - 改挂单的价格：先撤单，再重新挂
+- 定时撤单：“周五 13:30 撤单 XAU”“明天下午3点撤单 XAU 3588”“30分钟后撤单 XAU”；按价格撤：“跌破 3530 撤单 XAU 3588”。设的时候出预览、回一次确认码，到时我自己撤，撤完发卡片；只撤预览里那几张，不会自己开仓。时间按你的时区，写“北京时间 周五 13:30”就按北京时间。发“提醒”能看到，“取消提醒 编号”取消
 
 **止盈止损**（对整个仓位）
 - “止损 XAU 3860”“止盈 XAU 3950”“止损 XAU 3860 止盈 3950”
@@ -184,7 +190,8 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 
 **安全**
 - 每条指令我先回一张预览，你回复确认码才执行（“确认 4812”“4812”“确认4812执行”都行），回复“取消”作废；回复里只要带“取消、不要、别、先等等”这类话，即使有确认码也按作废处理；过期也作废
-- 不是标准写法也可以，例如“止损减两点”“把 3808 的止损挪到 3806”：我会先写出我理解成哪条指令，再出预览
+- 不是标准写法也可以，例如“止损减两点”“把 3808 的止损挪到 3806”：我会先写出我理解成哪条指令，再出预览。一句话两件事（“减仓 5 个然后止损设在 3730”），第一张执行完接着出第二张的预览
+- 我刚给过写法时，回“帮我设置”“就按这个”“帮我挂”就按那一句出预览
 - “停止交易”：立刻不再接受开仓（平仓、撤单、改止损照常）。“恢复交易”解除
 - 熔断：24 小时内亏损的止损或强平满 2 次，我自动不再接受开仓（平仓、撤单、改止损照常），不动任何仓位。“解除熔断”再回确认码恢复
 - “交易设置”：看当前是模拟盘还是实盘、各项限额、这把 key 的权限
@@ -224,6 +231,11 @@ class Command:
     note: str = ""  # unclear: what to tell the owner
     tiers: tuple[Decimal, ...] = ()  # open: the prices of a ladder of limit orders (分档挂单), as written
     source: str = ""  # where the order came from (sources.SOURCE_NAMES); set by the desk, not by the parser
+    due: float | None = None  # cancel: carried out at this time (epoch seconds) instead of now
+    due_side: str = ""  # cancel: carried out when the price goes below | above due_px
+    due_px: Decimal | None = None
+    due_inst: str = ""  # the instrument whose price due_side watches
+    due_zone: str = ""  # the zone the time was written in, for showing it back
 
 
 class _Unclear(Exception):
@@ -231,8 +243,9 @@ class _Unclear(Exception):
 
 
 def normalise(text: str) -> str:
-    """Full-width digits, letters and punctuation become plain ones; separators become spaces."""
+    """Full-width digits, letters and punctuation become plain ones; separators and quotes become spaces."""
     text = unicodedata.normalize("NFKC", text or "").strip()
+    text = re.sub(r"[\"'`“”‘’「」『』]+", " ", text)  # a command copied from an answer keeps its quotes: “止损 XAU 3806”
     text = re.sub(r"[,;、。]+", " ", text)
     return re.sub(r"\s+", " ", text)
 
@@ -682,8 +695,58 @@ def _action(command: Command) -> str:
     return "limit" if command.ord_type == "limit" else "open"
 
 
+SCHEDULE_MAX_DAYS = 30  # the alert table drops a job older than this (alerts.KEEP_DAYS)
+_IN = re.compile(r"(半|(?<![\d.])\d+(?:\.\d+)?)\s*(?:个)?\s*(分钟|小时|钟头)\s*(?:以后|之后|后)")
+_AT = re.compile(
+    r"(北京时间|北京|洛杉矶时间|洛杉矶|美西时间|美西)?\s*"
+    r"(今天|今晚|明天|明晚|明早|后天|(?:周|星期|礼拜)[一二三四五六日天])?\s*"
+    r"(凌晨|早上|上午|中午|下午|傍晚|晚上)?\s*(?<![\d.])(\d{1,2})(?::(\d{2})|点(?:(半)|(\d{1,2})分?)?)"
+)
+_IF_PRICE = re.compile(r"(跌破|跌到|跌穿|跌至|低于|涨破|涨到|涨穿|涨至|突破|站上|高于)\s*(\d{2,6}(?:\.\d+)?)")
+_SCHEDULE_FILLER = re.compile(r"如果|要是|若是|假如|的时候|时候|之前|以前|以后|之后|前|后|就|自动|帮我|给我|请|到了?|在|时|再|把|吧|的")
+_WEEKDAY = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+_ZONE_WORDS = {"北京": BEIJING, "洛杉矶": LOS_ANGELES, "美西": LOS_ANGELES}
+_STOP_SAID = re.compile(r"(止损|止盈)[^\d]{0,6}?(\d{3,6}(?:\.\d+)?)")
+_AT_CAP = re.compile(r"(按|照|用|开|就)(着|这个)?(上限|最大|最多|能开的|还能开的)")
+
+
+def _is_at_cap(text: str) -> bool:
+    """ "按上限", "就按最多的开吧": after an open refused for a limit, open as much as the limit allows."""
+    plain = re.sub(r"[\s,.!~、吧啊呀了的]", "", normalise(text))
+    if len(plain) > 12 or re.search(r"\d|不|吗|多少|\?|杠杆|止损|止盈|风险", plain):
+        return False
+    return bool(_AT_CAP.search(plain))
+
+
 class Refused(Exception):
-    """A check said no. The message is for the owner, in plain words."""
+    """A check said no. The message is for the owner, in plain words. `reason` names the refusals a short
+    follow-up can mend: "no_stop" (an open without a stop: "止损 3560" next completes it), "over_cap" (an open
+    over a limit: "按上限" next opens `fits` contracts) and "no_position" (a stop or close with nothing to act on)."""
+
+    def __init__(self, message: str, reason: str = "", fits: Decimal | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.fits = fits
+
+
+@dataclass(frozen=True)
+class _Then:
+    """The second step of a sentence that asked for two ("减仓 5 个然后止损 3730"): previewed once the first is done."""
+
+    at: float
+    command: Command
+    text: str
+    in_group: bool = False
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    """An open the owner was just refused, kept for the follow-up that mends it."""
+
+    at: float
+    command: Command
+    reason: str  # no_stop | over_cap
+    fits: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -813,6 +876,8 @@ class TradeDesk:
         # Who asked -> the preview waiting for his code. With more than one owner, each has his own: a code
         # counts only from the person who sent the command, wherever it is typed.
         self._pending: dict[str, _Pending] = {}
+        self._refused: dict[str, _Refusal] = {}  # who asked -> the open he was just refused, for the follow-up
+        self._then: dict[str, _Then] = {}  # who asked -> the second step waiting for his first to be done
         self._last_sizing: tuple[str, float] | None = None  # (instrument, when) of the last "算仓位" answered
         self._account_config: tuple[float, AccountConfig] | None = None
         self.stream_status: Callable[[], str] | None = None  # set by the app: whether OKX's push stream is up
@@ -831,10 +896,108 @@ class TradeDesk:
     def _read(self, text: str, sender: str | None = "") -> Command | None:
         """The command in a message: one of the fixed patterns, or the code of the preview that is waiting.
         `sender` None: anyone's preview counts (for `is_command`)."""
+        scheduled = self._scheduled(text, sender)
+        if scheduled is not None:
+            return scheduled
         command = self._parser.parse(text)
+        if command is None and _is_at_cap(text) and self._held(sender, "over_cap") is not None:
+            return Command("at_cap")
         if command is None or command.kind == "unclear":
             return self._code_reply(text, sender) or command
         return command
+
+    def _scheduled(self, text: str, sender: str | None = "") -> Command | None:
+        """ "周五 13:30 撤单 XAU", "30 分钟后撤单 XAU 3588", "跌破 3530 撤单 XAU 3588": a cancellation carried
+        out later by the bot itself. Only cancellations: nothing else is ever done on a timer. None when the
+        message is not one."""
+        plain = normalise(text)
+        if "撤" not in plain:
+            return None
+        now = self._clock()
+        due, side, px, zone, rest = None, "", None, "", plain
+        found = _IF_PRICE.search(plain)
+        if found:
+            side = "below" if found.group(1).startswith(("跌", "低")) else "above"
+            px = Decimal(found.group(2))
+            rest = plain[: found.start()] + " " + plain[found.end() :]
+        moved = _IN.search(rest)
+        at = _AT.search(rest) if moved is None else None
+        if moved is not None:
+            amount = Decimal("0.5") if moved.group(1) == "半" else Decimal(moved.group(1))
+            due = now + float(amount) * (60 if moved.group(2) == "分钟" else 3600)
+            rest = rest[: moved.start()] + " " + rest[moved.end() :]
+        elif at is not None:
+            tz = next((z for word, z in _ZONE_WORDS.items() if at.group(1) and at.group(1).startswith(word)), None)
+            tz = tz or (zone_of(self._journal, sender) if sender else None) or self._cfg.tz
+            zone = getattr(tz, "key", "")
+            due = self._due_at(at, tz, now)
+            if due is None:
+                return Command("unclear", note=f"“{at.group(0).strip()}”这个时间我读不准（或者已经过了）。请写成“周五 13:30 撤单 XAU”或“30分钟后撤单 XAU”。")
+            rest = rest[: at.start()] + " " + rest[at.end() :]
+        if due is None and not side:
+            return None
+        if due is not None and side:
+            return Command("unclear", note="时间和价格条件请只写一个，例如“周五 13:30 撤单 XAU”或“跌破 3530 撤单 XAU 3588”。")
+        rest = re.sub(r"\s+", " ", _SCHEDULE_FILLER.sub(" ", rest)).strip()
+        command = self._parser.parse(rest)
+        if command is None or command.kind not in ("cancel", "unclear"):
+            return None
+        if command.kind == "unclear":
+            return command
+        if due is not None and not now + 60 <= due <= now + SCHEDULE_MAX_DAYS * 86400:
+            return Command("unclear", note=f"定时撤单的时间要在 1 分钟以后、{SCHEDULE_MAX_DAYS} 天以内。")
+        watched = ""
+        if side:
+            allowed = self._cfg.tradable_instruments
+            watched = command.inst_id or (allowed[0] if len(allowed) == 1 else "")
+            if not watched:
+                return Command("unclear", note="价格条件要看哪个品种的价？请写明，例如“跌破 3530 撤单 XAU 3588”。")
+        return replace(command, due=due, due_side=side, due_px=px, due_inst=watched, due_zone=zone)
+
+    def _due_at(self, at: re.Match, tz, now: float) -> float | None:
+        """The moment "周五 13:30", "明天 9点半" or "21:00" names in `tz`: the next one, never one gone by."""
+        day_word, part, hour = at.group(2) or "", at.group(3) or "", int(at.group(4))
+        minute = int(at.group(5) or (30 if at.group(6) else at.group(7) or 0))
+        if part in ("下午", "傍晚", "晚上") and hour < 12:
+            hour += 12
+        if day_word in ("今晚", "明晚") and hour < 12:
+            hour += 12
+        if hour > 23 or minute > 59:
+            return None
+        today = datetime.fromtimestamp(now, tz=tz)
+        base = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if day_word in ("明天", "明晚", "明早", "后天"):
+            moment = base + timedelta(days=2 if day_word == "后天" else 1)
+        elif day_word[-1:] in _WEEKDAY and day_word not in ("今天",):
+            ahead = (_WEEKDAY[day_word[-1]] - today.weekday()) % 7
+            moment = base + timedelta(days=ahead)
+            if moment.timestamp() <= now:
+                moment += timedelta(days=7)
+        else:
+            moment = base
+            if moment.timestamp() <= now and day_word not in ("今天", "今晚"):
+                moment += timedelta(days=1)
+        return moment.timestamp() if moment.timestamp() > now else None
+
+    def _due_text(self, command: Command) -> str:
+        """ "到 北京 11-21 周五 13:30（洛杉矶 11-20 周四 21:30）", "XAU 跌破 3530 时": when a scheduled cancel runs."""
+        if command.due is not None:
+            first = None
+            if command.due_zone:
+                try:
+                    first = ZoneInfo(command.due_zone)
+                except Exception:
+                    first = None
+            return f"到 {when_text(command.due, self._cfg.tz, first=first)}"
+        word = "跌破" if command.due_side == "below" else "涨破"
+        return f"{command.due_inst.split('-')[0]} {word} {_plain(command.due_px)} 时"
+
+    def _held(self, sender: str | None, reason: str) -> _Refusal | None:
+        """The open this person was refused for `reason` in the last few minutes (anyone's when None)."""
+        now = self._clock()
+        with self._lock:
+            held = [item for who, item in self._refused.items() if sender is None or who == sender]
+        return next((item for item in held if item.reason == reason and now - item.at <= REFUSED_FOLLOW_SECONDS), None)
 
     def _code_reply(self, text: str, sender: str | None = "") -> Command | None:
         """While a preview waits, a short message with its code in it is the confirmation, however it is
@@ -870,6 +1033,8 @@ class TradeDesk:
         """Voids the preview waiting for this person's code: he is no longer an owner."""
         with self._lock:
             self._pending.pop(sender, None)
+            self._refused.pop(sender, None)
+            self._then.pop(sender, None)
 
     def positions_text(self) -> str:
         """The positions and their stops, for reading a command that names a stop relative to the current one."""
@@ -879,22 +1044,58 @@ class TradeDesk:
         """A command the AI wrote out from the owner's own words. It goes through the same reading,
         checks, preview and code as one he typed; the preview starts with what it was taken to mean.
         Only orders: a confirmation, a cancellation or a switch is never taken from the AI."""
-        command = self._parser.parse(command_text)
+        first, _, second = command_text.partition("\n")
+        first = first.strip()
+        command = self._parser.parse(first)
         if command is None or command.kind not in ("open", "close", "cancel", "stop", "orders", "unclear"):
             return None
         log.info("an order was read with the AI's help: %s", command.kind)
         command = replace(command, source=sources.of_words(said))
-        heading = f"我把“{said.strip()[:60]}”理解为：**{command_text}**"
-        try:
-            reply = self._dispatch(command, in_group, sender)
-        except Refused as exc:
-            reply = Reply(str(exc))
-        except OkxError as exc:
-            reply = Reply(f"OKX 返回了错误，没有执行任何操作：{exc.message or '没有给出原因'}（代码 {exc.code}）")
-        except OkxNetworkError:
-            reply = Reply("现在连不上 OKX，没有执行任何操作。请稍后再试。")
-        ending = "" if command.kind == "orders" else "\n不是这个意思就回“取消”，再换个说法。" if reply.title.startswith("下单预览") else ""
+        then = self._second_step(said, command, second.strip())
+        heading = f"我把“{said.strip()[:60]}”理解为：**{first}**" + (f"，然后 **{then.text}**" if then else "")
+        reply = self._answer(command, in_group, sender)
+        previewed = reply.title.startswith("下单预览")
+        ending = "" if command.kind == "orders" else "\n不是这个意思就回“取消”，再换个说法。" if previewed else ""
+        if then is not None and previewed:
+            with self._lock:
+                self._then[sender] = replace(then, at=self._clock(), in_group=in_group)
+            ending += f"\n这张执行完，我接着出第二张预览：**{then.text}**，同样要你回确认码。"
+        elif then is not None:
+            ending += f"\n第二步“{then.text}”也没有做。第一步办好后，要做请再单独发一次。"
         return Reply(f"{heading}\n\n{reply.text}{ending}", title=reply.title, template=reply.template)
+
+    def _second_step(self, said: str, command: Command, second: str) -> _Then | None:
+        """What a sentence asked for after its first order: the AI's second line, or else a stop or target
+        price he named that a partial close left out ("减仓减 5 个然后止损设在 3730")."""
+        if second:
+            then = self._parser.parse(second)
+            if then is not None and then.kind in ("open", "close", "cancel", "stop"):
+                return _Then(0.0, replace(then, source=sources.of_words(said)), second)
+            return None
+        if command.kind != "close" or command.everything or command.size is None:
+            return None  # only what is left of a position can still take a stop
+        named = {word: price for word, price in _STOP_SAID.findall(normalise(said))}
+        carried = {_plain(price) for price in (command.sl, command.tp) if price is not None}
+        parts = [f"{word} {price}" for word, price in named.items() if price not in carried]
+        if not parts:
+            return None
+        short = command.inst_id.split("-")[0] if command.inst_id else ""
+        text = " ".join(part if i else part.replace(" ", f" {short} " if short else " ", 1) for i, part in enumerate(parts))
+        then = self._parser.parse(text)
+        if then is None or then.kind != "stop":
+            return None
+        return _Then(0.0, replace(then, source=sources.of_words(said)), text)
+
+    def _then_step(self, done: Reply, sender: str) -> Reply:
+        """After the first step of a two-step sentence is carried out, the preview of the second."""
+        with self._lock:
+            then = self._then.pop(sender, None)
+        if then is None or self._clock() - then.at > self._cfg.trade_confirm_seconds + 60:
+            return done
+        if not done.title.startswith("已执行"):
+            return Reply(f"{done.text}\n\n第二步“{then.text}”没有接着做：第一步没有全部办成。核对后要做请再单独发。", done.title, done.template)
+        step = self._answer(then.command, then.in_group, sender)
+        return Reply(f"{done.text}\n\n**第二步：{then.text}**\n{step.text}", done.title, done.template)
 
     def takes_long(self, text: str, sender: str = "") -> bool:
         """Whether answering this message takes a while: the confirmation that starts the demo rehearsal."""
@@ -918,15 +1119,73 @@ class TradeDesk:
             return None
         if refused_here:
             return Reply(refused_here)
-        command = self._tagged(command)
+        return self._answer(self._tagged(command), in_group, sender)
+
+    def _answer(self, command: Command, in_group: bool = False, sender: str = "") -> Reply:
+        """Carries the command out as far as a preview, and words what said no. An open refused for a missing
+        stop or for being over a limit is kept a few minutes: "止损 3560" or "按上限" then mends it, without
+        the whole order typed again."""
         try:
-            return self._dispatch(command, in_group, sender)
+            if command.kind == "at_cap":
+                held = self._take_refusal(sender, "over_cap")
+                if held is None or held.fits is None:
+                    return Reply("刚才没有被上限拦下的开仓单，或者已经过了 10 分钟。请把整条指令重发一次。")
+                mended = replace(held.command, size=held.fits, unit="contracts")
+                return self._mended(f"按上限把数量改成 {_plain(held.fits)} 张，重新出预览：", mended, in_group, sender)
+            if command.kind == "open":
+                with self._lock:
+                    self._refused.pop(sender, None)  # a new open: the one refused before is let go
+            try:
+                return self._dispatch(command, in_group, sender)
+            except Refused as exc:
+                held = self._take_refusal(sender, "no_stop", command) if exc.reason == "no_position" else None
+                if held is None:
+                    raise
+            tp = command.tp if command.tp is not None else held.command.tp
+            mended = replace(held.command, sl=command.sl, tp=tp)
+            added = f"止损 {_plain(command.sl)}" + (f"、止盈 {_plain(command.tp)}" if command.tp is not None else "")
+            return self._mended(f"接着刚才被拦下的那张开仓单，加上{added}：", mended, in_group, sender)
         except Refused as exc:
-            return Reply(str(exc))
+            return Reply(str(exc) + self._keep_refusal(command, exc, sender))
         except OkxError as exc:
             return Reply(f"OKX 返回了错误，没有执行任何操作：{exc.message or '没有给出原因'}（代码 {exc.code}）")
         except OkxNetworkError:
             return Reply("现在连不上 OKX，没有执行任何操作。请稍后再试。")
+
+    def _mended(self, lead: str, command: Command, in_group: bool, sender: str) -> Reply:
+        """The refused open, mended by the follow-up, through the same checks and preview as any other."""
+        try:
+            reply = self._dispatch(command, in_group, sender)
+        except Refused as exc:
+            reply = Reply(str(exc) + self._keep_refusal(command, exc, sender))
+        return Reply(f"{lead}\n\n{reply.text}", title=reply.title, template=reply.template, unclear=reply.unclear)
+
+    def _take_refusal(self, sender: str, reason: str, stop: Command | None = None) -> _Refusal | None:
+        """The refused open this follow-up mends, taken off the shelf; None when there is none to mend. A stop
+        mends it only when it names a stop price and does not point at another instrument or side."""
+        held = self._held(sender, reason)
+        if held is None:
+            return None
+        if stop is not None and (
+            stop.kind != "stop" or stop.sl is None or stop.clear_sl or stop.clear_tp
+            or stop.inst_id not in ("", held.command.inst_id) or stop.direction not in ("", held.command.direction)
+        ):  # fmt: skip
+            return None
+        with self._lock:
+            self._refused.pop(sender, None)
+        return held
+
+    def _keep_refusal(self, command: Command, exc: Refused, sender: str) -> str:
+        """Keeps an open refused for a missing stop or a limit, and says what short reply mends it."""
+        if command.kind != "open" or command.tiers or exc.reason not in ("no_stop", "over_cap"):
+            return ""
+        if exc.reason == "over_cap" and exc.fits is None:
+            return ""
+        with self._lock:
+            self._refused[sender] = _Refusal(self._clock(), command, exc.reason, exc.fits)
+        if exc.reason == "no_stop":
+            return "\n补一句“止损 价格”（可以连止盈一起写），我就按这张单出预览。10 分钟内有效。"
+        return f"\n回“按上限”，我就按 {_plain(exc.fits)} 张重新出预览。10 分钟内有效。"
 
     def _tagged(self, command: Command) -> Command:
         """A command the owner typed himself: "sized" when it opens on an instrument he had sized just before."""
@@ -980,6 +1239,15 @@ class TradeDesk:
                 "要开放它，需要在服务器的 .env 里改 TRADE_ACTIONS，飞书里改不了。"
             )
         plan = self._plan(command)
+        if command.due is not None or command.due_side:
+            plan = replace(
+                plan, title=f"{self._due_text(command)}{plan.title}",
+                lines=(*plan.lines, "到时由我自己撤，那一刻不再问你；撤完在私聊和群里发卡片。只撤上面这几张，不会下任何新单。"),
+            )  # fmt: skip
+            return self._ask_to_confirm(
+                command, plan, f"定时撤单预览 · {MODE_LABELS[self._mode]}",
+                "回复 **确认 {code}** 设好，回复“取消”作废。{seconds} 秒内有效。", in_group, sender,
+            )  # fmt: skip
         return self._ask_to_confirm(
             command, plan, f"下单预览 · {MODE_LABELS[self._mode]}",
             "回复 **确认 {code}** 执行，回复“取消”作废。{seconds} 秒内有效，过期要重新发指令。", in_group, sender,
@@ -993,6 +1261,8 @@ class TradeDesk:
         seconds = self._cfg.trade_confirm_seconds
         with self._lock:
             self._pending[sender] = _Pending(code, self._clock() + seconds, command, plan)
+            self._refused.pop(sender, None)
+            self._then.pop(sender, None)
         log.info("preview (%s) %s %s: waiting for the code", self._mode, command.kind, command.inst_id or "-")
         ending = ending.format(code=code, seconds=seconds)
         if in_group:
@@ -1037,8 +1307,68 @@ class TradeDesk:
             try:
                 plan = self._plan(pending.command, previous=pending.plan)
             except Refused as exc:
-                return Reply(f"没有执行。{exc}")
-            return self._execute(plan, pending.command.source)
+                return self._then_step(Reply(f"没有执行。{exc}"), sender)
+            if pending.command.due is not None or pending.command.due_side:
+                return self._schedule(pending.command, pending.plan, plan, sender)
+            done = self._execute(plan, pending.command.source)
+        return self._then_step(done, sender)
+
+    def _schedule(self, command: Command, shown: Plan, plan: Plan, sender: str) -> Reply:
+        """Keeps a confirmed scheduled cancel in the alert table, where the alert watcher runs it when due."""
+        data = {
+            "ids": list(plan.data.get("ids", [])), "inst": command.inst_id, "direction": command.direction,
+            "px": _plain(command.px) if command.px is not None else "", "ord_id": command.ord_id,
+            "everything": command.everything, "source": command.source, "by": sender, "title": plan.title,
+        }  # fmt: skip
+        said = "；".join(shown.lines[:-1][:3]) or plan.title
+        if command.due is not None:
+            job = self._journal.add_alert(
+                command.inst_id or plan.inst_id, "at", command.due, said=said, ts=self._clock(), action="cancel",
+                data=json.dumps(data, ensure_ascii=False),
+            )  # fmt: skip
+        else:
+            job = self._journal.add_alert(
+                command.due_inst, command.due_side, float(command.due_px), said=said, ts=self._clock(), action="cancel",
+                data=json.dumps(data, ensure_ascii=False),
+            )  # fmt: skip
+        log.info("a scheduled cancel was set (#%s, %d order(s))", job, len(data["ids"]))
+        return Reply(
+            f"设好了（#{job}）：{shown.title}。\n到时我自己撤，撤完在私聊和群里发卡片，不再要确认码。"
+            f"不想撤了发“取消提醒 {job}”。挂单在那之前成交或被撤掉的，到时就跳过。",
+            title="定时撤单已设好", template="green",
+        )
+
+    def run_job(self, job: dict) -> Reply:
+        """A scheduled cancel that is due: the orders it was set for that are still resting are cancelled,
+        through the same plan and report as any cancellation. Never anything but a cancellation."""
+        try:
+            data = json.loads(job.get("data") or "{}")
+        except ValueError:
+            data = {}
+        ids = [str(item) for item in data.get("ids", [])]
+        heading = f"定时撤单 #{job.get('id')}"
+        if job.get("action") != "cancel" or not ids:
+            return Reply("这条定时任务读不懂，没有执行任何操作。", title=heading, template="grey")
+        if self._mode == "off" or "cancel" not in self._cfg.trade_actions:
+            why = "交易现在关着" if self._mode == "off" else "撤单现在没有开放（TRADE_ACTIONS）"
+            return Reply(f"{why}，没有撤：{job.get('said') or ''}。请在 OKX 里看一下。", title=heading, template="red")
+        command = Command(
+            "cancel", inst_id=data.get("inst", ""), direction=data.get("direction", ""),
+            px=Decimal(data["px"]) if data.get("px") else None, ord_id=data.get("ord_id", ""),
+            everything=bool(data.get("everything")), source=data.get("source", ""),
+        )  # fmt: skip
+        shown = Plan("cancel", data.get("title", ""), (), (), data.get("inst", ""), {"ids": ids})
+        with self._sending:
+            try:
+                plan = self._plan(command, previous=shown)
+            except Refused as exc:
+                return Reply(f"到时间了，但没有可撤的：{exc}", title=f"{heading}：没有执行", template="grey")
+            except (OkxError, OkxNetworkError) as exc:
+                return Reply(f"到时间了，但读不到 OKX，没有撤：{exc}。请马上在 OKX 里看一下。", title=f"{heading}：没有执行", template="red")
+            gone = len(ids) - len(plan.data.get("ids", []))
+            done = self._execute(plan, data.get("source", ""))
+        tail = f"\n另有 {gone} 张在这之前已经成交或被撤掉，跳过了。" if gone else ""
+        return Reply(f"{done.text}{tail}", title=f"{heading}：{done.title}", template=done.template)
 
     def _selftest(self, inst_id: str = ""):
         from .selftest import SelfTest  # imported here because that module is built on this one
@@ -1062,8 +1392,11 @@ class TradeDesk:
     def _abort(self, refused: bool = False, sender: str = "") -> Reply:
         with self._lock:
             pending = self._pending.pop(sender, None)
+            then = self._then.pop(sender, None)
         if pending is None:
             return Reply("现在没有等待确认的指令。")
+        if then is not None:
+            log.info("the second step of a two-step order is let go with the first")
         if refused:
             log.info("a reply to the card said no: the preview is voided")
             return Reply(
@@ -1076,6 +1409,8 @@ class TradeDesk:
         self._journal.set_setting(PAUSED_SETTING, "1")
         with self._lock:
             self._pending.clear()
+            self._then.clear()
+            self._refused.clear()
         log.info("the owner paused trading")
         return Reply(
             "已暂停：从现在起不接受开仓指令，等待确认的预览也作废了。\n"
@@ -1648,38 +1983,54 @@ class TradeDesk:
             gap = abs(ref - sl)
             if gap * contracts * per_contract > room:
                 fits = _floor_to(max(room, Decimal(0)) / gap / per_contract, spec.lot_sz)
-                where = f"账户现在所有止损都打到要亏约 {_amt(others.loss + kept)}，占权益 {(others.loss + kept) / equity * 100:.1f}%"
+                at_risk = others.loss + kept
+                where = f"账户现在所有止损都打到要亏约 {_amt(at_risk)}，占权益 {at_risk / equity * 100:.1f}%"
                 if cmd.unit == "risk" and previous is None and fits >= spec.min_sz and fits > 0:
                     sized += f"；{where}，总风险上限 {total_cap:g}% 还剩约 {_amt(max(room, Decimal(0)))}，按它减到 {_contracts_text(fits, spec)}"
                     contracts, value = fits, fits * per_contract * ref
                 else:
-                    most = f"按这个止损最多还能开 {_contracts_text(fits, spec)}" if fits >= spec.min_sz and fits > 0 else "按这个止损已经放不下了"
+                    room_ok = fits >= spec.min_sz and fits > 0
+                    most = f"按这个止损最多还能开 {_contracts_text(fits, spec)}" if room_ok else "按这个止损已经放不下了"
+                    loss = gap * contracts * per_contract
+                    if at_risk > 0:
+                        why = f"{where}；加上这张会超过你定的账户总风险 {total_cap:g}%（TRADE_MAX_TOTAL_RISK_PCT）。"
+                    else:  # nothing else at risk: the order alone is over the line
+                        why = (
+                            f"这张单打到止损要亏约 {_amt(loss)} {settle}，占权益 {loss / equity * 100:.1f}%，"
+                            f"超过了你定的账户总风险 {total_cap:g}%（约 {_amt(line)} {settle}，TRADE_MAX_TOTAL_RISK_PCT）。"
+                        )
+                    ways = "可以少开一点，或者把止损放近一点。" if at_risk <= 0 else "可以先平掉或减掉别的仓位、撤掉挂单，或者把止损放近一点。"
                     raise Refused(
-                        (f"{sized}。" if sized else "")
-                        + f"{where}；加上这张会超过你定的账户总风险 {total_cap:g}%（TRADE_MAX_TOTAL_RISK_PCT）。{most}。"
-                        "可以先平掉或减掉别的仓位、撤掉挂单，或者把止损放近一点。"
+                        (f"{sized}。" if sized else "") + f"{why}{most}。{ways}",
+                        reason="over_cap", fits=fits if room_ok and not cmd.tiers else None,
                     )
 
         if value > max_order:
-            hint = f"这张单最多能开约 {_contracts_text(_floor_to(max_order / (per_contract * ref), spec.lot_sz), spec)}。"
+            most = _floor_to(max_order / (per_contract * ref), spec.lot_sz)
+            hint = f"这张单最多能开约 {_contracts_text(most, spec)}。"
             raise Refused(
                 (f"{sized}。" if sized else "")
                 + f"这张单约 {_amt(value)} {settle}，超过了单笔上限 {cfg.trade_max_order_usd:,.0f}。{hint}"
-                "上限在服务器 .env 的 TRADE_MAX_ORDER_USD，飞书里改不了。"
+                "上限在服务器 .env 的 TRADE_MAX_ORDER_USD，飞书里改不了。",
+                reason="over_cap", fits=most if most >= spec.min_sz and most > 0 else None,
             )
         total = held_value + queued + value
         if total > max_position:
+            most = _floor_to(max(max_position - held_value - queued, Decimal(0)) / (per_contract * ref), spec.lot_sz)
+            room_ok = most >= spec.min_sz and most > 0
             raise Refused(
                 (f"{sized}。" if sized else "")
                 + f"下了这张单，{inst_id} 的{word}单会到约 {_amt(total)} {settle}"
                 f"（现有 {_amt(held_value)}，挂单 {_amt(queued)}，这张 {_amt(value)}），"
-                f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。可以写一个更小的数量。"
-                "上限在服务器 .env 的 TRADE_MAX_POSITION_USD，飞书里改不了。"
+                f"超过了单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f}。"
+                + (f"最多还能开约 {_contracts_text(most, spec)}。" if room_ok else "可以写一个更小的数量。")
+                + "上限在服务器 .env 的 TRADE_MAX_POSITION_USD，飞书里改不了。",
+                reason="over_cap", fits=most if room_ok else None,
             )
         self._check_daily()
 
         if cfg.trade_require_stop and sl is None:
-            raise Refused("按你的设置（TRADE_REQUIRE_STOP=true），开仓必须带止损。请在指令后面加上“止损 价格”。")
+            raise Refused("按你的设置（TRADE_REQUIRE_STOP=true），开仓必须带止损。", reason="no_stop")
         self._check_stop_sides(direction, ref, sl, tp, entry_name, spec)
         self._check_max_risk(contracts, ref, sl, entry_name, equity, spec, confirming=previous is not None)
 
@@ -2204,7 +2555,8 @@ class TradeDesk:
         if sl is None:
             raise Refused(
                 f"按你的设置（TRADE_MAX_RISK_PCT={cap:g}），开仓必须带止损，止损触发时最多亏权益的 {cap:g}%。"
-                "请在指令后面加上“止损 价格”；不写数量的话，我按单笔风险算数量。"
+                "不写数量只写止损的话，我按单笔风险算数量。",
+                reason="no_stop",
             )
         if equity <= 0:
             raise Refused("读不到账户权益，没法核对单笔止损上限，这次不开仓。请稍后再试。")
@@ -2221,10 +2573,12 @@ class TradeDesk:
                 f"价格在你确认前动了，按{entry_name} {_px(ref, spec)} 算，这张单止损触发要亏约 {_amt(loss)} {settle}，"
                 f"占权益 {loss / equity * 100:.1f}%，超过了你设的 {cap:g}%（TRADE_MAX_RISK_PCT）。请重新发指令，我按新价格再算。"
             )
-        fits = f"按这个止损最多开 {_contracts_text(most, spec)}" if most >= spec.min_sz else "按这个止损，最小的数量也超了"
+        room_ok = most >= spec.min_sz and most > 0
+        fits = f"按这个止损最多开 {_contracts_text(most, spec)}" if room_ok else "按这个止损，最小的数量也超了"
         raise Refused(
             f"这张单止损触发大约亏 {_amt(loss)} {settle}，占权益 {loss / equity * 100:.1f}%，"
-            f"超过了你设的单笔上限 {cap:g}%（TRADE_MAX_RISK_PCT）。{fits}；只写止损不写数量的话，我按单笔风险算数量。"
+            f"超过了你设的单笔上限 {cap:g}%（TRADE_MAX_RISK_PCT）。{fits}；只写止损不写数量的话，我按单笔风险算数量。",
+            reason="over_cap", fits=most if room_ok else None,
         )
 
     @staticmethod
@@ -2260,9 +2614,9 @@ class TradeDesk:
         if cmd.direction in ("long", "short"):
             pool = [p for p in pool if p.direction == cmd.direction]
         if not pool:
-            name = f"{cmd.inst_id} " if cmd.inst_id else ""
+            name = f" {cmd.inst_id} 的" if cmd.inst_id else ""
             side = f"{_side_word(cmd.direction)}单" if cmd.direction in ("long", "short") else "仓位"
-            raise Refused(f"没有找到 {name}的{side}，没有可以{what}的。发“仓位”可以看当前持仓。")
+            raise Refused(f"现在没有{name}{side}，没有可以{what}的。发“仓位”可以看当前持仓。", reason="no_position")
         if len(pool) > 1:
             names = "、".join(f"{p.inst_id} {_side_word(p.direction)}单" for p in pool)
             raise Refused(f"现在有 {len(pool)} 个仓位（{names}），请写明要{what}哪一个，例如：平仓 XAU，或 平多 XAU。")

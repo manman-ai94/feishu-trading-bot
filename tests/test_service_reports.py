@@ -304,3 +304,23 @@ def test_the_weekly_review_comes_with_the_weeks_track_record():
     record = [item for item in feishu.sent if item.title == "本周成绩单"]
     assert [item.target for item in record] == [OWNER, GROUP]  # with the review, wherever it went
     assert "最近 7 天" in record[0].body and "记录了 1 次带点位的分析" in record[0].body
+
+
+def test_an_open_or_an_addition_tells_how_to_have_the_position_watched_while_the_watch_is_off():
+    from bot.service import WATCH_HINT
+    from bot.watch import SETTING as WATCH_SETTING
+
+    reporter, feishu, _, okx, clock, journal = build()
+    okx.state = make_state([make_position(qty=3.0, avg_px=2655.0)])
+    clock.advance(30)
+    reporter.monitor.poll_once()
+    [to_owner] = feishu.to(OWNER)
+    [to_group] = feishu.to(GROUP)
+    assert to_owner.body.endswith(WATCH_HINT) and to_group.body.endswith(WATCH_HINT)
+    journal.set_setting(WATCH_SETTING, '{"hours": 1}')
+    okx.state = make_state([make_position(qty=4.0, avg_px=2655.0)])
+    clock.advance(30)
+    reporter.monitor.poll_once()
+    assert WATCH_HINT not in feishu.to(OWNER)[-1].body
+    reporter.notify_event(Event(kind="margin_warning", title="保证金率偏低", private_lines=("账户保证金率 250%",), warning=True))
+    assert WATCH_HINT not in feishu.to(OWNER)[-1].body

@@ -143,6 +143,9 @@ ADDED_COLUMNS = (
     ("calls", "confidence", "INTEGER"),
     ("orders", "source", "TEXT NOT NULL DEFAULT ''"),  # where an order came from: see trading.SOURCE_NAMES
     ("reviews", "source", "TEXT NOT NULL DEFAULT ''"),
+    ("alerts", "bar", "TEXT NOT NULL DEFAULT ''"),  # "" on a touch; "1H", "4H"…: on a candle's close
+    ("alerts", "action", "TEXT NOT NULL DEFAULT ''"),  # "" tells; "cancel" cancels orders; "recheck" looks again
+    ("alerts", "data", "TEXT NOT NULL DEFAULT ''"),  # what the action needs, as JSON
 )
 
 
@@ -475,13 +478,15 @@ class Journal:
     # ---------------------------------------------------------------- alerts
 
     def add_alert(
-        self, inst_id: str, direction: str, price: float, said: str = "", chat: str = "", ts: float | None = None
-    ) -> int:
-        """A price alert: `direction` is "below" or "above" `price`. Returns its number."""
+        self, inst_id: str, direction: str, price: float, said: str = "", chat: str = "", ts: float | None = None,
+        bar: str = "", action: str = "", data: str = "",
+    ) -> int:  # fmt: skip
+        """A price alert: `direction` is "below" or "above" `price`, or "at" with `price` a time (epoch
+        seconds). `bar` judges it on that candle's close; `action` does something instead of telling. Returns its number."""
         with self._lock:
             cursor = self._db.execute(
-                "INSERT INTO alerts (ts, inst_id, direction, price, said, chat) VALUES (?, ?, ?, ?, ?, ?)",
-                (int(ts or time.time()), inst_id, direction, float(price), said, chat),
+                "INSERT INTO alerts (ts, inst_id, direction, price, said, chat, bar, action, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(ts or time.time()), inst_id, direction, float(price), said, chat, bar, action, data),
             )
             self._db.commit()
             return int(cursor.lastrowid)

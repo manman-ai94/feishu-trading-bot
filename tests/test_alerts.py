@@ -21,6 +21,7 @@ class Market:
     def __init__(self):
         self.last = {XAU: 3850.0, BTC: 65000.0}
         self.candles_by_inst: dict[str, list[Candle]] = {}
+        self.bars: dict[tuple[str, str], list[Candle]] = {}  # candles of other lengths, for close alerts
         self.error: Exception | None = None
         self.reads = 0
 
@@ -31,9 +32,10 @@ class Market:
         return Ticker(inst_id, self.last[inst_id])
 
     def candles(self, inst_id, bar="1H", limit=200):
-        assert bar == "1m"
         if self.error:
             raise self.error
+        if bar != "1m":
+            return self.bars.get((inst_id, bar), [])[-limit:]
         return self.candles_by_inst.get(inst_id, [])[-limit:]
 
 
@@ -58,7 +60,8 @@ class Bench:
         self.sent: list[tuple[str, str]] = []
         self.send_error: Exception | None = None
         self.alerts = PriceAlerts(self.journal, self.market, Names(), lambda: XAU, lambda: shared, self.clock)
-        self.watcher = AlertWatcher(self.journal, self.market, self._send, self.clock)
+        self.jobs: list[dict] = []
+        self.watcher = AlertWatcher(self.journal, self.market, self._send, self.clock, act=self.jobs.append)
 
     def _send(self, title, markdown):
         if self.send_error:
@@ -235,3 +238,69 @@ def test_alerts_survive_a_restart():
     watcher = AlertWatcher(bench.journal, bench.market, bench._send, bench.clock)  # a new process, the same journal
     bench.market.last[XAU] = 3790.0
     assert watcher.check_once() == 1
+
+
+# ------------------------------------------------------------------ on a candle's close, no twins, jobs
+
+HOUR_MS = 3_600_000
+
+
+def test_a_close_alert_waits_for_the_candle_to_close_beyond_the_level():
+    bench = Bench()
+    bench.market.last[XAU] = 3590.0
+    bench.clock.advance(20 * 60)  # 20 minutes into the hour
+    reply = bench.say("1小时收盘回到3605下方提醒我")
+    assert reply.text.startswith("好，XAU 1小时收盘在 3,605 下方 时提醒你") and "按 1小时 K 线收盘价判断" in reply.text
+    [alert] = bench.journal.alerts()
+    assert (alert["bar"], alert["direction"], alert["price"]) == ("1H", "below", 3605.0)
+    hour = int(START * 1000)
+    bench.market.bars[(XAU, "1H")] = [Candle(hour - HOUR_MS, 3600, 3610, 3580, 3590), Candle(hour, 3590, 3600, 3585, 3592, confirmed=False)]
+    assert bench.watcher.check_once() == 0  # the candle that closed before it was set does not count; this one is still open
+    bench.market.bars[(XAU, "1H")] = [Candle(hour, 3590, 3612, 3585, 3608), Candle(hour + HOUR_MS, 3608, 3609, 3607, 3608, confirmed=False)]
+    bench.clock.advance(41 * 60)
+    assert bench.watcher.check_once() == 0  # closed at 3,608: above the level
+    bench.market.bars[(XAU, "1H")].append(Candle(hour + HOUR_MS, 3608, 3609, 3588, 3591))
+    bench.market.bars[(XAU, "1H")].pop(1)
+    bench.clock.advance(60 * 60)
+    assert bench.watcher.check_once() == 1
+    title, body = bench.sent[0]
+    assert title == "收盘提醒：XAU 1小时收盘在 3,605 下方" and "1小时 K 线收在 3,591" in body and "没有下任何单" in body
+
+
+@pytest.mark.parametrize(
+    "text, bar, direction, price",
+    [
+        ("4小时收在 3600 上方提醒我", "4H", "above", 3600.0),
+        ("1H收盘跌破3605提醒我", "1H", "below", 3605.0),
+        ("15分钟K线收盘站上 3620 通知我", "15m", "above", 3620.0),
+        ("XAU 1小时线收盘涨破 3900 提醒我", "1H", "above", 3900.0),
+    ],
+)
+def test_the_ways_to_name_a_candle_close(text, bar, direction, price):
+    bench = Bench()
+    bench.say(text)
+    [alert] = bench.journal.alerts()
+    assert (alert["bar"], alert["direction"], alert["price"]) == (bar, direction, price)
+
+
+def test_the_same_alert_is_not_set_twice():
+    bench = Bench()
+    bench.say("跌破 3800 提醒我")
+    reply = bench.say("黄金跌破3800提醒我")
+    assert reply.text == "#1 XAU 跌破 3,800 已经设过了，不再重复设。" and len(bench.journal.alerts()) == 1
+    assert "好，" in bench.say("1小时收盘跌破 3800 提醒我").text  # on a close it is another alert
+    assert len(bench.journal.alerts()) == 2
+
+
+def test_a_job_runs_once_when_its_time_or_price_comes_and_shows_in_the_list():
+    bench = Bench()
+    bench.journal.add_alert(XAU, "at", START + 600, said="XAU 3,588 那张挂单", ts=START, action="cancel", data="{}")
+    bench.journal.add_alert(XAU, "below", 3800.0, said="XAU 3,588 那张挂单", ts=START, action="cancel", data="{}")
+    listing = bench.say("提醒").text
+    assert "#1 到 " in listing and "撤单：XAU 3,588 那张挂单" in listing and "#2 XAU 跌破 3,800 撤单：" in listing
+    assert bench.watcher.check_once() == 0
+    bench.clock.advance(600)
+    assert bench.watcher.check_once() == 1 and [job["id"] for job in bench.jobs] == [1]
+    bench.market.last[XAU] = 3799.0
+    assert bench.watcher.check_once() == 1 and [job["id"] for job in bench.jobs] == [1, 2]
+    assert bench.watcher.check_once() == 0 and bench.sent == []  # a job tells through its own runner

@@ -46,6 +46,7 @@ from .market import build_market_context, quote_line
 from .okx_client import OkxError, OkxNetworkError
 from .reports import DISCLAIMER, status_markdown
 from .service import Reporter
+from .times import BEIJING, LOS_ANGELES, both, now_text, set_zone, zone_of
 from .track import scorecard_markdown
 from .watch import PositionWatch, model_name
 
@@ -55,13 +56,17 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 
 - 直接问行情，例如“BTC 现在怎么看”“黄金今晚有什么数据”。OKX 上的品种我都能查实时行情，也会联网查新闻和经济数据
 - 发“BTC 报价”，马上回最新价（不经过 AI，几秒就回）
-- 发“仓位”，看当前持仓
+- 发“仓位”，看当前持仓（没持仓时写最近一笔平仓赚了多少）
+- 问“现在几点”“1小时K线几点收盘”，马上回洛杉矶和北京时间（不经过 AI）
 - 发 /whoami，查看你的飞书 ID
 
 主人专用：
 - 下单、平仓、撤单、设止盈止损：私聊里，或者在登记的群里 @我。每条指令我先回预览，你回复确认码才执行。发“交易帮助”看写法
 - 发“算仓位 XAU 止损 3768”：按你定的单笔风险算最多开多大，只算数不下单
-- 价格提醒：发“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了我马上告诉你（只提醒，不下单）。发“提醒”看已设的，“取消提醒 编号”取消
+- 价格提醒：发“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了我马上告诉你（只提醒，不下单）；要按收盘算，发“1小时收盘跌破 3605 提醒我”（15 分钟、30 分钟、1 小时、4 小时）。发“提醒”看已设的，“取消提醒 编号”取消
+- 定时撤单：“周五 13:30 撤单 XAU”“30分钟后撤单 XAU”“跌破 3530 撤单 XAU 3588”，设的时候回一次确认码，到时我自己撤
+- 发“15 分钟后再看一下”，到时我再看一次行情和仓位，回在这里（最长 4 小时）
+- 发“我用北京时间”，跟你说时间时北京时间写在前面
 - 定时盯仓：发“每 4 小时盯一下仓位”（几小时你定），持仓期间按时发卡片：离止损止盈多远、浮动盈亏、几句点评，只看不动。发“盯仓”看设置，“停止盯仓”关掉
 - 发“记个诉求：……”，把想让我做到的事记下来；我做不到的事也会自动记。发“诉求清单”看记了什么，发“诉求 3 做好了”或“诉求 3 不做了”标掉一条
 - 问题前面加“深度”，我会多查几轮、分析得更细
@@ -84,6 +89,9 @@ ORDER_WORDS = (
     "止损", "止盈", "平仓", "平掉", "平一半", "减仓", "加仓", "开仓", "做多", "做空", "开多", "开空", "平多", "平空",
     "撤单", "撤掉", "挂上", "挂单", "挂个", "挂一张", "挂一单", "开单", "清仓", "下单", "按你说的", "照你说的", "按刚才",
     "按计划", "照计划", "按照", "照着", "sl", "tp",
+    # "帮我设置": after the AI gave the line to send, he asks for it to be done, not to copy it out himself
+    "帮我设", "帮我挂", "帮我改", "帮我调", "帮我下", "帮我开", "帮我平", "帮我撤", "帮我执行", "帮我弄", "帮我做",
+    "给我设", "给我挂", "给我做", "给我改", "给我调", "就按这个", "按这个来", "按这个做", "照这个", "就这么办", "执行吧",
 )  # fmt: skip  # "按照这个计划开单": the AI's rewrite takes the prices from the earlier answer
 # Words of someone still talking a plan over, not asking for it to be done: "把把握提到 60%，要确保单子挂上".
 DISCUSS_WORDS = (
@@ -91,6 +99,27 @@ DISCUSS_WORDS = (
     "别下",
 )  # fmt: skip
 ORDER_WORDS_MAX_CHARS = 80
+# A follow-up of a few words on the answer before: the cheaper MODEL_SHORT rewrites or explains it.
+SHORT_FOLLOW_UPS = (
+    "简单说", "简单点", "说简单点", "简单一点", "简单说说", "说重点", "重点", "然后呢", "还有呢", "继续", "接着说",
+    "具体点", "具体一点", "详细点", "展开说说", "为什么", "为啥", "什么意思", "啥意思", "没懂", "没看懂", "再说一遍",
+    "翻译一下", "用英文说",
+)  # fmt: skip
+RECHECK_MAX_MINUTES = 240
+_RECHECK = re.compile(
+    r"(?:过\s*(半|\d+(?:\.\d+)?)\s*(?:个)?\s*(分钟|小时|钟头)(?:以后|之后|后)?|(半|(?<![\d.])\d+(?:\.\d+)?)\s*(?:个)?\s*(分钟|小时|钟头)\s*(?:以后|之后|后))"
+    r"\s*(?:你|再|给我|帮我|跟我|回头)*\s*(?:看|复查|答复|回复|回我|告诉我|说|分析|检查|盯)"
+)
+RECHECK_QUESTION = "过了一会儿，再看一次现在的行情和仓位：和上一次比有什么变化，原来的判断还成不成立，有没有要留意的。"
+_ZONE_PREF = re.compile(r"^(?:我|以后|以后我|我以后)?(?:都|就)?(?:用|按|看|习惯)(北京|洛杉矶|美西)时间(?:吧|就行|就好|为准)?$")
+_TIME_QUESTION = re.compile(
+    r"^(?:现在|当前|目前)?(?:北京时间|洛杉矶时间|美西时间|北京|洛杉矶)?(?:现在|这会儿)?(?:是)?(?:几点了?|几点钟|什么时间|啥时间|几号)(?:了)?$"
+)
+_BAR_CLOSE_QUESTION = re.compile(
+    r"(?:(15|30)\s*(?:分钟|min|m)|([14])\s*(?:个)?\s*(?:小时|h))\s*(?:k\s*线|线)?\s*(?:几点|什么时候|啥时候|还有多久|多久)\s*(?:收盘|收线|收)|"
+    r"(?:(15|30)\s*(?:分钟|min|m)|([14])\s*(?:个)?\s*(?:小时|h))\s*(?:k\s*线|线)?\s*(?:收盘|收线)\s*(?:是|在)?\s*(?:几点|什么时候|啥时候|还有多久)",
+    re.I,
+)
 COMMAND_HISTORY_TURNS = 3  # earlier answers the AI may take an order's prices from
 
 HELLO_TEXT = "在。直接问就行，例如“黄金现在怎么看”；发“帮助”可以看我能做什么。"
@@ -309,6 +338,12 @@ class Router:
             self._feishu.reply_text(message.message_id, "我目前只看得懂文字消息。发“帮助”可以看我能做什么。")
             return
 
+        told = self._time_answer(text, message.sender_open_id)
+        if told:
+            self._feishu.reply_text(message.message_id, told)
+            self._remember_fixed(message.chat_id, text, "", told)
+            return
+
         quoted = self._quote_instruments(text)
         if quoted:
             self._reply_quote(message, text, quoted)
@@ -352,13 +387,100 @@ class Router:
             self._record_wish(message, wishes.wish_body(text))
         elif _note_body(text) is not None:
             self._learn(message, _note_body(text))
-        elif not self._watch_command(message, text):  # "每 4 小时盯一下仓位" handles itself when it is one
+        elif _ZONE_PREF.match(text.strip(" 。.!！~")):
+            self._zone_command(message, text)
+        elif not self._watch_command(message, text) and not self._recheck_command(message, text):
             # Before the orders: "跌破 3800 提醒我平仓" asks to be told, never for a close.
             alert = self._alerts.handle(text, message.chat_id) if self._alerts is not None else None
             if alert is None:
                 return self._trade_command(message, text)
             self._reply_alert(message, text, alert)
         return True
+
+    def _zone_command(self, message: IncomingMessage, text: str) -> None:
+        """ "我用北京时间": times are written to him in that zone first."""
+        key = "Asia/Shanghai" if "北京" in text else "America/Los_Angeles"
+        word = "北京时间" if key == "Asia/Shanghai" else "洛杉矶时间"
+        other = "洛杉矶时间" if key == "Asia/Shanghai" else "北京时间"
+        if self._journal is None:
+            reply = "现在记不住这个设置（没有数据库）。"
+        else:
+            set_zone(self._journal, message.sender_open_id, key)
+            reply = f"好，以后跟你说时间先写{word}，后面带上{other}。定时撤单不写哪里的时间时，也按{word}算。"
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember_fixed(message.chat_id, text, "", reply)
+
+    def _zone(self, open_id: str):
+        return zone_of(self._journal, open_id) if self._journal is not None else None
+
+    def _time_answer(self, text: str, open_id: str) -> str:
+        """ "现在几点", "北京时间几点", "1小时K线几点收盘": answered by the program, never the AI."""
+        plain = re.sub(r"[\s?？,，。.!！吗呀啊呢]", "", text)
+        if len(plain) > 20:
+            return ""
+        now = self._clock()
+        first = self._zone(open_id)
+        if "北京" in plain:
+            first = BEIJING
+        elif "洛杉矶" in plain or "美西" in plain:
+            first = LOS_ANGELES
+        if _TIME_QUESTION.match(plain):
+            return f"现在是 {now_text(now, self._cfg.tz, first)}。"
+        found = _BAR_CLOSE_QUESTION.search(plain)
+        if not found:
+            return ""
+        minutes = found.group(1) or found.group(3)
+        hours = found.group(2) or found.group(4)
+        length = int(minutes) * 60 if minutes else int(hours) * 3600
+        name = f"{minutes} 分钟" if minutes else f"{hours} 小时"
+        ends = (int(now) // length + 1) * length  # OKX's candles up to 4 hours start on the hour, in UTC
+        left = int(ends - now)
+        gap = f"{left // 3600} 小时 {left % 3600 // 60} 分钟" if left >= 3600 else f"{max(1, left // 60)} 分钟"
+        return f"这根 {name} K 线 {both(ends, self._cfg.tz, '%H:%M', first=first)}收盘，还有 {gap}。"
+
+    def _recheck_command(self, message: IncomingMessage, text: str) -> bool:
+        """ "15 分钟后再看一下": one more look later, answered where he asked. Kept in the alert table, so a
+        restart forgets nothing; "取消提醒 编号" drops it."""
+        found = _RECHECK.search(text)
+        if found is None or self._journal is None:
+            return False
+        amount = found.group(1) or found.group(3)
+        unit = found.group(2) or found.group(4)
+        minutes = (0.5 if amount == "半" else float(amount)) * (1 if unit == "分钟" else 60)
+        if not 1 <= minutes <= RECHECK_MAX_MINUTES:
+            reply = "过一会儿再看一次，最长 4 小时。要持仓期间一直盯着，发“每 1 小时盯一下仓位”。"
+            self._feishu.reply_text(message.message_id, reply)
+            return True
+        question = (text[: found.start()] + text[found.end() :]).strip(" ，,。.!！一下吧")
+        now = self._clock()
+        due = now + minutes * 60
+        data = {"message_id": message.message_id, "chat_type": message.chat_type, "sender": message.sender_open_id,
+                "question": question, "minutes": minutes}  # fmt: skip
+        inst = self._cfg.watch_instruments[0] if self._cfg.watch_instruments else ""
+        job = self._journal.add_alert(
+            inst, "at", due, said=question or "再看一次行情和仓位", chat=message.chat_id, ts=now, action="recheck",
+            data=json.dumps(data, ensure_ascii=False),
+        )  # fmt: skip
+        reply = f"好，到 {both(due, self._cfg.tz, '%H:%M', first=self._zone(message.sender_open_id))}，我再看一次，结果回在这里。不用了就发“取消提醒 {job}”。"
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember_fixed(message.chat_id, text, "", reply)
+        return True
+
+    def recheck(self, job: dict) -> None:
+        """A second look that is due: the question asked (or a fresh look at the market and the positions),
+        answered as a reply to the message that asked for it."""
+        try:
+            data = json.loads(job.get("data") or "{}")
+        except ValueError:
+            data = {}
+        sender = data.get("sender", "")
+        if not data.get("message_id") or not self._cfg.is_owner(sender):
+            log.info("a second look was due, but whoever asked for it is no longer an owner")
+            return
+        message = IncomingMessage(data["message_id"], job.get("chat") or "", data.get("chat_type", "p2p"), sender, "")
+        minutes = data.get("minutes") or 0
+        asked = data.get("question") or RECHECK_QUESTION
+        self._reply_analysis(message, f"（{minutes:g} 分钟前他让你过一会儿再看一次，现在到时间了）{asked}", True)
 
     def _watch_command(self, message: IncomingMessage, text: str) -> bool:
         """ "每 4 小时盯一下仓位", "停止盯仓", "盯仓". False when the message is none of them."""
@@ -933,7 +1055,10 @@ class Router:
             return
         risk = self._reporter.risk(state) if with_account else None
         exposure = self._reporter.exposure_lines(state) if with_account else None
-        body = status_markdown(state, self._reporter.day_change(state), private=with_account, risk=risk, exposure=exposure)
+        last_close = self._reporter.last_close_lines() if with_account and not state.positions else None
+        body = status_markdown(
+            state, self._reporter.day_change(state), private=with_account, risk=risk, exposure=exposure, last_close=last_close
+        )
         # The owner's own numbers need no disclaimer; a friend looking at his stops may take them as a signal.
         asked_by_owner = self._cfg.is_owner(message.sender_open_id)
         footer = None if message.is_private or asked_by_owner else DISCLAIMER
@@ -967,9 +1092,12 @@ class Router:
             market = self._market_text(named)
 
             account = self._reporter.account_for_ai() if self._shows_account(message) else None
+            history = self._recent(message.chat_id)
+            short = not deep and bool(history) and _short_follow_up(text)
             try:
                 answer = self._analyst.answer(
-                    text, market, account, in_group=in_group, deep=deep, history=self._recent(message.chat_id)
+                    text, market, account, in_group=in_group, deep=deep, history=history, short=short,
+                    notes=self._notes(message, account is not None),
                 )
             except AnalystUnavailable as exc:
                 self._feishu.reply_text(message.message_id, str(exc))
@@ -993,6 +1121,20 @@ class Router:
             title = "深度分析" + (f" · {'、'.join(named)}" if named else "")
         # Without a title of its own the answer goes without a header: "行情分析" on a reply about R multiples misleads.
         self._feishu.reply_markdown(message.message_id, title, body, "indigo", footer=footer)
+
+    def _notes(self, message: IncomingMessage, with_account: bool) -> list[str]:
+        """What the program knows that the AI cannot see: the zone the asker reads, the watch being off."""
+        notes = []
+        if self._zone(message.sender_open_id) is BEIJING or getattr(self._zone(message.sender_open_id), "key", "") == "Asia/Shanghai":
+            notes.append("提问的人习惯用北京时间，写时刻时北京时间写在前面。")
+        if with_account and self._watch is not None:
+            try:
+                state = self._reporter.current_state()
+                if state is not None and state.positions and self._watch.watching() is None:
+                    notes.append("定时盯仓现在没开。")
+            except Exception:
+                log.exception("could not tell whether the position watch is on")
+        return notes
 
     def _show_working(self, message: IncomingMessage, deep: bool = False, slow_text: str = "") -> Callable[[], None]:
         """Shows that an answer is on its way, and returns what to call when it is there.
@@ -1165,6 +1307,12 @@ ASKING_WORDS = (
     "?", "？", "吗", "呢", "要不要", "有没有", "是不是", "能不能", "该不该", "可不可以", "还是",
     "怎么", "为啥", "哪", "风险", "必要", "确认", "判断", "分析", "建议", "看法",
 )
+
+
+def _short_follow_up(text: str) -> bool:
+    """ "简单说", "为什么？": a few words that only make sense against the answer before."""
+    plain = re.sub(r"[\s?？,，。.!！~吗呀啊呢吧]", "", text.lower())
+    return 0 < len(plain) <= 8 and plain in SHORT_FOLLOW_UPS
 
 
 def _asks_something(text: str) -> bool:
