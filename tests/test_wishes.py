@@ -107,6 +107,8 @@ def test_marked_requests_and_the_card_of_the_version_that_did_them():
     releases.told(journal, "0.18.1")
     assert "移动止损" in releases.news_text(journal, "9.9.9")  # and 0.19.0
     releases.told(journal, "0.19.0")
+    assert "MT5" in releases.news_text(journal, "9.9.9")  # and 0.20.0
+    releases.told(journal, "0.20.0")
     assert releases.news_text(journal, "9.9.9") == ""  # a version with no notes and nothing done says nothing
 
 

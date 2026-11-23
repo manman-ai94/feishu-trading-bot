@@ -648,17 +648,18 @@ class Monitor:
     def _on_failure(self, exc: Exception) -> None:
         self._failures += 1
         self.last_error = str(exc)
-        log.warning("OKX read failed (%d in a row): %s", self._failures, exc)
+        log.warning("%s read failed (%d in a row): %s", self._cfg.broker_name, self._failures, exc)
         if self._failures == FAILURES_BEFORE_ALERT and not self._down_reported:
             self._down_reported = True
             self._safe_notify(
                 Event(
                     kind="okx_down",
-                    title="读不到 OKX 账户",
+                    title=f"读不到 {self._cfg.broker_name} 账户",
                     private_lines=(
                         f"已连续 {self._failures} 次读取失败，监控暂时停摆。",
                         f"原因：{exc}",
-                        "如果提示 IP 不在白名单或 key 无效，请检查 OKX 里这把 key 的设置。",
+                        "MT5 要在服务器上开着并登录账户；远程桌面用完请直接关窗口，不要注销。"
+                        if self._cfg.mt5 else "如果提示 IP 不在白名单或 key 无效，请检查 OKX 里这把 key 的设置。",
                     ),
                     warning=True,
                 )
@@ -666,7 +667,7 @@ class Monitor:
 
     def _on_success(self) -> None:
         if self._down_reported:
-            self._safe_notify(Event(kind="okx_recovered", title="OKX 账户读取已恢复", private_lines=("监控恢复正常。",)))
+            self._safe_notify(Event(kind="okx_recovered", title=f"{self._cfg.broker_name} 账户读取已恢复", private_lines=("监控恢复正常。",)))
         self._failures = 0
         self._down_reported = False
         self.last_error = ""

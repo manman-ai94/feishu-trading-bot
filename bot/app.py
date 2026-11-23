@@ -26,6 +26,7 @@ from .instruments import InstrumentResolver
 from .journal import Journal
 from .knowledge import KnowledgeBase
 from .monitor import Monitor
+from .mt5_client import Mt5Client, Mt5Link, Mt5TradeClient
 from .okx_client import OkxClient, OkxError, OkxNetworkError
 from .okx_trade import OkxTradeClient
 from .router import Router
@@ -82,17 +83,33 @@ def setup_logging(cfg: Config) -> None:
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
-def build_okx(cfg: Config) -> OkxClient:
+MT5_CONNECT_MS = 20_000  # how long the MT5 package waits for the terminal
+
+
+def build_okx(cfg: Config) -> OkxClient | Mt5Client:
+    """The client the bot reads the account and the market with. BROKER=mt5: the MT5 account, and
+    OKX's public data for what the broker does not carry."""
+    if cfg.mt5:
+        market = OkxClient(base_url=cfg.okx_base_url)
+        return Mt5Client(market, Mt5Link(cfg.mt5_path, connect_ms=MT5_CONNECT_MS), dict(cfg.mt5_symbols))
     return OkxClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, cfg.okx_demo)
 
 
-def build_trader(cfg: Config) -> OkxTradeClient | None:
+def build_trader(cfg: Config, reader=None) -> OkxTradeClient | Mt5TradeClient | None:
     """The client that can place orders. None unless the owner switched trading on in .env.
 
     TRADING=demo sends orders to OKX demo trading: with the demo keys when they
     are filled in, otherwise with the main keys (which are demo keys when
     OKX_DEMO=true). TRADING=live uses the main keys on the real account.
+    BROKER=mt5: the account the MT5 terminal is logged in to, which must be a
+    real one for TRADING=live and a demo one for TRADING=demo.
     """
+    if cfg.mt5:
+        if not cfg.trading_on or not isinstance(reader, Mt5Client):
+            return None
+        return Mt5TradeClient(
+            reader.market, reader.link, dict(cfg.mt5_symbols), real=cfg.trading == "live", slippage_pct=cfg.trade_slippage_pct
+        )
     if cfg.trading == "live":
         trader = OkxTradeClient(cfg.okx_api_key, cfg.okx_secret_key, cfg.okx_passphrase, cfg.okx_base_url, demo=False)
     elif cfg.trading == "demo" and cfg.has_okx_demo_keys:
@@ -110,7 +127,7 @@ def build_trader(cfg: Config) -> OkxTradeClient | None:
 def build_demo_trader(cfg: Config) -> OkxTradeClient | None:
     """While trading live, a client on OKX demo trading with the demo keys, so that the rehearsal
     (模拟盘自测) can run without switching the bot off the real account. None otherwise."""
-    if cfg.trading != "live" or not cfg.has_okx_demo_keys:
+    if cfg.trading != "live" or not cfg.has_okx_demo_keys or cfg.mt5:
         return None
     trader = OkxTradeClient(cfg.okx_demo_api_key, cfg.okx_demo_secret_key, cfg.okx_demo_passphrase, cfg.okx_base_url, demo=True)
     trader.trigger_px_type = cfg.trade_stop_trigger
@@ -125,7 +142,7 @@ def build_trade_desk(cfg: Config, journal: Journal, okx: OkxClient, resolver: In
         state = reporter.current_state() if reporter is not None else None
         return reporter.day_change(state) if state is not None else None
 
-    return TradeDesk(cfg, journal, okx, build_trader(cfg), resolver, day_change=day_change, demo_trader=build_demo_trader(cfg))
+    return TradeDesk(cfg, journal, okx, build_trader(cfg, okx), resolver, day_change=day_change, demo_trader=build_demo_trader(cfg))
 
 
 def build_crowd(cfg: Config, okx: OkxClient) -> Crowd | None:
@@ -197,6 +214,9 @@ def feedback_text(cfg: Config, journal: Journal, now: float, with_account: bool)
 def start_stream(cfg: Config, monitor: Monitor, stop: threading.Event) -> Streams | None:
     """OKX's private WebSockets, which wake the monitor the moment something changes. The regular
     poll carries on regardless; without them an alert simply waits for the next tick."""
+    if cfg.mt5:
+        log.info("mt5: no push stream; the account is read every %d seconds", cfg.poll_seconds)
+        return None
     if not cfg.okx_stream:
         log.info("okx stream: off (OKX_STREAM=false); positions are read every %d seconds", cfg.poll_seconds)
         return None
@@ -300,13 +320,15 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     )  # fmt: skip
 
     stop = threading.Event()
-    if cfg.has_okx_keys:
+    if cfg.has_account:
         monitor.poll_once()  # first read, so the start-up message has the positions
         threading.Thread(target=monitor.run_forever, args=(stop,), name="monitor", daemon=True).start()
         stream = start_stream(cfg, monitor, stop)
         desk.stream_status = stream.status if stream is not None else (lambda: f"没开，每 {cfg.poll_seconds} 秒读一次账户")
     else:
         log.warning("no OKX keys configured: position monitoring is off")
+    if cfg.mt5:
+        log.info("broker: MT5 (%s), OKX for public market data only", ", ".join(f"{b}={s}" for b, s in cfg.mt5_symbols))
 
     scheduler = Scheduler(
         cfg,
@@ -331,13 +353,13 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     watcher = AlertWatcher(journal, okx, reporter.send_alert, tz=cfg.tz, act=run_job)
     threading.Thread(target=watcher.run_forever, args=(stop,), name="alerts", daemon=True).start()
     log.info("price alerts: %d active", len(journal.alerts("active")))
-    if cfg.has_okx_keys:
+    if cfg.has_account:
         threading.Thread(target=trail.run_forever, args=(stop,), name="trail", daemon=True).start()
-    if cfg.has_okx_keys:
+    if cfg.has_account:
         threading.Thread(target=watch.run_forever, args=(stop,), name="watch", daemon=True).start()
         watching = watch.watching()
         log.info("position watch: %s", f"every {watching.hours:g} hour(s)" if watching else "off")
-    if cfg.has_okx_keys:
+    if cfg.has_account:
         release_watcher = ReleaseWatcher(
             journal, okx, reporter.current_state, reporter.send_alert, cfg.tz,
             note_wish=lambda text: wishes.record(journal, text, "auto", "", time.time()),
@@ -348,8 +370,9 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         threading.Thread(target=scorer.run_forever, args=(stop,), name="track", daemon=True).start()
 
     health = Health(journal, lambda: threading.Timer(RESTART_DELAY_SECONDS, _exit_for_restart).start())
-    if cfg.has_okx_keys:
-        health.watch("monitor", going_round(lambda: monitor.cycles), limit=3 * cfg.poll_seconds)
+    if cfg.has_account:
+        # MT5: a read waits up to MT5_CONNECT_MS for the terminal, which must not count as the monitor stuck.
+        health.watch("monitor", going_round(lambda: monitor.cycles), limit=max(3 * cfg.poll_seconds, 90 if cfg.mt5 else 0))
     health.watch("feishu", feishu.connected)
     upkeep = Upkeep(cfg, journal, health=health)
     downtime = upkeep.downtime()  # read before this run's first heartbeat overwrites it

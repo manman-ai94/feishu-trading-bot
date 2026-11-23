@@ -4,3 +4,4 @@ anthropic==2.8.0
 python-dotenv==1.2.4
 requests==2.34.2
 tzdata==2026.6
+MetaTrader5==5.0.6231; sys_platform == "win32"  # BROKER=mt5: talks to the MT5 terminal on the same Windows machine

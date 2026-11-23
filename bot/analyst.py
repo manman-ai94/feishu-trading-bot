@@ -77,6 +77,7 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 - 持仓期间他又问“现在怎么说”“要不要调整”这类话，而消息里写着定时盯仓没开时，在最后用一句话提一下：可以发“每 1 小时盯一下仓位”让程序按时看，或者发“15 分钟后再看一下”让你过一会儿再看一次。同一段对话里提过一次就不要再提。
 - 他只是说了一句话、表个态（例如“我去跟 Claude 商量”“好的”），一句话回应就够了，不要再把数字列一遍。
 - 让你看或分析他的仓位和挂单：逐张说清楚它挂在哪里、离现价多远、对着的是哪个关键位，成交后仓位多大、打到止损亏多少占权益多少，和已有仓位叠在一起是什么风险。直接点出挂得好的和有问题的（例如挂在支撑正下方、止损和他的规则对不上、同方向重复挂、止盈止损和委托互相打架），给出你从数据里看到的价位作参考，改不改由他定。
+- 止盈只能在开仓价赚钱的一边：多单在开仓价上方，空单在开仓价下方。挂在亏钱一边的不是止盈，是提前止损：就这样叫它，并写出打到时亏多少。不要先这样建议、复盘时又批评它；计划、建议和复盘用同一个标准。
 - 问某个品种“怎么看”，才写完整一点的判断。也只写今天真正要紧的两三件事：方向和最主要的依据、最关键的一两个价位、值得做计划的那一种情景（触发位、目标位、失效位，先用 check_setup 过清单，不达标就写观望和差哪条）。只有一边值得做计划就只写一边；没有新东西的部分不写。
 不管是哪一种，这几条不变：
 - 价位写精确数字，并说明依据，例如 4H 前高、日线 EMA50、昨天的低点。
@@ -160,6 +161,15 @@ COMMAND_SYSTEM = """交易员在飞书里给交易机器人发了一句话。机
 
 SMALL_TALK_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的行情分析助手。对方只是打了个招呼、道了声谢、寒暄了一句，或者告诉你一声、表了个态。像熟悉的同事那样用一句自然的中文回应，不超过 30 个字。不要介绍你的功能，不要主动讲行情，不要复述数字，不要用表情符号，也不要连着反问。"""
 
+# With BROKER=mt5: added to the analyst's instructions, and the order wording counts in lots.
+MT5_NOTE = """
+
+现在的账户在 EC Markets 的 MT5 上（交易员自己的实盘账户）：账户、持仓、挂单、成交记录，以及黄金（XAU；程序里叫 XAU-USD-SWAP，就是 MT5 的 XAUUSD）的报价和 K 线都来自 MT5。数量按 MT5 的手数算，黄金 1 手 = 100 盎司。MT5 的止损止盈按买卖价触发（多单看卖价 bid，空单看买价 ask），中间隔着点差。其他品种的行情和大户多空比仍是 OKX 的公开数据。上面说到 OKX 账户、在 OKX 里操作、下到 OKX 的地方，现在都指 MT5。"""
+MT5_COMMAND_WORDING = (
+    ("做多 XAU 100张、做空 XAU 0.5个、做多 XAU 500U（数量一定带单位：张、个、U。他说“手”时，黄金 1 手 = 1 个，写成“个”）",
+     "做多 XAU 0.1手、做空 XAU 5个、做多 XAU 5000U（数量一定带单位：手、个、U。“手”是 MT5 的手数，黄金 1 手 = 100 盎司；“个”是盎司。不要写“张”）"),
+    ("XAU 100张", "XAU 0.1手"),
+)  # fmt: skip
 INTENTS = ("status", "hello", "help", "analysis")
 WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 
@@ -450,8 +460,25 @@ class Analyst:
             except Exception:
                 log.exception("could not record AI usage")
 
+    @property
+    def _market_label(self) -> str:
+        return "实时行情数据（黄金来自 MT5，其他来自 OKX）" if getattr(self._cfg, "mt5", False) else "OKX 实时行情数据"
+
+    def _for_broker(self, system: str) -> str:
+        """With BROKER=mt5 the instructions say where the account is, and order wording counts in lots."""
+        if not getattr(self._cfg, "mt5", False):
+            return system
+        if system == COMMAND_SYSTEM:
+            for old, new in MT5_COMMAND_WORDING:
+                system = system.replace(old, new)
+            return system
+        if system.startswith("你是“交易助手”"):
+            return system + MT5_NOTE
+        return system
+
     def _converse(self, tier: Tier, system: str, messages: list[dict], usage: Usage, account: bool = False):
         """Sends the conversation, runs the tools the AI asks for, and returns its final message."""
+        system = self._for_broker(system)
         toolbox = self._toolbox if tier.tools else None
         if toolbox is None:
             message = self._send(
@@ -607,7 +634,7 @@ class Analyst:
         `notes`: what the program knows about the asker and the moment (his time zone, the watch being off)."""
         parts = [self._now_line(), *(notes or [])]
         if market_text:
-            parts.append(f"OKX 实时行情数据：\n{market_text}")
+            parts.append(f"{self._market_label}：\n{market_text}")
         if in_group and account_text:
             parts.append(
                 "（背景：这是交易员和朋友的群，他的账户和持仓可以在群里谈；群里其他人只是旁观，不要针对他们个人给建议。）\n"
@@ -666,7 +693,7 @@ class Analyst:
                 "开头用一句话说今天最值得记住的事，然后写：今天的走势和波动、关键点位有没有被突破、驱动行情的消息，"
                 "以及接下来需要观察什么。写法跟着当天的行情走，平淡的一天就写得短。保持简短。"
             )
-        parts = [self._now_line(), f"OKX 实时行情数据：\n{market_text}"]
+        parts = [self._now_line(), f"{self._market_label}：\n{market_text}"]
         if plan_note:
             parts.append(plan_note + "简报里的情景要和今天的计划方向一致，先用 check_setup 过清单；不达标的不写。")
         if for_owner:
@@ -704,7 +731,7 @@ class Analyst:
         task += "结尾加一行“本周英语”：给一句和复盘有关的地道英文交易用语，并附中文意思。"
         parts = [
             self._now_line(),
-            f"OKX 实时行情数据：\n{market_text}",
+            f"{self._market_label}：\n{market_text}",
             f"本周权益变化：\n{equity_text}",
         ]
         if week_figures:
@@ -733,7 +760,7 @@ class Analyst:
     ) -> tuple[str, tuple]:
         """The trading day's plan: the text for the card, and what the program reads from it (discipline.py).
         Written on MODEL_DAILY with the tools; `earlier`: the plan it replaces, when it is made again."""
-        parts = [self._now_line(), f"OKX 实时行情数据：\n{market_text}"]
+        parts = [self._now_line(), f"{self._market_label}：\n{market_text}"]
         if account_text:
             parts.append(f"交易员当前的账户和持仓：\n{account_text}")
         feedback = self._feedback_text(account_text is not None)

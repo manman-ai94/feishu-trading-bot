@@ -10,7 +10,7 @@ from bot.__main__ import main
 from bot.config import load_config, parse_weekly
 from bot.okx_client import OkxNetworkError
 
-PREFIXES = ("FEISHU_", "OKX_", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING", "TRACK_", "HEARTBEAT_", "BACKUP_")
+PREFIXES = ("FEISHU_", "OKX_", "MT5_", "BROKER", "MODEL_", "EFFORT_", "ALERT_", "BRIEF_", "GROUP_", "TRADE_", "TRADING", "TRACK_", "HEARTBEAT_", "BACKUP_")
 NAMES = (
     "OWNER_OPEN_ID", "CO_OWNER_OPEN_IDS", "WATCH_INSTRUMENTS", "ANTHROPIC_API_KEY", "TIMEZONE", "POLL_SECONDS", "SNAPSHOT_MINUTES",
     "WEEKLY_REVIEW", "DB_PATH", "LOG_DIR", "WEB_SEARCH", "AI_MONTHLY_BUDGET_USD", "KNOWLEDGE_DIR", "MODEL_SHORT", "EFFORT_SHORT",
@@ -489,3 +489,25 @@ def test_co_owners_are_read_from_the_file(tmp_path):
     os.environ.pop("CO_OWNER_OPEN_IDS", None)  # loading put it in the environment
     cfg, _ = load_config(write_env(tmp_path, "OWNER_OPEN_ID=ou_1\nCO_OWNER_OPEN_IDS=\n"))
     assert cfg.co_owner_open_ids == () and not cfg.is_owner("")
+
+
+def test_on_mt5_gold_is_named_for_the_broker_and_no_okx_key_is_needed(tmp_path):
+    path = write_env(
+        tmp_path,
+        "BROKER=mt5\nTRADING=live\nWATCH_INSTRUMENTS=XAU-USDT-SWAP,BTC-USDT-SWAP\nTRADE_INSTRUMENTS=XAU-USDT-SWAP\n"
+        "MT5_SYMBOLS=XAU=XAUUSD.r\n",
+    )
+    cfg, problems = load_config(path)
+    assert cfg.mt5 and cfg.broker_name == "MT5" and cfg.has_account
+    assert cfg.watch_instruments == ("XAU-USD-SWAP", "BTC-USDT-SWAP") and cfg.tradable_instruments == ("XAU-USD-SWAP",)
+    assert cfg.mt5_symbols == (("XAU", "XAUUSD.r"),)
+    assert cfg.trading == "live" and not cfg.trading_blocked  # the terminal's account is checked at each order
+    assert cfg.poll_seconds == 10  # no push stream on MT5: read more often
+    assert not any("OKX_API_KEY" in problem for problem in problems)
+
+
+def test_mistakes_in_the_broker_settings_are_explained(tmp_path):
+    cfg, problems = load_config(write_env(tmp_path, "BROKER=ecmarkets\nMT5_SYMBOLS=XAUUSD\n"))
+    assert cfg.broker == "okx" and any("BROKER" in problem for problem in problems)
+    assert cfg.mt5_symbols == (("XAU", "XAUUSD"),) and any("MT5_SYMBOLS" in problem for problem in problems)
+    assert (cfg.trade_fee_pct, cfg.trade_slippage_pct, cfg.mt5_commission_per_lot) == (0.05, 0.02, 0.0)

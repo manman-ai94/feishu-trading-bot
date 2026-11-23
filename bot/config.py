@@ -30,6 +30,7 @@ TRADING_MODES = ("off", "demo", "live")
 TRADE_ACTIONS = ("stops", "close", "cancel", "limit", "open")
 STOP_TRIGGERS = {"last": "最新成交价", "mark": "标记价", "index": "指数价"}
 MARGIN_MODES = ("cross", "isolated")
+BROKERS = ("okx", "mt5")  # where the account is: OKX, or a MetaTrader 5 broker (EC Markets) through the MT5 terminal
 
 
 def _get(name: str, default: str = "") -> str:
@@ -90,6 +91,21 @@ def _pct_or_off(name: str, default: float, problems: list[str]) -> float | None:
     return value
 
 
+def _symbol_pairs(raw: str, problems: list[str]) -> tuple[tuple[str, str], ...]:
+    """MT5_SYMBOLS: "XAU=XAUUSD,XAG=XAGUSD" -> (("XAU", "XAUUSD"), ("XAG", "XAGUSD"))."""
+    pairs: list[tuple[str, str]] = []
+    for part in raw.replace("，", ",").split(","):
+        base, _, symbol = part.partition("=")
+        base, symbol = base.strip().upper(), symbol.strip()
+        if not base and not symbol:
+            continue
+        if not base.isalnum() or not symbol:
+            problems.append(f"MT5_SYMBOLS 的写法是 币种=MT5里的品种名，例如 XAU=XAUUSD，{part.strip()!r} 看不懂，跳过")
+            continue
+        pairs.append((base, symbol))
+    return tuple(pairs) or (("XAU", "XAUUSD"),)
+
+
 def _get_int(name: str, default: int, problems: list[str]) -> int:
     value = _get_float(name, float(default), problems)
     return int(value) if value is not None else default
@@ -125,6 +141,15 @@ class Config:
     okx_stream: bool = True  # OKX's private WebSocket wakes the monitor the moment a position or stop changes
     okx_ws_url: str = ""  # empty = the stream that belongs to OKX_BASE_URL
     watch_instruments: tuple[str, ...] = ("XAU-USDT-SWAP",)
+
+    # MetaTrader 5 (BROKER=mt5): the account is read and traded through the MT5 terminal on the server;
+    # OKX is then only used for public market data of what the broker does not carry.
+    broker: str = "okx"
+    mt5_path: str = ""  # terminal64.exe; empty = the terminal that is installed
+    mt5_symbols: tuple[tuple[str, str], ...] = (("XAU", "XAUUSD"),)  # (base, the broker's symbol)
+    mt5_commission_per_lot: float = 0.0  # what the broker charges per lot, in and out together (0 on a standard account)
+    trade_fee_pct: float = 0.05  # OKX's taker fee, each way, in % (MT5: MT5_COMMISSION_PER_LOT instead)
+    trade_slippage_pct: float = 0.02  # allowed for when an order is sized against the risk limit, as % of the price
 
     # Claude
     anthropic_api_key: str = field(default="", repr=False)
@@ -214,6 +239,19 @@ class Config:
         return bool(self.okx_api_key and self.okx_secret_key and self.okx_passphrase)
 
     @property
+    def mt5(self) -> bool:
+        return self.broker == "mt5"
+
+    @property
+    def has_account(self) -> bool:
+        """Whether there is an account to watch: the OKX keys, or the MT5 terminal."""
+        return self.mt5 or self.has_okx_keys
+
+    @property
+    def broker_name(self) -> str:
+        return "MT5" if self.mt5 else "OKX"
+
+    @property
     def has_okx_demo_keys(self) -> bool:
         return bool(self.okx_demo_api_key and self.okx_demo_secret_key and self.okx_demo_passphrase)
 
@@ -293,9 +331,22 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
             return default
         return raw
 
-    instruments = tuple(
+    broker = _get("BROKER", "okx").lower()
+    if broker not in BROKERS:
+        problems.append(f"BROKER 只能填 okx 或 mt5，现在是 {broker!r}，按 okx 算")
+        broker = "okx"
+    mt5_symbols = _symbol_pairs(_get("MT5_SYMBOLS", "XAU=XAUUSD"), problems)
+
+    def _on_broker(items: tuple[str, ...]) -> tuple[str, ...]:
+        """With BROKER=mt5, an instrument the broker carries is named <BASE>-USD-SWAP whatever .env calls it."""
+        if broker != "mt5":
+            return items
+        bases = {base for base, _ in mt5_symbols}
+        return tuple(dict.fromkeys(f"{item.split('-')[0]}-USD-SWAP" if item.split("-")[0] in bases else item for item in items))
+
+    instruments = _on_broker(tuple(
         item.strip().upper() for item in _get("WATCH_INSTRUMENTS", "XAU-USDT-SWAP").split(",") if item.strip()
-    )
+    ))  # fmt: skip
     if not instruments:
         problems.append("WATCH_INSTRUMENTS 至少要填一个品种，例如 XAU-USDT-SWAP")
 
@@ -323,6 +374,8 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         trading = "off"
     elif trading not in TRADING_MODES:
         trading_blocked = f"TRADING 只能填 off、demo 或 live，现在是 {trading!r}"
+    elif broker == "mt5":
+        pass  # the account is whatever the terminal is logged in to; each order checks it is the kind TRADING names
     elif trading == "demo" and not has_demo_keys and not (okx_demo and has_main_keys):
         trading_blocked = "TRADING=demo 需要模拟盘的三项 key：OKX_DEMO_API_KEY、OKX_DEMO_SECRET_KEY、OKX_DEMO_PASSPHRASE"
     elif trading == "live" and okx_demo:
@@ -411,6 +464,12 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         okx_stream=_get_bool("OKX_STREAM", True),
         okx_ws_url=_get("OKX_WS_URL"),
         watch_instruments=instruments or ("XAU-USDT-SWAP",),
+        broker=broker,
+        mt5_path=_get("MT5_PATH"),
+        mt5_symbols=mt5_symbols,
+        mt5_commission_per_lot=max(0.0, _get_float("MT5_COMMISSION_PER_LOT", 0.0, problems) or 0.0),
+        trade_fee_pct=max(0.0, _get_float("TRADE_FEE_PCT", 0.05, problems) or 0.0),
+        trade_slippage_pct=max(0.0, _get_float("TRADE_SLIPPAGE_PCT", 0.02, problems) or 0.0),
         anthropic_api_key=secrets["ANTHROPIC_API_KEY"],
         model_quick=_get("MODEL_QUICK", "claude-haiku-5-5"),
         model_daily=_get("MODEL_DAILY", "claude-opus-5-5"),
@@ -431,7 +490,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         close_review=_get_bool("CLOSE_REVIEW", True),
         track_window_hours=min(72, max(4, _get_int("TRACK_WINDOW_HOURS", 72, problems))),
         timezone=timezone,
-        poll_seconds=max(5, _get_int("POLL_SECONDS", 30, problems)),
+        poll_seconds=max(5, _get_int("POLL_SECONDS", 10 if broker == "mt5" else 30, problems)),
         snapshot_minutes=max(1, _get_int("SNAPSHOT_MINUTES", 15, problems)),
         alert_margin_ratio=_get_float("ALERT_MARGIN_RATIO", 3.0, problems),
         alert_liq_distance_pct=_get_float("ALERT_LIQ_DISTANCE_PCT", 5.0, problems),
@@ -461,9 +520,9 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         okx_demo_api_key=secrets["OKX_DEMO_API_KEY"],
         okx_demo_secret_key=secrets["OKX_DEMO_SECRET_KEY"],
         okx_demo_passphrase=secrets["OKX_DEMO_PASSPHRASE"],
-        trade_instruments=tuple(
+        trade_instruments=_on_broker(tuple(
             item.strip().upper() for item in _get("TRADE_INSTRUMENTS").split(",") if item.strip()
-        ),
+        )),
         trade_max_order_usd=_positive("TRADE_MAX_ORDER_USD", 1000.0),
         trade_max_position_usd=_positive("TRADE_MAX_POSITION_USD", 3000.0),
         trade_max_opens_per_day=max(0, _get_int("TRADE_MAX_OPENS_PER_DAY", 20, problems)),
@@ -488,7 +547,7 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:
         problems.append("还没填飞书的 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
-    if not cfg.has_okx_keys:
+    if not cfg.has_account:
         problems.append("还没填 OKX 的 OKX_API_KEY、OKX_SECRET_KEY、OKX_PASSPHRASE（三样都要）")
     if not cfg.anthropic_api_key:
         problems.append("还没填 ANTHROPIC_API_KEY，AI 分析和简报用不了")

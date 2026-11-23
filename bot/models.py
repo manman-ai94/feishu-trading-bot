@@ -307,6 +307,7 @@ class InstrumentSpec:
     min_sz: Decimal
     tick_sz: Decimal  # price step
     state: str = "live"
+    unit: str = "张"  # what one contract is called: 张 on OKX, 手 (one lot) on MT5
 
     @property
     def coins_per_contract(self) -> Decimal:

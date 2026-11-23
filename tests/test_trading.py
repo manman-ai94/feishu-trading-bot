@@ -809,6 +809,18 @@ def test_an_open_with_only_a_stop_is_sized_by_the_owners_risk():
     assert bench.sent[0][1]["sz"] == "10000" and bench.sent[0][1]["sl_trigger_px"] == "3830"
 
 
+def test_the_fees_and_the_slippage_are_counted_in_the_size_and_the_loss():
+    bench = Bench(**roomy(trade_fee_pct=0.05, trade_slippage_pct=0.02))
+    preview = bench.say("做多 XAU 止损 3830")
+    # Each XAU loses 50 to the stop, 3.88 in fees (0.05 % in and out) and 0.776 to slippage: 500 / 54.656 = 9.148 XAU.
+    assert "止损离现价 50，加上开平手续费 3.88、滑点 0.776，每 1 XAU 最多亏 54.656，最多开 9148 张（合 9.148 XAU）" in preview.text
+    assert "触发后大约亏 499.99 USDT，含手续费和滑点约 42.59（每 1 XAU：开平手续费 3.88、滑点 0.776）" in preview.text
+    refused = Bench(**roomy(trade_fee_pct=0.05, trade_slippage_pct=0.02, trade_max_risk_pct=25.0)).say("做多 XAU 10个 止损 3830")
+    assert "大约亏 546.56 USDT（含手续费和滑点）" in refused.text and "最多开 9148 张" in refused.text
+    sizing = Bench(**roomy(trade_fee_pct=0.05, trade_slippage_pct=0.02)).say("算仓位 XAU 止损 3830")
+    assert "加上开平手续费 3.88、滑点 0.776，每 1 XAU 亏 54.656 USDT" in sizing.text and "最多 9148 张" in sizing.text
+
+
 def test_a_resting_limit_order_is_sized_from_its_own_price():
     bench = Bench(**roomy())
     preview = bench.say("限价做多 XAU 3850 止损 3800")
@@ -1261,6 +1273,15 @@ def test_adding_a_take_profit_to_a_lone_stop_loss_replaces_the_order():
         ("cancel_stops", {"items": [(XAU, "a1")]}),
         ("place_stop", {"inst_id": XAU, "td_mode": "cross", "side": "sell", "sl_trigger_px": "3700", "tp_trigger_px": "3950", "cl_ord_id": "ftb0001"}),
     ]
+
+
+def test_a_take_profit_on_the_losing_side_of_the_entry_is_called_an_early_stop():
+    bench = Bench(FakeExchange([gold(stops=(StopOrder("a1", 3700.0, None),))]))
+    preview = bench.say("止盈 XAU 3900")  # above the price, so OKX takes it; the entry is 3844.8: a gain
+    assert "提前止损" not in preview.text
+    bench = Bench(FakeExchange([gold(avg_px=3950.0, stops=(StopOrder("a1", 3700.0, None),))]))
+    preview = bench.say("止盈 XAU 3900")
+    assert "这笔交易 -500.00 USDT" in preview.text and "这个止盈在开仓均价亏钱的一边，打到时是亏着出场，其实是提前止损" in preview.text
 
 
 def test_a_replacement_that_fails_halfway_is_shouted_about():

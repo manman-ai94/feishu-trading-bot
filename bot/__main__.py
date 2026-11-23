@@ -70,27 +70,10 @@ def selfcheck(cfg: Config, problems: list[str]) -> int:
         failures += 1
         _print("[X]", f"OKX 行情读取失败：{exc}")
 
-    print("\n== 3. OKX 账户（只读取，不下单） ==")
-    if not cfg.has_okx_keys:
-        failures += 1
-        _print("[X]", "还没填 OKX 的三个 key")
+    if cfg.mt5:
+        failures += _check_mt5(cfg, okx)
     else:
-        try:
-            state = okx.account_state()
-            _print("[OK]", f"账户读取成功，当前 {len(state.positions)} 个持仓")
-            if cfg.okx_demo:
-                _print("[!]", "现在连的是模拟盘 (OKX_DEMO=true)")
-            account = okx.account_config()
-            rights = "读取" + ("、交易" if account.can_trade else "")
-            _print("[OK]", f"这把 key 的权限：{rights}；{'已绑定 IP' if account.ip else '没有绑定 IP'}")
-            if account.can_withdraw:
-                _print("[!]", "这把 key 开了提现权限。机器人用不到，建议在 OKX 里关掉")
-            if not account.ip:
-                _print("[!]", "建议在 OKX 里把这把 key 绑定到这台服务器的 IP")
-        except (OkxError, OkxNetworkError) as exc:
-            failures += 1
-            _print("[X]", f"账户读取失败：{exc}")
-            _print("   ", "常见原因：key 填错、Passphrase 不对、这台机器的 IP 不在这把 key 的白名单里")
+        failures += _check_okx_account(cfg, okx)
 
     print("\n== 4. Claude ==")
     analyst, _, knowledge = build_ai(cfg, okx, Journal(":memory:"))  # a self-check leaves no records
@@ -320,7 +303,7 @@ def send_brief(cfg: Config, kind: str) -> int:
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
     reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, macro=macro)
     reporter.monitor = Monitor(okx, cfg, journal, lambda event: None)
-    if cfg.has_okx_keys:
+    if cfg.has_account:
         reporter.monitor.poll_once()
     if kind == "weekly":
         reporter.send_weekly_review()
@@ -504,6 +487,69 @@ def main(argv: list[str] | None = None) -> int:
 
     run(cfg, args.env)
     return 0
+
+
+def _check_okx_account(cfg, okx) -> int:
+    """Section 3 of the self-check on OKX. Returns the number of failures."""
+    from .okx_client import OkxError, OkxNetworkError
+
+    failures = 0
+    print("\n== 3. OKX 账户（只读取，不下单） ==")
+    if not cfg.has_okx_keys:
+        failures += 1
+        _print("[X]", "还没填 OKX 的三个 key")
+    else:
+        try:
+            state = okx.account_state()
+            _print("[OK]", f"账户读取成功，当前 {len(state.positions)} 个持仓")
+            if cfg.okx_demo:
+                _print("[!]", "现在连的是模拟盘 (OKX_DEMO=true)")
+            account = okx.account_config()
+            rights = "读取" + ("、交易" if account.can_trade else "")
+            _print("[OK]", f"这把 key 的权限：{rights}；{'已绑定 IP' if account.ip else '没有绑定 IP'}")
+            if account.can_withdraw:
+                _print("[!]", "这把 key 开了提现权限。机器人用不到，建议在 OKX 里关掉")
+            if not account.ip:
+                _print("[!]", "建议在 OKX 里把这把 key 绑定到这台服务器的 IP")
+        except (OkxError, OkxNetworkError) as exc:
+            failures += 1
+            _print("[X]", f"账户读取失败：{exc}")
+            _print("   ", "常见原因：key 填错、Passphrase 不对、这台机器的 IP 不在这把 key 的白名单里")
+    return failures
+
+
+def _check_mt5(cfg, reader) -> int:
+    """Section 3 of the self-check with BROKER=mt5: the terminal, the account and the symbols. Reads only."""
+    from .market import fmt_price
+    from .okx_client import OkxError, OkxNetworkError
+
+    print("\n== 3. MT5 账户（只读取，不下单） ==")
+    try:
+        state = reader.account_state()
+    except (OkxError, OkxNetworkError) as exc:
+        _print("[X]", f"MT5 账户读取失败：{exc}")
+        return 1
+    failures = 0
+    kind = "模拟账户" if reader.demo else "实盘账户"
+    _print("[OK]", f"MT5 已登录，{kind}，权益 {state.snapshot.total_eq:,.2f} {reader.account_currency()}，当前 {len(state.positions)} 个持仓")
+    if cfg.trading == "live" and reader.demo:
+        _print("[!]", "TRADING=live，但登录的是模拟账户：下单会被拒绝")
+    if cfg.trading == "demo" and not reader.demo:
+        _print("[!]", "TRADING=demo，但登录的是实盘账户：下单会被拒绝")
+    account = reader.account_config()
+    _print("[OK]" if account.can_trade else "[!]", "可以自动交易" if account.can_trade else "现在不能自动交易：MT5 工具栏上的“算法交易”（Algo Trading）没打开，或者账户不允许")
+    _print("[OK]", f"持仓模式：{'对冲（多空分开）' if account.hedge_mode else '净持仓'}")
+    for base, _ in cfg.mt5_symbols:
+        inst_id = f"{base}-USD-SWAP"
+        try:
+            spec = reader.instrument_spec(inst_id)
+            ticker = reader.ticker(inst_id)
+            _print("[OK]", f"{inst_id} → MT5 的 {reader.symbol(inst_id)}：1 手 = {spec.coins_per_contract:g} {spec.ct_val_ccy}，"
+                           f"最小 {spec.min_sz:g} 手，步长 {spec.lot_sz:g}，现价 {fmt_price(ticker.last)}")
+        except (OkxError, OkxNetworkError) as exc:
+            failures += 1
+            _print("[X]", f"{inst_id} 读不到：{exc}")
+    return failures
 
 
 if __name__ == "__main__":

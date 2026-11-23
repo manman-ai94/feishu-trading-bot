@@ -29,6 +29,10 @@ def make_cfg(**overrides) -> Config:
         okx_secret_key="secret",
         okx_passphrase="pass",
         anthropic_api_key="sk-test",
+        # No fees or slippage in the sizing, so the figures of a test are the stop distance alone;
+        # tests of the costs set them.
+        trade_fee_pct=0.0,
+        trade_slippage_pct=0.0,
     )
     values.update(overrides)
     return Config(**values)

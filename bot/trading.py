@@ -267,9 +267,10 @@ def _take(pattern: re.Pattern, text: str, what: str) -> tuple[Decimal | None, st
 class CommandParser:
     """Reads order commands by fixed patterns. `parse` returns None for anything that is not one."""
 
-    def __init__(self, resolver, instruments: Callable[[], tuple[str, ...]]):
+    def __init__(self, resolver, instruments: Callable[[], tuple[str, ...]], lots: bool = False):
         self._resolver = resolver
         self._instruments = instruments  # the instruments orders are allowed in
+        self._lots = lots  # MT5: a contract is a lot (手), and 张 means nothing there
 
     def parse(self, raw: str) -> Command | None:
         text = normalise(raw)
@@ -628,6 +629,8 @@ class CommandParser:
         if value <= 0:
             raise _Unclear("数量要大于 0。")
         if word == "张":
+            if self._lots:
+                raise _Unclear("MT5 上数量用“手”（黄金 1 手 = 100 盎司），也可以写“盎司”或 U。")
             unit = "contracts"
         elif word in ("个", "枚", "币") or (base and word == base.lower()):
             unit = "coins"
@@ -635,6 +638,8 @@ class CommandParser:
             if base not in ("XAU", "XAG", ""):
                 raise _Unclear("“盎司”只用在黄金和白银上。其他品种请用 张、个 或 U。")
             unit = "coins"
+        elif word == "手" and self._lots:
+            unit = "contracts"  # MT5: one lot, whatever the instrument
         elif word == "手":
             gold_only = all(inst.split("-")[0] == "XAU" for inst in self._instruments())
             if base != "XAU" and not (not base and gold_only):
@@ -832,7 +837,7 @@ def _side_word(direction: str) -> str:
 
 
 def _contracts_text(contracts: Decimal, spec: InstrumentSpec) -> str:
-    return f"{_plain(contracts)} 张（合 {_plain(contracts * spec.coins_per_contract)} {spec.ct_val_ccy}）"
+    return f"{_plain(contracts)} {spec.unit}（合 {_plain(contracts * spec.coins_per_contract)} {spec.ct_val_ccy}）"
 
 
 # ------------------------------------------------------------------------------- desk
@@ -870,7 +875,7 @@ class TradeDesk:
         self._new_code = new_code or new_confirmation_code
         self._new_id = new_id or (lambda: "ftb" + uuid.uuid4().hex[:24])
         self._day_change = day_change
-        self._parser = CommandParser(resolver or InstrumentResolver(reader, clock), lambda: cfg.tradable_instruments)
+        self._parser = CommandParser(resolver or InstrumentResolver(reader, clock), lambda: cfg.tradable_instruments, lots=cfg.mt5)
         self._lock = threading.Lock()  # guards the pending confirmations
         self._sending = threading.Lock()  # one order at a time
         # Who asked -> the preview waiting for his code. With more than one owner, each has his own: a code
@@ -1128,7 +1133,17 @@ class TradeDesk:
             return Reply(refused_here)
         return self._answer(self._tagged(command), in_group, sender)
 
+    def _worded(self, reply: Reply) -> Reply:
+        """On MT5, every "OKX" the desk would say means the MT5 account."""
+        if not self._cfg.mt5:
+            return reply
+        text = reply.text.replace("OKX key", "MT5 账户").replace("OKX", "MT5")
+        return replace(reply, text=text, title=reply.title.replace("OKX", "MT5"))
+
     def _answer(self, command: Command, in_group: bool = False, sender: str = "") -> Reply:
+        return self._worded(self._take(command, in_group, sender))
+
+    def _take(self, command: Command, in_group: bool = False, sender: str = "") -> Reply:
         """Carries the command out as far as a preview, and words what said no. An open refused for a missing
         stop or for being over a limit is kept a few minutes: "止损 3560" or "按上限" then mends it, without
         the whole order typed again."""
@@ -1346,6 +1361,9 @@ class TradeDesk:
         )
 
     def run_job(self, job: dict) -> Reply:
+        return self._worded(self._run_job(job))
+
+    def _run_job(self, job: dict) -> Reply:
         """A scheduled cancel that is due: the orders it was set for that are still resting are cancelled,
         through the same plan and report as any cancellation. Never anything but a cancellation."""
         try:
@@ -1606,6 +1624,10 @@ class TradeDesk:
         return "\n".join(lines)
 
     def status_lines(self) -> list[str]:
+        lines = self._status_lines()
+        return [line.replace("OKX key", "MT5 账户").replace("OKX", "MT5") for line in lines] if self._cfg.mt5 else lines
+
+    def _status_lines(self) -> list[str]:
         """The trading set-up in plain words: mode, limits, and what the API key may do."""
         cfg = self._cfg
         lines = [f"**下单功能**：{MODE_LABELS[self._mode]}"]
@@ -1637,8 +1659,9 @@ class TradeDesk:
         lines.append(f"**群里**：{group}")
         lines.append(f"**单笔风险**：权益的 {cfg.risk_per_trade_pct:g}%（“算仓位”和只写止损不写数量的开仓按它算数量）")
         lines.append("**限额**")
-        lines.append(f"- 单笔上限 {cfg.trade_max_order_usd:,.0f} USDT（名义价值）")
-        lines.append(f"- 单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f} USDT（含没成交的挂单）")
+        unit = "USD" if cfg.mt5 else "USDT"
+        lines.append(f"- 单笔上限 {cfg.trade_max_order_usd:,.0f} {unit}（名义价值）")
+        lines.append(f"- 单个品种的持仓上限 {cfg.trade_max_position_usd:,.0f} {unit}（含没成交的挂单）")
         opens = ""
         if self._mode != "off":
             opens = f"，今天已开 {self._journal.count_opens(self._day_start(), self._clock() + 1, self._mode)} 次"
@@ -1664,21 +1687,46 @@ class TradeDesk:
         except (OkxError, OkxNetworkError) as exc:
             lines.append(f"- 暂时读不到：{exc}")
         else:
-            lines.append(f"- 交易权限：{'有' if account.can_trade else '没有'}")
-            lines.append("- 提现权限：有。机器人用不到，建议在 OKX 里关掉" if account.can_withdraw else "- 提现权限：没有")
-            lines.append("- 已绑定 IP" if account.ip else "- 没有绑定 IP，建议绑定服务器的 IP")
-            lines.append(f"- 持仓模式：{'双向持仓' if account.hedge_mode else '单向持仓'}")
-            if account.spot_only:
-                lines.append(f"- 账户模式：现货模式。{self._spot_mode_text()}")
-            elif account.level_name:
-                lines.append(f"- 账户模式：{account.level_name}")
+            lines.extend(self._mt5_account_lines(account) if cfg.mt5 else self._okx_key_lines(account))
+        lines.extend(self._cost_lines())
         if self._mode != "off":
             lines.extend(self._funds_lines())
-        where = ""
-        if self._mode == "live":
-            where = "。实盘时用 .env 里模拟盘的 key 跑" if self._demo_trader is not None else "。实盘时要 .env 里有模拟盘的 key 才能跑，现在没有"
-        lines.append(f"**模拟盘自测**：{self._selftest().last_text()}{where}")
+        if cfg.mt5:
+            lines.append("**模拟盘自测**：MT5 上没有。要演练，先在 MT5 里登录模拟账户，再把 TRADING 改成 demo")
+        else:
+            where = ""
+            if self._mode == "live":
+                where = "。实盘时用 .env 里模拟盘的 key 跑" if self._demo_trader is not None else "。实盘时要 .env 里有模拟盘的 key 才能跑，现在没有"
+            lines.append(f"**模拟盘自测**：{self._selftest().last_text()}{where}")
         lines.append("限额、品种名单和开放哪些操作只能在服务器的 .env 里改，飞书里改不了。")
+        return lines
+
+    def _mt5_account_lines(self, account: AccountConfig) -> list[str]:
+        return [
+            "- 自动交易：可以" if account.can_trade else "- 自动交易：不行。MT5 工具栏上的“算法交易”（Algo Trading）没打开，或者账户不允许",
+            f"- 持仓模式：{'对冲（多空分开）' if account.hedge_mode else '净持仓'}",
+            f"- 订单只发到{'实盘' if self._cfg.trading == 'live' else '模拟'}账户；MT5 登录的账户不是这种，就一张也不下",
+        ]
+
+    def _cost_lines(self) -> list[str]:
+        cfg = self._cfg
+        if cfg.mt5:
+            fees = f"点差按下单时的报价，手续费每手 {cfg.mt5_commission_per_lot:g} USD（MT5_COMMISSION_PER_LOT）"
+        else:
+            fees = f"手续费按开平各 {cfg.trade_fee_pct:g}%（TRADE_FEE_PCT）"
+        return [f"**成本**：按止损算数量和核对上限时，{fees}，滑点按价格的 {cfg.trade_slippage_pct:g}%（TRADE_SLIPPAGE_PCT），都算进亏损"]
+
+    def _okx_key_lines(self, account: AccountConfig) -> list[str]:
+        lines = [
+            f"- 交易权限：{'有' if account.can_trade else '没有'}",
+            "- 提现权限：有。机器人用不到，建议在 OKX 里关掉" if account.can_withdraw else "- 提现权限：没有",
+            "- 已绑定 IP" if account.ip else "- 没有绑定 IP，建议绑定服务器的 IP",
+            f"- 持仓模式：{'双向持仓' if account.hedge_mode else '单向持仓'}",
+        ]
+        if account.spot_only:
+            lines.append(f"- 账户模式：现货模式。{self._spot_mode_text()}")
+        elif account.level_name:
+            lines.append(f"- 账户模式：{account.level_name}")
         return lines
 
     def _spot_mode_text(self) -> str:
@@ -1747,14 +1795,18 @@ class TradeDesk:
         pct = _dec(self._cfg.risk_per_trade_pct)
         budget = equity * pct / 100
         per_contract = spec.coins_per_contract
-        contracts = _floor_to(budget / gap / per_contract, spec.lot_sz)
+        cost, cost_words = self._cost(cmd.inst_id, entry, spec)
+        each = gap + cost
+        contracts = _floor_to(budget / each / per_contract, spec.lot_sz)
+        with_cost = f"，加上{cost_words}，每 1 {base} 亏 {_plain(_round_to(each, spec.tick_sz / 100))} {settle}" if cost > 0 else ""
         lines = [
             f"按你定的单笔风险 {float(pct):g}%：权益 {_amt(equity)} USD，这一笔止损触发时最多亏 {_amt(budget)} {settle}",
             f"{_side_word('long' if long else 'short')}单，入场 {_px(entry, spec)}{'（现价）' if cmd.px is None else ''}，"
-            f"止损 {_px(cmd.sl, spec)}，相差 {_plain(gap)}（{gap / entry * 100:.2f}%），每 1 {base} 亏 {_plain(gap)} {settle}",
+            f"止损 {_px(cmd.sl, spec)}，相差 {_plain(gap)}（{gap / entry * 100:.2f}%），"
+            + (with_cost[1:] if cost > 0 else f"每 1 {base} 亏 {_plain(gap)} {settle}"),
         ]
         if contracts < spec.min_sz or contracts <= 0:
-            least = spec.min_sz * per_contract * gap
+            least = spec.min_sz * per_contract * each
             lines.append(
                 f"按这个止损，最小的 {_plain(spec.min_sz)} 张也会亏约 {_amt(least)} {settle}，"
                 f"占权益 {least / equity * 100:.2f}%，超过了 {float(pct):g}%。止损要更近，或者这笔不做。"
@@ -1764,7 +1816,7 @@ class TradeDesk:
             notional = coins * entry
             lines.append(
                 f"最多 {_contracts_text(contracts, spec)}，名义价值约 {_amt(notional)} {settle}，"
-                f"实际杠杆 {notional / equity:.2f} 倍，止损触发亏约 {_amt(coins * gap)} {settle}"
+                f"实际杠杆 {notional / equity:.2f} 倍，止损触发亏约 {_amt(coins * each)} {settle}"
             )
             held = [p for p in state.positions if p.inst_id == cmd.inst_id and p.direction == ("long" if long else "short")]
             if held and held[0].lever:
@@ -1774,18 +1826,18 @@ class TradeDesk:
                     lines.append("保证金超过了账户权益，这么大开不出来")
             if notional > _dec(self._cfg.trade_max_position_usd):
                 lines.append(
-                    f"超过了单个品种的持仓上限 {_amt(_dec(self._cfg.trade_max_position_usd))} USDT，按现在的限额开不了这么大"
+                    f"超过了单个品种的持仓上限 {_amt(_dec(self._cfg.trade_max_position_usd))} {settle}，按现在的限额开不了这么大"
                 )
             elif notional > _dec(self._cfg.trade_max_order_usd):
-                lines.append(f"超过了单笔上限 {_amt(_dec(self._cfg.trade_max_order_usd))} USDT，要分几次开")
+                lines.append(f"超过了单笔上限 {_amt(_dec(self._cfg.trade_max_order_usd))} {settle}，要分几次开")
         for position in state.positions:
             if position.inst_id != cmd.inst_id or position.direction != ("long" if long else "short"):
                 continue
             coins_held = _dec(position.qty) * per_contract
-            cost = coins_held * gap
+            held_loss = coins_held * gap
             lines.append(
-                f"你现在的{_side_word(position.direction)}单 {_plain(coins_held)} {base}，按同样的止损距离要亏约 {_amt(cost)} {settle}，"
-                f"占权益 {cost / equity * 100:.1f}%"
+                f"你现在的{_side_word(position.direction)}单 {_plain(coins_held)} {base}，按同样的止损距离要亏约 {_amt(held_loss)} {settle}，"
+                f"占权益 {held_loss / equity * 100:.1f}%"
             )
         resting = cmd.px is None or (cmd.px < last if long else cmd.px > last)  # a limit order there would wait
         if contracts >= spec.min_sz and contracts > 0 and resting:
@@ -1860,6 +1912,8 @@ class TradeDesk:
             self._account_config = known
         if not known[1].can_trade:
             self._account_config = None  # read it again next time: the owner may have just changed the key
+            if self._cfg.mt5:
+                raise Refused("MT5 现在不能自动交易，下不了单。请在服务器的 MT5 工具栏上打开“算法交易”（Algo Trading）。")
             raise Refused("这把 OKX key 没有交易权限，下不了单。请在 OKX 里给它开通“交易”权限（不要开提现）。")
         return known[1], self._okx.account_state()
 
@@ -1992,11 +2046,12 @@ class TradeDesk:
         sl = _round_to(cmd.sl, spec.tick_sz) if cmd.sl is not None else None
         tp = _round_to(cmd.tp, spec.tick_sz) if cmd.tp is not None else None
         sized = ""  # how a risk-sized order came to its size, for the preview and for a refusal
+        cost = self._cost(inst_id, ref, spec) if sl is not None else (Decimal(0), "")  # per coin, in and out
         if previous is not None:
             contracts = Decimal(previous.data["sz"])
             sized = previous.data.get("sized", "")
         elif cmd.unit == "risk":
-            contracts, sized = self._risk_sized(direction, ref, sl, entry_name, equity, spec)
+            contracts, sized = self._risk_sized(direction, ref, sl, entry_name, equity, spec, cost)
         elif cmd.unit == "contracts":
             contracts = cmd.size
             if contracts % spec.lot_sz != 0:
@@ -2037,7 +2092,7 @@ class TradeDesk:
         if total_cap is not None and sl is not None and equity > 0:
             line = equity * _dec(total_cap) / 100
             room = line * (CONFIRM_RISK_SLACK if previous is not None else 1) - others.loss - kept
-            gap = abs(ref - sl)
+            gap = abs(ref - sl) + cost[0]
             if gap * contracts * per_contract > room:
                 fits = _floor_to(max(room, Decimal(0)) / gap / per_contract, spec.lot_sz)
                 at_risk = others.loss + kept
@@ -2089,7 +2144,7 @@ class TradeDesk:
         if cfg.trade_require_stop and sl is None:
             raise Refused("按你的设置（TRADE_REQUIRE_STOP=true），开仓必须带止损。", reason="no_stop")
         self._check_stop_sides(direction, ref, sl, tp, entry_name, spec)
-        self._check_max_risk(contracts, ref, sl, entry_name, equity, spec, confirming=previous is not None)
+        self._check_max_risk(contracts, ref, sl, entry_name, equity, spec, confirming=previous is not None, cost=cost[0])
 
         td_mode = (same or held)[0].mgn_mode if held else cfg.trade_margin_mode
         pos_side = direction if account.hedge_mode else None
@@ -2125,10 +2180,11 @@ class TradeDesk:
             )
         coins = contracts * per_contract
         if sl is not None:
-            loss = abs(sl - ref) * coins
+            loss = (abs(sl - ref) + cost[0]) * coins
+            costs = f"，含手续费和滑点约 {_amt(cost[0] * coins)}（每 1 {spec.ct_val_ccy}：{cost[1]}）" if cost[0] > 0 else ""
             lines.append(
                 f"止损 {_px(sl, spec)}（离{entry_name} {abs(sl - ref) / ref * 100:.2f}%，触发后大约亏 {_amt(loss)} {settle}"
-                f"{self._risk_share(loss, state)}）"
+                f"{costs}{self._risk_share(loss, state)}）"
             )
         else:
             lines.append("止损 无（这张单不带止损）")
@@ -2137,7 +2193,7 @@ class TradeDesk:
         else:
             lines.append("止盈 无")
         lines.append(f"下单后 {inst_id} 的{word}单约 {_amt(total)} {settle}（上限 {cfg.trade_max_position_usd:,.0f}）")
-        lines.extend(self._total_risk_lines(others, kept, (abs(ref - sl) * coins) if sl is not None else None, equity, settle))
+        lines.extend(self._total_risk_lines(others, kept, ((abs(ref - sl) + cost[0]) * coins) if sl is not None else None, equity, settle))
         liq = self._liquidation_estimate(state, inst_id, direction, td_mode, lever, held_coins, mark, ref, coins, equity, value)
         if liq is not None:
             lines.append(f"粗估强平价约 {_px(liq, spec)}（{'全仓，按账户权益亏光算' if td_mode == 'cross' else '逐仓，按这张单的保证金亏光算'}；实际强平会早一点，以 OKX 显示为准）")
@@ -2213,7 +2269,9 @@ class TradeDesk:
         self._check_stop_sides(direction, prices[0], None, tp, "最近一档", spec)
         count = Decimal(len(prices))
         price_sum = sum(prices, Decimal(0))
-        gap_sum = sum((abs(price - sl) for price in prices), Decimal(0))  # the loss of one coin in every tier
+        tier_cost = self._cost(inst_id, sum(prices, Decimal(0)) / len(prices), spec)  # per coin, in and out
+        # The loss of one coin in every tier, fees and slippage included.
+        gap_sum = sum((abs(price - sl) for price in prices), Decimal(0)) + tier_cost[0] * len(prices)
         average = price_sum / count
 
         held_value = sum((self._value(p, spec) for p in same), Decimal(0))
@@ -2336,10 +2394,10 @@ class TradeDesk:
         near, far = (abs(prices[0] - last) / last * 100), (abs(prices[-1] - last) / last * 100)
         lines.append(f"现价 {_px(last, spec)}，最近一档离现价 {near:.2f}%，最远一档 {far:.2f}%，价格到了才成交")
         for number, price in enumerate(prices, 1):
-            lines.append(f"第 {number} 档 限价 {_px(price, spec)}：{_contracts_text(each, spec)}，打到止损亏约 {_amt(abs(price - sl) * each * per_contract)} {settle}")
+            lines.append(f"第 {number} 档 限价 {_px(price, spec)}：{_contracts_text(each, spec)}，打到止损亏约 {_amt((abs(price - sl) + tier_cost[0]) * each * per_contract)} {settle}")
         lines.append(
             f"止损 {_px(sl, spec)}（每档成交后各自带上；全部成交再打到止损，合计大约亏 {_amt(loss)} {settle}"
-            f"{self._risk_share(loss, state)}）"
+            f"{f'，含手续费和滑点（每 1 {spec.ct_val_ccy}：{tier_cost[1]}）' if tier_cost[0] > 0 else ''}{self._risk_share(loss, state)}）"
         )
         if tp is not None:
             gain = sum((abs(tp - price) for price in prices), Decimal(0)) * each * per_contract
@@ -2569,11 +2627,37 @@ class TradeDesk:
             log.warning("could not read the record of %s orders: %s", source, exc)
             return ""
 
+    def _cost(self, inst_id: str, ref: Decimal, spec: InstrumentSpec) -> tuple[Decimal, str]:
+        """What getting in and out costs per coin on top of the stop's distance, and what it is made of in words:
+        OKX's fees both ways (TRADE_FEE_PCT each way) or, on MT5, the spread and the broker's commission
+        (MT5_COMMISSION_PER_LOT); and the slippage allowed for (TRADE_SLIPPAGE_PCT of the price)."""
+        cfg = self._cfg
+        slip = ref * _dec(cfg.trade_slippage_pct) / 100
+        parts: list[tuple[str, Decimal]] = []
+        if cfg.mt5:
+            spread = Decimal(0)
+            try:
+                ticker = self._okx.ticker(inst_id)
+                if ticker.ask and ticker.bid and ticker.ask > ticker.bid:
+                    spread = _dec(ticker.ask) - _dec(ticker.bid)
+            except (OkxError, OkxNetworkError) as exc:
+                log.warning("no spread for %s: %s", inst_id, exc)
+            per = spec.coins_per_contract
+            commission = _dec(cfg.mt5_commission_per_lot) / per if per else Decimal(0)
+            parts = [("点差", spread), ("手续费", commission), ("滑点", slip)]
+        else:
+            parts = [("开平手续费", ref * _dec(cfg.trade_fee_pct) * 2 / 100), ("滑点", slip)]
+        cost = sum((value for _, value in parts), Decimal(0))
+        words = "、".join(f"{name} {_plain(_round_to(value, spec.tick_sz / 100))}" for name, value in parts if value > 0)
+        return cost, words
+
     def _risk_sized(
-        self, direction: str, ref: Decimal, sl: Decimal | None, entry_name: str, equity: Decimal, spec: InstrumentSpec
+        self, direction: str, ref: Decimal, sl: Decimal | None, entry_name: str, equity: Decimal, spec: InstrumentSpec,
+        cost: tuple[Decimal, str] = (Decimal(0), ""),
     ) -> tuple[Decimal, str]:
         """The size of an opening order given only a stop: as many contracts as the owner's per-trade risk
-        (RISK_PER_TRADE_PCT of the equity) allows if the stop is hit. Returns (contracts, how it was worked out)."""
+        (RISK_PER_TRADE_PCT of the equity) allows if the stop is hit, fees and slippage (`cost`, per coin)
+        included. Returns (contracts, how it was worked out)."""
         if sl is None:
             raise Refused("要写数量和单位，或者写止损让我按单笔风险算数量。")
         if spec.ct_type and spec.ct_type != "linear":
@@ -2585,13 +2669,16 @@ class TradeDesk:
         budget = equity * pct / 100
         gap = abs(ref - sl)
         settle = spec.settle_ccy or "USDT"
-        contracts = _floor_to(budget / gap / spec.coins_per_contract, spec.lot_sz)
+        each = gap + cost[0]
+        base = spec.ct_val_ccy or "币"
+        contracts = _floor_to(budget / each / spec.coins_per_contract, spec.lot_sz)
+        with_cost = f"，加上{cost[1]}，每 1 {base} 最多亏 {_plain(_round_to(each, spec.tick_sz / 100))}" if cost[0] > 0 else ""
         how = (
             f"数量按你定的单笔风险算：权益 {_amt(equity)} USD 的 {float(pct):g}% 是 {_amt(budget)} {settle}，"
-            f"止损离{entry_name} {_plain(gap)}，最多开 {_contracts_text(contracts, spec)}"
+            f"止损离{entry_name} {_plain(gap)}{with_cost}，最多开 {_contracts_text(contracts, spec)}"
         )
         if contracts < spec.min_sz or contracts <= 0:
-            least = spec.min_sz * spec.coins_per_contract * gap
+            least = spec.min_sz * spec.coins_per_contract * each
             raise Refused(
                 f"{how}。按这个止损，最小的 {_plain(spec.min_sz)} 张也会亏约 {_amt(least)} {settle}，"
                 f"占权益 {least / equity * 100:.2f}%，超过了 {float(pct):g}%。止损要更近，或者这笔不做。"
@@ -2600,7 +2687,7 @@ class TradeDesk:
 
     def _check_max_risk(
         self, contracts: Decimal, ref: Decimal, sl: Decimal | None, entry_name: str, equity: Decimal,
-        spec: InstrumentSpec, confirming: bool,
+        spec: InstrumentSpec, confirming: bool, cost: Decimal = Decimal(0),
     ) -> None:  # fmt: skip
         """TRADE_MAX_RISK_PCT: an opening order must carry a stop, and the stop may cost at most that share of
         the equity. When the owner confirms, a market order is measured again from the price then, with a
@@ -2619,12 +2706,12 @@ class TradeDesk:
             raise Refused("读不到账户权益，没法核对单笔止损上限，这次不开仓。请稍后再试。")
         settle = spec.settle_ccy or "USDT"
         per_contract = spec.coins_per_contract
-        loss = abs(ref - sl) * contracts * per_contract
+        loss = (abs(ref - sl) + cost) * contracts * per_contract
         line = equity * _dec(cap) / 100
         allowed = line * CONFIRM_RISK_SLACK if confirming else line
         if loss <= allowed:
             return
-        most = _floor_to(line / abs(ref - sl) / per_contract, spec.lot_sz)
+        most = _floor_to(line / (abs(ref - sl) + cost) / per_contract, spec.lot_sz)
         if confirming:
             raise Refused(
                 f"价格在你确认前动了，按{entry_name} {_px(ref, spec)} 算，这张单止损触发要亏约 {_amt(loss)} {settle}，"
@@ -2633,7 +2720,7 @@ class TradeDesk:
         room_ok = most >= spec.min_sz and most > 0
         fits = f"按这个止损最多开 {_contracts_text(most, spec)}" if room_ok else "按这个止损，最小的数量也超了"
         raise Refused(
-            f"这张单止损触发大约亏 {_amt(loss)} {settle}，占权益 {loss / equity * 100:.1f}%，"
+            f"这张单止损触发大约亏 {_amt(loss)} {settle}{'（含手续费和滑点）' if cost > 0 else ''}，占权益 {loss / equity * 100:.1f}%，"
             f"超过了你设的单笔上限 {cap:g}%（TRADE_MAX_RISK_PCT）。{fits}；只写止损不写数量的话，我按单笔风险算数量。",
             reason="over_cap", fits=most if room_ok else None,
         )
@@ -2972,6 +3059,9 @@ class TradeDesk:
         if average is not None:
             result = (new - average) * coins * sign
             text += f"；从开仓均价算，这笔交易 {float(result):+,.2f} {ccy}"
+            if name == "止盈" and result < 0:
+                # On the losing side of the entry it is not a take-profit: say what it is.
+                return text + "）\n**注意：这个止盈在开仓均价亏钱的一边，打到时是亏着出场，其实是提前止损**"
         return text + "）"
 
     def _risk_share(self, loss: Decimal, state: AccountState) -> str:
@@ -3072,7 +3162,7 @@ class TradeDesk:
                 algo_id = self._trader.place_stop(cl_ord_id=self._new_id(), **args)
                 return [f"已挂上：{self._stops_text(args)}，触发后按市价平掉整个仓位", f"止盈止损单号 {algo_id}"]
         except OkxNetworkError:
-            raise _Lost(f"{step.label}：发给 OKX 的时候连接断了，不确定有没有生效。") from None
+            raise _Lost(f"{step.label}：发给 {self._cfg.broker_name} 的时候连接断了，不确定有没有生效。") from None
         raise ValueError(f"unknown step {step.call}")
 
     def _stops_text(self, args: dict) -> str:
@@ -3150,19 +3240,20 @@ class TradeDesk:
 
     def _fill_lines(self, order: OrderInfo | None, inst_id: str, order_id: str) -> list[str]:
         if order is None:
-            return [f"OKX 已接受这张单（订单号 {order_id}），成交情况暂时没查到，发“仓位”或“挂单”可以看"]
+            return [f"{self._cfg.broker_name} 已接受这张单（订单号 {order_id}），成交情况暂时没查到，发“仓位”或“挂单”可以看"]
         spec = self._spec_or_none(inst_id)
+        unit = spec.unit if spec is not None else "张"
         filled = _contracts_text(_dec(order.filled_sz), spec) if spec is not None else f"{order.filled_sz:g} 张"
         average = self._price(order.avg_px, spec) if order.avg_px else "未知"
         if order.state == "filled":
             lines = [f"已成交 {filled}，均价 {average}"]
         elif order.state == "partially_filled":
-            lines = [f"部分成交：{filled}，均价 {average}；剩下 {order.remaining:g} 张还挂着"]
+            lines = [f"部分成交：{filled}，均价 {average}；剩下 {order.remaining:g} {unit}还挂着"]
         elif order.state == "live":
             price = f"限价 {self._price(order.px, spec)}" if order.px is not None else "市价"
-            lines = [f"已挂单，等待成交：{price}，{order.sz:g} 张"]
+            lines = [f"已挂单，等待成交：{price}，{order.sz:g} {unit}"]
         elif order.state == "canceled":
-            lines = [f"订单被 OKX 撤销了，成交了 {order.filled_sz:g} 张"]
+            lines = [f"订单被 {self._cfg.broker_name} 撤销了，成交了 {order.filled_sz:g} {unit}"]
         else:
             lines = [f"订单状态：{order.state or '未知'}"]
         if order.pnl:
