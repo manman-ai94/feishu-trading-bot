@@ -1472,6 +1472,34 @@ def test_with_several_people_the_bot_asks_which_one():
     assert reply.body.startswith("没找到“张三”。是哪一位？") and len(bench.cfg.co_owner_open_ids) == 1
 
 
+def test_a_name_that_fits_several_people_makes_none_of_them_owner_until_he_picks():
+    bench = Bench()
+    _say(bench, "在吗", sender=BUDDY, private=False)
+    _say(bench, "在吗", sender=OTHER, private=False)
+    _say(bench, "你们看下", private=False, mentions=(BOT, BUDDY, OTHER), mentioned_names=("交易助手", "小明", "王小明"))
+    # The full name of one of them: only him, though the other's whole name is part of it.
+    [reply] = _say(bench, "设置主人 王小明", private=False)
+    assert "王小明 现在也是主人" in plain(reply) and bench.cfg.co_owner_open_ids == (OTHER,)
+    bench.say("取消主人", private=False, message_id="om_remove_wang")
+    _say(bench, "设置主人 小明", private=False)
+    assert bench.cfg.co_owner_open_ids == (BUDDY,)
+    bench.say("取消主人", private=False, message_id="om_remove_xiao")
+    # Part of two names: a list to pick from, nobody made an owner yet.
+    bench = Bench()
+    _say(bench, "在吗", sender=BUDDY, private=False)
+    _say(bench, "在吗", sender=OTHER, private=False)
+    _say(bench, "你们看下", private=False, mentions=(BOT, BUDDY, OTHER), mentioned_names=("交易助手", "李小明", "王小明"))
+    [reply] = _say(bench, "设置主人 小明", private=False)
+    assert reply.body.startswith("“小明”对得上 2 个人。是哪一位？") and not bench.saved
+    order = re.findall(r'\d\. <at user_id="(ou_\w+)">', reply.body)
+    assert sorted(order) == sorted([BUDDY, OTHER])
+    _say(bench, "设为主人 1", private=False)
+    assert bench.cfg.co_owner_open_ids == (order[0],)
+    # Taking one off by part of the name: only the owner among them is meant.
+    [reply] = _say(bench, "取消主人 小明", private=False)
+    assert "不再是主人了" in plain(reply) and not bench.cfg.co_owner_open_ids
+
+
 def test_nobody_known_explains_both_ways():
     bench = Bench()
     [reply] = _say(bench, "设置主人 张小明", private=False)

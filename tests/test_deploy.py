@@ -4,11 +4,12 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import subprocess
+import sys
 import zipfile
 
 import pytest
 
-from bot.deploy import DeployError, deploy, members
+from bot.deploy import DeployError, _run_in, deploy, members
 
 
 class Box:
@@ -138,3 +139,35 @@ def test_a_zip_with_a_path_outside_the_install_is_refused(tmp_path):
         archive.writestr("../evil.py", "x")
     with zipfile.ZipFile(bad) as archive, pytest.raises(DeployError, match="outside"):
         members(archive)
+
+
+def test_the_requests_marked_are_reported_in_words_and_a_failed_marking_says_so(tmp_path, capsys):
+    box = Box(tmp_path)
+    plain_run = box.run
+
+    def run(args, **kwargs):
+        if "wishes" in args:
+            box.calls.append([str(a) for a in args])
+            return subprocess.CompletedProcess(args, 0, "已标成做好：#3 #4\n", "")
+        return plain_run(args, **kwargs)
+
+    box.run = run
+    assert box.deploy(done_wishes="3,4") == 0
+    assert "requests marked done: 已标成做好：#3 #4" in capsys.readouterr().out
+    # The exit code is never shown as if it were how many were marked.
+    box = Box(tmp_path / "again")
+    plain_run = box.run
+
+    def failing(args, **kwargs):
+        if "wishes" in args:
+            return subprocess.CompletedProcess(args, 1, "", "no such request: 99\n")
+        return plain_run(args, **kwargs)
+
+    box.run = failing
+    assert box.deploy(done_wishes="99") == 0
+    assert "requests 99 not marked (exit 1): no such request: 99" in capsys.readouterr().out
+
+
+def test_commands_are_read_as_utf8_whatever_the_console_code_page(tmp_path):
+    shown = _run_in(tmp_path)([sys.executable, "-c", "import sys; sys.stdout.buffer.write('诉求 #3 已做好'.encode('utf-8'))"])
+    assert shown.returncode == 0 and shown.stdout == "诉求 #3 已做好"

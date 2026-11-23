@@ -194,6 +194,20 @@ def _tail(text: str, lines: int = 40) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+def _run_in(root: Path) -> Callable:
+    """Runs a command in the install and reads what it prints as UTF-8. On Windows the default would be the
+    console's code page (cp1252), which cannot read Chinese output: the reading thread then fails and the
+    output is lost, though the command itself worked."""
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+
+    def run(args, **kw):
+        return subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=root, env=env, **kw
+        )
+
+    return run
+
+
 def deploy(
     root: Path,
     zip_path: Path,
@@ -206,7 +220,7 @@ def deploy(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    run = run or (lambda args, **kw: subprocess.run(args, capture_output=True, text=True, cwd=root, **kw))
+    run = run or _run_in(root)
     python = sys.executable
     if not zip_path.is_file():
         raise DeployError(f"no zip at {zip_path}")
@@ -299,7 +313,11 @@ def _check(root: Path, python: str, requirements_before: bytes, done_wishes: str
         return "tests failed"
     if done_wishes:
         marked = run([python, "-m", "bot", "wishes", "--done", done_wishes], timeout=120)
-        say(f"requests marked done: {(marked.stdout or '').strip() or marked.returncode}")
+        shown = (marked.stdout or "").strip()
+        if marked.returncode != 0:
+            say(f"requests {done_wishes} not marked (exit {marked.returncode}): {shown or _tail(marked.stderr or '')}")
+        else:
+            say(f"requests marked done: {shown or done_wishes}")
     return ""
 
 

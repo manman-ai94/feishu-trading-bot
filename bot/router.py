@@ -558,8 +558,17 @@ class Router:
                 for open_id, known in names.items()
                 if open_id not in skip and known and (known in text or name in known)
             ]
-            if named:
+            exact = [(open_id, known) for open_id, known in named if known == name]
+            if len(exact) == 1:
+                return exact, ""
+            if intent == "remove":  # only an owner can be taken off
+                named = [item for item in named if item[0] in cfg.co_owner_open_ids] or named
+            if len(named) == 1:
                 return named, ""
+            if named:
+                # "设置主人 小明" fits 小明 and 王小明: never all of them, he picks one by number.
+                head = f"“{name}”对得上 {len(named)} 个人。"
+                return [], head + self._choose(intent, [open_id for open_id, _ in named], people, names)
             # Never guessed: the list @-mentions each person, so Feishu shows his real name to pick by number.
             return [], self._not_found(name, intent, pool, people, names)
         if intent == "remove" and not pool:
