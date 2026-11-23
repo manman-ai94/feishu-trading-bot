@@ -208,6 +208,10 @@ def test_startup_message():
     reporter.send_startup()
     assert "还没读到 OKX 账户" in feishu.sent[0].body
 
+    reporter, feishu, *_ = build(state=None, broker="mt5")
+    reporter.send_startup()
+    assert "还没读到 MT5 账户" in feishu.sent[0].body and "OKX" not in feishu.sent[0].body
+
 
 def test_startup_message_says_when_the_bot_was_not_running():
     reporter, feishu, _, _, clock, _ = build()

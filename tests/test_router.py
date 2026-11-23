@@ -237,6 +237,8 @@ def test_status_when_flat_and_when_okx_was_never_read():
     assert reply.body == "当前没有持仓。"
     [reply] = Bench(state=None).say("仓位")
     assert "还没读到 OKX 账户" in reply.body
+    [reply] = Bench(state=None, broker="mt5").say("仓位")
+    assert "还没读到 MT5 账户" in reply.body
 
 
 # ----------------------------------------------------------------- analysis

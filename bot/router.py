@@ -1118,13 +1118,14 @@ class Router:
             except (OkxError, OkxNetworkError) as exc:
                 lines.append(f"**{inst_id}** 暂时取不到：{exc}")
         footer = None if message.is_private else DISCLAIMER
-        self._feishu.reply_markdown(message.message_id, "OKX 实时报价", "\n".join(lines), "wathet", footer=footer)
-        self._remember_fixed(message.chat_id, text, "OKX 实时报价", "\n".join(lines))  # so that "那白银呢" follows on
+        title = "实时报价" if self._cfg.mt5 else "OKX 实时报价"  # MT5: gold from MT5, the rest from OKX
+        self._feishu.reply_markdown(message.message_id, title, "\n".join(lines), "wathet", footer=footer)
+        self._remember_fixed(message.chat_id, text, title, "\n".join(lines))  # so that "那白银呢" follows on
 
     def _reply_status(self, message: IncomingMessage) -> None:
         state = self._reporter.current_state()
         if state is None:
-            self._feishu.reply_text(message.message_id, "还没读到 OKX 账户，请稍后再试。")
+            self._feishu.reply_text(message.message_id, f"还没读到 {self._cfg.broker_name} 账户，请稍后再试。")
             return
         with_account = self._shows_account(message)
         if not with_account and not state.positions:

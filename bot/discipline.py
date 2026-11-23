@@ -406,7 +406,7 @@ class Discipline:
             status = self.status(fresh=True)
         except (OkxError, OkxNetworkError) as exc:
             log.warning("discipline: OKX's records could not be read (%s)", type(exc).__name__)
-            return "读不到 OKX 的平仓记录，今天开了几笔、连亏几笔没法核对，这次不开仓。请稍后再试。" + tail
+            return f"读不到 {cfg.broker_name} 的平仓记录，今天开了几笔、连亏几笔没法核对，这次不开仓。请稍后再试。" + tail
         if status.stopped:
             return f"今天停手了：{status.stopped}。新的交易日 {self.next_day_text()}开始，到时再开仓。" + tail
         if cfg.plan_required:
@@ -438,7 +438,7 @@ class Discipline:
         try:
             status = self.status()
         except (OkxError, OkxNetworkError):
-            lines.append("今天开了几笔、连亏几笔：这次没读到 OKX")
+            lines.append(f"今天开了几笔、连亏几笔：这次没读到 {cfg.broker_name}")
             return lines
         count = f"今天开了 {status.opened} 笔新仓" + (f"（上限 {cfg.plan_max_trades}）" if cfg.plan_max_trades else "")
         count += f"，平掉 {status.finished} 笔，最近连亏 {status.streak} 笔"
@@ -567,7 +567,7 @@ class Discipline:
             status = self.status()
             breaker = self.breaker() if self.breaker else ""
         except (OkxError, OkxNetworkError):
-            results.append((False, "今天的状态", "读不到 OKX 的记录，没法核对"))
+            results.append((False, "今天的状态", f"读不到 {self._cfg.broker_name} 的记录，没法核对"))
         else:
             if status.stopped or breaker:
                 said = status.stopped if amounts else "今天已经停手（连亏或亏损到了上限）"

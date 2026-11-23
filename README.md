@@ -264,8 +264,8 @@ AI 只写三行：和计划比怎么样、一条下次用得上的教训、有�
 
 账户在 MT5 经纪商（例如 EC Markets）时，机器人通过同一台 Windows 服务器上的 MT5 终端 (terminal) 读账户和下单，用的是 MetaQuotes 官方的 MetaTrader5 Python 包（装新版本时自动装上）。密码只在终端里输入一次，机器人不保存、也看不到。
 
-1. 在服务器上装好 MT5 终端，用远程桌面登录交易账户，勾上“保存密码”。远程桌面用完直接关窗口，不要注销 (log off)，注销会把终端一起关掉。
-2. `.env` 里填 `BROKER=mt5`。品种名和默认不一样时改 `MT5_SYMBOLS`（默认 `XAU=XAUUSD`，带后缀的名字会自己找到）；终端不止一个时填 `MT5_PATH`。
+1. 在服务器上装好 MT5 终端。机器人必须和终端在同一个 Windows 会话 (session) 里、用同一个用户跑：开机自启的计划任务如果是 `/RU SYSTEM`，机器人在没有桌面的后台会话里，看不到你登录的终端。用 MT5 时把计划任务改成你远程桌面的那个用户、只在登录时运行（见下面 Windows 一节）。然后远程桌面进去，在机器人打开的终端里登录交易账户，勾上“保存密码”。远程桌面用完直接关窗口，不要注销 (log off)，注销会把终端和机器人一起关掉。
+2. `.env` 里填 `BROKER=mt5`。品种名和默认不一样时改 `MT5_SYMBOLS`（默认 `XAU=XAUUSD`，带后缀的名字会自己找到）；`MT5_PATH` 不填时用 MetaQuotes 默认装的位置 `C:\Program Files\MetaTrader 5\terminal64.exe`，终端装在别处或不止一个时再填。
 3. 运行自检：第 3 部分会写登录的是实盘还是模拟账户、权益、能不能自动交易，以及黄金在 MT5 里的手数规则和现价。
 4. 要下单时，在终端工具栏上打开“算法交易”(Algo Trading)，再把 `TRADING` 改成 live（实盘账户）或 demo（模拟账户）。登录的账户和 `TRADING` 不是同一种，订单一张也不发。
 
@@ -582,6 +582,12 @@ VPS 重启后自动启动（可选）：以管理员身份打开命令提示符�
 
 ```
 schtasks /Create /TN "FeishuTradingBot" /TR "C:\feishu-trading-bot\scripts\start.bat" /SC ONSTART /RU SYSTEM /F
+```
+
+用 MT5 时改用下面这一行（`Administrator` 换成你远程桌面登录的用户）：登录这个用户时启动，跑在你的桌面会话里，和 MT5 终端在一起。代价是 VPS 重启以后，要远程桌面登录一次机器人才会启动。
+
+```
+schtasks /Create /TN "FeishuTradingBot" /TR "C:\feishu-trading-bot\scripts\start.bat" /SC ONLOGON /RU Administrator /IT /RL HIGHEST /F
 ```
 
 用了开机自启以后，就不要再手动双击 `start.bat`，否则会有两个机器人同时回话。取消自启的命令是 `schtasks /Delete /TN "FeishuTradingBot" /F`。

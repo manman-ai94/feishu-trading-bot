@@ -125,6 +125,41 @@ def test_a_version_that_does_not_start_cleanly_is_rolled_back_and_the_old_one_st
     assert "RESULT: v0.14.1 did not start; back on v0.13.0, which is running" in capsys.readouterr().out
 
 
+def test_chinese_in_the_log_on_a_console_that_cannot_show_it_still_rolls_back(tmp_path, monkeypatch):
+    """Windows over SSH prints in cp1252, and the bot logs Chinese: printing the log must not stop the way back."""
+    import io
+
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252", errors="strict", write_through=True))
+    box = Box(tmp_path, starts=(False, True))
+    started = box.run
+
+    def run(args, **kwargs):
+        done = started(args, **kwargs)
+        if args[:2] == ["schtasks", "/Run"]:
+            with (box.root / "logs" / "bot.log").open("a", encoding="utf-8") as log:
+                log.write("2026 WARNING bot.monitor: MT5 read failed (1 in a row): 连不上 MT5 终端\n")
+        return done
+
+    box.run = run
+    assert box.deploy() == 2
+    assert box.text("bot/x.py") == "old = 1\n" and len(box.restarts()) == 2
+    shown = raw.getvalue().decode("cp1252")
+    assert "\\u8fde" in shown and "back on v0.13.0, which is running" in shown
+
+
+def test_the_deploy_writes_utf8_where_the_console_lets_it(tmp_path, monkeypatch):
+    import io
+
+    from bot import deploy as module
+
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252", write_through=True))
+    module._speak_utf8()
+    module.say("连不上 MT5")
+    assert raw.getvalue().decode("utf-8").strip() == "连不上 MT5"
+
+
 def test_new_packages_are_installed_when_the_requirements_change(tmp_path):
     box = Box(tmp_path)
     (box.root / "requirements.txt").write_text("lark-oapi==1.7.4\n", encoding="utf-8")

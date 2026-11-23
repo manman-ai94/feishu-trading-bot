@@ -172,6 +172,9 @@ def test_records_that_cannot_be_read_hold_new_positions_back():
 
     exchange.position_history = broken
     assert "读不到 OKX 的平仓记录" in rules.refusal(XAU, "long")
+    on_mt5, *_ = discipline(exchange, broker="mt5")
+    assert "读不到 MT5 的平仓记录" in on_mt5.refusal(XAU, "long")
+    assert "这次没读到 MT5" in "\n".join(on_mt5.status_lines())
 
 
 # ---------------------------------------------------------------------- the checklist

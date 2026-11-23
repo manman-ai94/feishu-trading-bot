@@ -43,7 +43,22 @@ VERSION = re.compile(r'__version__\s*=\s*"([^"]+)"')
 
 
 def say(text: str) -> None:
-    print(text, flush=True)
+    """One line of the report. A character the console cannot show (Windows over SSH: cp1252, and the bot's
+    log is Chinese) must not stop the deploy: a failure here would skip the way back."""
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="backslashreplace").decode(encoding), flush=True)
+
+
+def _speak_utf8() -> None:
+    """Where the console can be told to, write UTF-8: the person reading over SSH sees the Chinese."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 class DeployError(Exception):
@@ -322,6 +337,7 @@ def _check(root: Path, python: str, requirements_before: bytes, done_wishes: str
 
 
 def main(argv: list[str] | None = None) -> int:
+    _speak_utf8()
     parser = argparse.ArgumentParser(prog="python -m bot.deploy", description="Install a new version, with a way back.")
     parser.add_argument("--zip", required=True, type=Path)
     parser.add_argument("--sha256", required=True)

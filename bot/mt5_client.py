@@ -26,6 +26,7 @@ UTC+2 otherwise).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
@@ -48,6 +49,14 @@ from .models import (
 from .okx_client import OkxError, OkxNetworkError
 
 log = logging.getLogger(__name__)
+
+
+class Mt5Error(OkxError):
+    """MT5 refused or failed. Caught wherever an OKX error is; it reads as its own words, without OKX's prefix."""
+
+    def __str__(self) -> str:
+        return self.message
+
 
 # The MetaTrader5 package's constants. Spelt out, so the bot reads the same numbers on any machine.
 TIMEFRAMES = {
@@ -99,6 +108,9 @@ BOT_PREFIX = "ftb"  # the bot's client order ids start with it; MT5 keeps them i
 HISTORY_DAYS = 90
 MERGE_SECONDS = 2  # closing deals of one position this close together are one close
 INIT_RETRY_SECONDS = 60.0
+# Where MetaQuotes' installer puts the terminal. Used when MT5_PATH is empty: the package's own search looks in the
+# registry of the user who installed it, and the bot may run as another user.
+DEFAULT_TERMINALS = (r"C:\Program Files\MetaTrader 5\terminal64.exe",)
 STOP_PREFIX = "p:"
 OFFSET_TOLERANCE_SECONDS = 120
 # Calls that return a list: None with no error means there is nothing to list.
@@ -128,8 +140,8 @@ class Mt5Link:
     """The connection to the terminal. Every call goes through one lock: the package is not made for
     several threads at once."""
 
-    def __init__(self, path: str = "", module=None, clock=time.time, connect_ms: int = 20_000):
-        self._path = path
+    def __init__(self, path: str = "", module=None, clock=time.time, connect_ms: int = 20_000, terminals=DEFAULT_TERMINALS):
+        self._path = path or next((where for where in terminals if os.path.isfile(where)), "")
         self._connect_ms = connect_ms
         self._module = module
         self._clock = clock
@@ -146,14 +158,14 @@ class Mt5Link:
             try:
                 import MetaTrader5  # noqa: PLC0415  Windows only; installed on the server
             except ImportError as exc:
-                raise OkxError("mt5_missing", "服务器上还没装 MetaTrader5 这个 Python 包") from exc
+                raise Mt5Error("mt5_missing", "服务器上还没装 MetaTrader5 这个 Python 包") from exc
             self._module = MetaTrader5
         return self._module
 
     def _connect(self) -> None:
         now = self._clock()
         if self._failed_at is not None and now - self._failed_at < INIT_RETRY_SECONDS:
-            raise OkxError("mt5_down", self._failure)
+            raise Mt5Error("mt5_down", self._failure)
         kwargs = {"path": self._path} if self._path else {}
         if self.mt5.initialize(timeout=self._connect_ms, **kwargs):
             self._ready, self._failed_at = True, None
@@ -162,7 +174,7 @@ class Mt5Link:
         code, message = self._error()
         self._failed_at = now
         self._failure = f"连不上 MT5 终端（{code} {message}）。请确认服务器上的 MT5 开着"
-        raise OkxError("mt5_down", self._failure)
+        raise Mt5Error("mt5_down", self._failure)
 
     def _error(self) -> tuple[int, str]:
         try:
@@ -184,10 +196,10 @@ class Mt5Link:
                 if code <= -10000:  # IPC errors: the terminal is gone
                     self._ready = False
                 if name == "account_info":
-                    raise OkxError(
+                    raise Mt5Error(
                         "mt5_login", "MT5 终端开着，但还没登录交易账户。请远程桌面进服务器，在 MT5 里登录并勾上“保存密码”"
                     )
-                raise OkxError("mt5_error", f"MT5 没有返回数据（{name}：{code} {message}）")
+                raise Mt5Error("mt5_error", f"MT5 没有返回数据（{name}：{code} {message}）")
             return result
 
     def last_error(self) -> tuple[int, str]:
@@ -269,7 +281,7 @@ class Mt5Client:
             candidates = self._link.call("symbols_get", f"{wanted}*") or ()
             names = [str(item.name) for item in candidates if str(item.name).upper().startswith(wanted.upper())]
             if not names:
-                raise OkxError("no_data", f"MT5 里找不到 {wanted} 这个品种")
+                raise Mt5Error("no_data", f"MT5 里找不到 {wanted} 这个品种")
             name = sorted(names, key=len)[0]
             info = self._link.call("symbol_info", name)
         if info is not None and not getattr(info, "visible", True):
@@ -292,13 +304,13 @@ class Mt5Client:
     def _info(self, inst_id: str):
         info = self._link.call("symbol_info", self.symbol(inst_id))
         if info is None:
-            raise OkxError("no_data", f"MT5 没有返回 {inst_id} 的品种信息")
+            raise Mt5Error("no_data", f"MT5 没有返回 {inst_id} 的品种信息")
         return info
 
     def _tick(self, symbol: str):
         tick = self._link.call("symbol_info_tick", symbol)
         if tick is None or not (getattr(tick, "bid", 0) or getattr(tick, "ask", 0)):
-            raise OkxError("no_data", f"MT5 没有 {symbol} 的报价")
+            raise Mt5Error("no_data", f"MT5 没有 {symbol} 的报价")
         self._link.learn_offset(symbol, tick)
         return tick
 
@@ -334,7 +346,7 @@ class Mt5Client:
     def _rates(self, symbol: str, bar: str, limit: int):
         frame = TIMEFRAMES.get(bar)
         if frame is None:
-            raise OkxError("bad_bar", f"MT5 没有 {bar} 这种 K 线")
+            raise Mt5Error("bad_bar", f"MT5 没有 {bar} 这种 K 线")
         rates = self._link.call("copy_rates_from_pos", symbol, frame, 0, max(1, int(limit)))
         return rates if rates is not None else []
 
@@ -696,7 +708,7 @@ class Mt5Client:
             start, end = self._history_range(2)
             found = [row for row in (self._link.call("history_orders_get", start, end) or ()) if str(row.comment or "") == cl_ord_id]
         if not found:
-            raise OkxError("51603", "MT5 里查不到这张单")
+            raise Mt5Error("51603", "MT5 里查不到这张单")
         tickets = {int(row.ticket) for row in found}
         deals = [deal for deal in self._deals(2) if int(deal.order) in tickets]
         first = min(found, key=lambda row: int(row.ticket))
@@ -830,14 +842,14 @@ class Mt5TradeClient(Mt5Client):
         account = self._account()
         real = int(account.trade_mode) == TRADE_MODE_REAL
         if self._real and not real:
-            raise OkxError("mt5_account", "TRADING=live，但 MT5 现在登录的是模拟账户，不下单")
+            raise Mt5Error("mt5_account", "TRADING=live，但 MT5 现在登录的是模拟账户，不下单")
         if not self._real and real:
-            raise OkxError("mt5_account", "TRADING=demo，但 MT5 现在登录的是实盘账户，不下单")
+            raise Mt5Error("mt5_account", "TRADING=demo，但 MT5 现在登录的是实盘账户，不下单")
         terminal = self._link.call("terminal_info")
         if not terminal.trade_allowed:
-            raise OkxError("10027", RETCODE_TEXT[10027] + "，机器人下不了单。请在服务器的 MT5 工具栏上点开它")
+            raise Mt5Error("10027", RETCODE_TEXT[10027] + "，机器人下不了单。请在服务器的 MT5 工具栏上点开它")
         if not account.trade_allowed or not getattr(account, "trade_expert", True):
-            raise OkxError("10026", RETCODE_TEXT[10026])
+            raise Mt5Error("10026", RETCODE_TEXT[10026])
 
     def _send(self, request: dict, what: str):
         self._check()
@@ -852,7 +864,7 @@ class Mt5TradeClient(Mt5Client):
         if retcode in RETCODE_UNKNOWN:
             raise OkxNetworkError(f"MT5 等交易服务器回应超时，不确定{what}有没有生效")
         words = RETCODE_TEXT.get(retcode) or str(getattr(result, "comment", "") or "交易服务器拒绝了")
-        raise OkxError(str(retcode), words)
+        raise Mt5Error(str(retcode), words)
 
     def _deviation(self, info, price: float) -> int:
         point = float(info.point) or 0.01
@@ -875,7 +887,7 @@ class Mt5TradeClient(Mt5Client):
         step = _dec(info.volume_step)
         lots = (Decimal(str(sz)) / step).to_integral_value(rounding="ROUND_DOWN") * step
         if lots < _dec(info.volume_min):
-            raise OkxError("10014", f"数量 {sz} 手小于最小手数 {_number(info.volume_min)}")
+            raise Mt5Error("10014", f"数量 {sz} 手小于最小手数 {_number(info.volume_min)}")
         return float(lots)
 
     def _market_order(self, symbol: str, info, buy: bool, volume: float, comment: str, ticket: int | None = None, sl=None, tp=None):
@@ -911,12 +923,12 @@ class Mt5TradeClient(Mt5Client):
         volume = self._volume(info, sz)
         if reduce_only:
             if ord_type != "market":
-                raise OkxError("mt5_reduce", "MT5 没有只减仓的限价单。要在某个价位平仓，请用止盈价")
+                raise Mt5Error("mt5_reduce", "MT5 没有只减仓的限价单。要在某个价位平仓，请用止盈价")
             return self._reduce(symbol, info, "short" if buy else "long", volume, cl_ord_id)
         if ord_type == "market":
             return str(self._market_order(symbol, info, buy, volume, cl_ord_id, sl=sl_trigger_px, tp=tp_trigger_px).order)
         if px is None:
-            raise OkxError("mt5_price", "限价单要有价格")
+            raise Mt5Error("mt5_price", "限价单要有价格")
         request = {
             "action": ACTION_PENDING, "symbol": symbol, "volume": volume, "type": BUY_LIMIT if buy else SELL_LIMIT,
             "price": self._price(info, px), "type_time": TIME_GTC, "type_filling": FILLING_RETURN, "comment": cl_ord_id[:31],
@@ -931,7 +943,7 @@ class Mt5TradeClient(Mt5Client):
         tickets = self._direction_tickets(symbol, direction)
         held = sum(float(row.volume) for row in tickets)
         if held + 1e-9 < volume:
-            raise OkxError("mt5_reduce", f"要平 {_number(volume)} 手，可{_side(direction)}单只有 {_number(held)} 手")
+            raise Mt5Error("mt5_reduce", f"要平 {_number(volume)} 手，可{_side(direction)}单只有 {_number(held)} 手")
         left = volume
         last = ""
         for done, row in enumerate(tickets):
@@ -942,7 +954,7 @@ class Mt5TradeClient(Mt5Client):
                 last = str(self._market_order(symbol, info, direction == "short", part, comment, ticket=int(row.ticket)).order)
             except OkxError as exc:
                 if done:
-                    raise OkxError(exc.code, f"{exc}（前面 {done} 张单已经平掉）") from None
+                    raise Mt5Error(exc.code, f"{exc}（前面 {done} 张单已经平掉）") from None
                 raise
             left -= part
         return last
@@ -957,14 +969,14 @@ class Mt5TradeClient(Mt5Client):
         direction = pos_side if pos_side in ("long", "short") else None
         tickets = self._direction_tickets(symbol, direction)
         if not tickets:
-            raise OkxError("mt5_no_position", "MT5 里没有这个仓位")
+            raise Mt5Error("mt5_no_position", "MT5 里没有这个仓位")
         for done, row in enumerate(tickets):
             long = int(row.type) == POSITION_BUY
             try:
                 self._market_order(symbol, info, not long, float(row.volume), cl_ord_id, ticket=int(row.ticket))
             except OkxError as exc:
                 if done:
-                    raise OkxError(exc.code, f"{exc}（前面 {done} 张单已经平掉）") from None
+                    raise Mt5Error(exc.code, f"{exc}（前面 {done} 张单已经平掉）") from None
                 raise
 
     # ------------------------------------------------ take-profit / stop-loss
@@ -974,7 +986,7 @@ class Mt5TradeClient(Mt5Client):
         info = self._link.call("symbol_info", symbol)
         tickets = self._direction_tickets(symbol, direction)
         if not tickets:
-            raise OkxError("mt5_no_position", "MT5 里没有这个仓位，止损止盈挂不上")
+            raise Mt5Error("mt5_no_position", "MT5 里没有这个仓位，止损止盈挂不上")
         for done, row in enumerate(tickets):
             new_sl = 0.0 if clear else (self._price(info, sl) if sl else float(row.sl or 0))
             new_tp = 0.0 if clear else (self._price(info, tp) if tp else float(row.tp or 0))
@@ -983,7 +995,7 @@ class Mt5TradeClient(Mt5Client):
                 self._send(request, "改止损止盈")
             except OkxError as exc:
                 if done:
-                    raise OkxError(exc.code, f"{exc}（前面 {done} 张单已经改好）") from None
+                    raise Mt5Error(exc.code, f"{exc}（前面 {done} 张单已经改好）") from None
                 raise
 
     def _stop_target(self, algo_id: str) -> tuple[str, str] | None:
@@ -1035,7 +1047,7 @@ class Mt5TradeClient(Mt5Client):
         # The stop-loss / take-profit that comes with a pending order.
         rows = [row for row in self._pending() if str(row.ticket) == str(algo_id)]
         if not rows:
-            raise OkxError("51603", "MT5 里查不到这张单")
+            raise Mt5Error("51603", "MT5 里查不到这张单")
         row = rows[0]
         info = self._link.call("symbol_info", str(row.symbol))
         request = {

@@ -67,8 +67,9 @@ def test_a_ticket_without_a_stop_leaves_the_position_without_one_and_take_profit
 def test_not_logged_in_says_so():
     reader, fake = client()
     fake.logged_in = False
-    with pytest.raises(OkxError, match="还没登录"):
+    with pytest.raises(OkxError, match="还没登录") as caught:
         reader.account_state()
+    assert str(caught.value).startswith("MT5 终端开着") and caught.value.code == "mt5_login"  # no "OKX error" in front
 
 
 def test_gold_is_read_from_mt5_and_everything_else_from_okx():
@@ -379,6 +380,18 @@ def test_nothing_to_list_is_an_empty_list_and_a_lost_terminal_is_found_again():
     fake.positions_get = lambda **kwargs: ()
     reader.account_state()
     assert len(calls) == 1 and calls[0]["timeout"] == 20_000
+
+
+def test_without_mt5_path_the_terminal_where_the_installer_puts_it_is_used(tmp_path):
+    terminal = tmp_path / "terminal64.exe"
+    terminal.write_bytes(b"")
+    fake = FakeMt5(Clock(START))
+    calls = []
+    fake.initialize = lambda **kwargs: calls.append(kwargs) or True
+    Mt5Link(module=fake, terminals=(str(tmp_path / "missing.exe"), str(terminal))).call("terminal_info")
+    Mt5Link("D:/own/terminal64.exe", module=fake, terminals=(str(terminal),)).call("terminal_info")
+    Mt5Link(module=fake, terminals=(str(tmp_path / "missing.exe"),)).call("terminal_info")
+    assert [call.get("path") for call in calls] == [str(terminal), "D:/own/terminal64.exe", None]
 
 
 def test_a_close_and_a_new_position_straight_after_are_two_things():

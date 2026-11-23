@@ -414,7 +414,7 @@ class Reporter:
         state = self.current_state()
         version = f"（v{__version__}）"
         if state is None:
-            body = f"机器人已启动{version}，但还没读到 OKX 账户。稍后如果连续失败，我会再提醒你。"
+            body = f"机器人已启动{version}，但还没读到 {self._cfg.broker_name} 账户。稍后如果连续失败，我会再提醒你。"
         else:
             # Short: a restart is not news. The positions in one line each; the full card is one word away.
             lines = [f"机器人已启动{version}，开始监控。", "", f"**账户权益** {_usd(state.snapshot.total_eq)}"]
