@@ -218,6 +218,7 @@ class FakeAnalyst:
         self.error: AnalystUnavailable | None = None
         self.reply: str | None = None  # what answer() gives back; "AI:answer" when not set
         self.command = ""  # what to_command() gives back: the owner's words as a fixed-pattern order
+        self.plan = None  # what day_plan() gives back, (text, items); a long XAU plan when not set
         self.calls: list[tuple[str, dict]] = []
 
     def _record(self, name: str, **details) -> str:
@@ -251,11 +252,25 @@ class FakeAnalyst:
         self.calls.append(("small_talk", {"text": text}))
         return "" if self.error else "AI:hello"
 
-    def brief(self, kind, market_text, account_text, journal_text, for_owner, shared_with_group=False):
+    def brief(self, kind, market_text, account_text, journal_text, for_owner, shared_with_group=False, plan_note=""):
         return self._record(
             "brief", kind=kind, market_text=market_text, account_text=account_text, journal_text=journal_text,
-            for_owner=for_owner, shared_with_group=shared_with_group,
+            for_owner=for_owner, shared_with_group=shared_with_group, plan_note=plan_note,
         )
+
+    def attach_discipline(self, check):
+        self.setup_check = check
+
+    def day_plan(self, day, market_text, account_text, rules, instruments, earlier="", reason=""):
+        self._record(
+            "day_plan", day=day, market_text=market_text, account_text=account_text, rules=rules,
+            instruments=tuple(instruments), earlier=earlier, reason=reason,
+        )  # fmt: skip
+        if self.plan is not None:
+            return self.plan
+        from bot.discipline import extract_plan
+
+        return extract_plan(self.reply or 'AI:plan\n<plan>{"inst":"XAU-USDT-SWAP","bias":"long","support":[3550],"resistance":[3610]}</plan>')
 
     def weekly_review(self, market_text, journal_text, equity_text, shared_with_group=False, week_figures=""):
         return self._record(

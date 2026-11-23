@@ -127,6 +127,16 @@ CREATE TABLE IF NOT EXISTS alerts (
     done_ts INTEGER,
     done_price REAL
 );
+CREATE TABLE IF NOT EXISTS plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    items TEXT NOT NULL DEFAULT '[]',
+    text TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_plans_day ON plans (day);
 CREATE TABLE IF NOT EXISTS wishes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
@@ -474,6 +484,32 @@ class Journal:
         with self._lock:
             self._db.execute("DELETE FROM dialog WHERE ts < ?", (int(ts),))
             self._db.commit()
+
+    # ----------------------------------------------------------------- plans
+
+    def add_plan(self, day: str, items: list[dict], text: str, revision: int = 0, reason: str = "", ts: float | None = None) -> int:
+        """A trading day's plan (discipline.py). The latest one of a day is the one in force; the earlier ones stay."""
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO plans (day, ts, items, text, revision, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (day, int(ts or time.time()), json.dumps(items, ensure_ascii=False), text, int(revision), reason),
+            )
+            self._db.commit()
+            return int(cursor.lastrowid)
+
+    def plans_for(self, day: str) -> list[dict]:
+        """Every plan made for this trading day, the first one first."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM plans WHERE day = ? ORDER BY id", (day,)).fetchall()
+        found = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["items"] = json.loads(item["items"] or "[]")
+            except ValueError:
+                item["items"] = []
+            found.append(item)
+        return found
 
     # ---------------------------------------------------------------- alerts
 

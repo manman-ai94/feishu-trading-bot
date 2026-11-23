@@ -1,4 +1,4 @@
-"""Runs the timed jobs (pre-market brief, daily wrap, weekly review) in the
+"""Runs the timed jobs (pre-market brief, daily wrap, weekly review, the day's trading plan) in the
 owner's time zone. Each job runs at most once per day, even across restarts,
 because every run is written to the journal."""
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .config import Config
+from .discipline import PLAN_WEEKDAYS_NY, plan_time
 from .journal import Journal
 
 log = logging.getLogger(__name__)
@@ -39,6 +40,9 @@ def scheduled_jobs(cfg: Config, now_local: datetime) -> list[tuple[str, datetime
     if cfg.weekend_check and now_ny.weekday() == WEEKEND_CHECK_NY[0]:
         friday = now_ny.replace(hour=WEEKEND_CHECK_NY[1], minute=0, second=0, microsecond=0)
         jobs.append(("weekend", friday.astimezone(now_local.tzinfo)))
+    if cfg.plan_required and now_ny.weekday() in PLAN_WEEKDAYS_NY:
+        # 17:05 New York, just after gold's session ends: the plan for the trading day that begins (discipline.py).
+        jobs.append(("plan", plan_time(now_local.timestamp()).astimezone(now_local.tzinfo)))
     return jobs
 
 

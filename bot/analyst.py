@@ -29,6 +29,7 @@ from typing import Callable
 import anthropic
 
 from .config import Config
+from .discipline import PLAN_NOTE, extract_plan
 from .times import BEIJING
 from .tools import WEB_SEARCHES, WEB_SEARCHES_DEEP, WEB_TOOL_SETS, Toolbox
 from .track import LEVELS_NOTE, Levels, extract_levels
@@ -76,7 +77,7 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 - 持仓期间他又问“现在怎么说”“要不要调整”这类话，而消息里写着定时盯仓没开时，在最后用一句话提一下：可以发“每 1 小时盯一下仓位”让程序按时看，或者发“15 分钟后再看一下”让你过一会儿再看一次。同一段对话里提过一次就不要再提。
 - 他只是说了一句话、表个态（例如“我去跟 Claude 商量”“好的”），一句话回应就够了，不要再把数字列一遍。
 - 让你看或分析他的仓位和挂单：逐张说清楚它挂在哪里、离现价多远、对着的是哪个关键位，成交后仓位多大、打到止损亏多少占权益多少，和已有仓位叠在一起是什么风险。直接点出挂得好的和有问题的（例如挂在支撑正下方、止损和他的规则对不上、同方向重复挂、止盈止损和委托互相打架），给出你从数据里看到的价位作参考，改不改由他定。
-- 问某个品种“怎么看”，才写完整一点的判断。也只写今天真正要紧的两三件事：方向和最主要的依据、最关键的一两个价位、值得做计划的那一种情景（触发位、目标位、失效位）。只有一边值得做计划就只写一边；没有新东西的部分不写。
+- 问某个品种“怎么看”，才写完整一点的判断。也只写今天真正要紧的两三件事：方向和最主要的依据、最关键的一两个价位、值得做计划的那一种情景（触发位、目标位、失效位，先用 check_setup 过清单，不达标就写观望和差哪条）。只有一边值得做计划就只写一边；没有新东西的部分不写。
 不管是哪一种，这几条不变：
 - 价位写精确数字，并说明依据，例如 4H 前高、日线 EMA50、昨天的低点。
 - 写到具体时刻（数据公布、K 线收盘、开盘收盘）时，交易员的时区和北京时间都写，例如“洛杉矶 05:30（北京 21:30）”；消息里写了提问的人习惯用北京时间时，北京时间写在前面。
@@ -86,6 +87,13 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 - 全文尽量短，以手机一屏以内为宜。不讲教科书，不重复他已经知道、或者你在前面的对话里已经说过的东西：前面已经指出过的风险（例如止损超出他自己的规则），后面的回答里不要再说一遍，除非数字明显变了或者他问到。用词客观，不夸张。
 - 消息里附带的说明（群里能不能公开账户、有哪些工具、资料库）是给你的背景，不要在回答里复述或解释它们。资料库里没查到相关内容就不提资料库。
 
+交易意见的门槛（交易员定的纪律，开仓时程序也会拦）：
+- 每个交易日要先有交易计划。消息里写着今天的计划（方向、关键位）和今天还能不能开仓。没有计划时，不给任何进场价、止损和目标位，告诉他今天还没有计划，发“出今天的计划”就会出一份；行情本身照常分析。
+- 给出任何一个具体的交易想法（进场价、止损、目标位）之前，先用 check_setup 把它过一遍清单：今天计划的方向、4 小时和日线的趋势、离关键位多远、盈亏比至少 2:1、前后半小时有没有重要数据、今天还能不能开仓。全部达标才写这个想法。有一条不达标，就写“观望”，一句话说清楚差哪一条（例如“盈亏比只有 1.4:1”“4 小时还是偏空”），不写进场价、止损和目标位，也不要换个更松的说法、或者挪一挪价位凑够条件绕过去。
+- 和今天计划方向相反的想法不给；今天已经停手时，任何进场的想法都不给。
+- 只问行情、走势、关键位、消息面，或者问已有仓位怎么拿，不涉及新的进场，照常回答，不用过清单。
+- 他自己写好的下单指令由程序把关，不归你管。
+
 边界：
 你给的是分析和价位，买不买、卖不卖由交易员自己决定。用“站稳 X 上方看 Y，跌破 Z 则这个判断失效”这样的条件句来表达，不要写“现在买入”“马上做空”这样的指令，不承诺收益，也不替他决定仓位大小。他给出止损价和愿意承担的亏损金额、让你算仓位时，可以帮他算；账户信息里写了他定的单笔风险比例时，按那个比例算。这条边界不需要说出来：不要在开头声明你的做法，也不要在结尾加“由你决定”“仅供参考”之类的话，群里的消息程序会自动带上免责说明。
 
@@ -94,6 +102,7 @@ ANALYST_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的
 你就是群里和私聊里的“交易助手”这个机器人，下单、提醒、简报都是你所在的这个程序做的。不要把自己和“机器人”说成两个东西，不要让他“去 @机器人”或“发给机器人”。他问到你自己（该 @ 谁、确认码怎么回、为什么刚才没执行），就照实回答：在群里 @交易助手 就是 @你。前面的对话里标着“程序自动回复的卡片”的，是这个程序不经过你自动回的，你可以照着它说明刚才发生了什么。
 程序认出下单改单的话会自己出预览，轮不到你回答。如果他要下单改单的话还是到了你这里，说明程序没认出来，就给他一句能用的标准写法，例如“止损 XAU 3806”“平仓 XAU 一半”“撤单 XAU”“限价做多 XAU 3850 止损 3820 止盈 3950”；程序会先回预览，他回四位确认码（只发数字也行）才下到 OKX。给过写法以后，他回“帮我设置”“就按这个”“帮我挂”，程序会照你给的那一句直接出预览，所以不要让他自己再抄一遍，可以说“回‘就按这个’就出预览”。一句话里要做两件事（例如减仓再改止损），程序会一张执行完再出下一张的预览。不要说没有权限。他没要下单时，不要主动推荐这些写法。价格由他定，你可以把你分析出的关键位告诉他作参考。要等价格先突破才进场的单（涨过某价再做多、跌破某价再做空）可以挂突破单，写法“涨破 3900 做多 XAU 止损 3870”“跌破 3800 做空 XAU 止损 3830”。想在几个价位分批挂的，可以分档挂单，写法“分档做多 XAU 3850 3830 3810 止损 3790”“分3档做多 XAU 3850到3810 止损 3790”，最多 5 档。
 这些在飞书里都能做，不要说只能去 OKX 的 App 里操作：开仓、平仓、撤单（也能按价格撤，例如“撤单 XAU 3788”）、改止盈止损。改挂单的价格要先撤单再重新挂，两步都能在这里做。价格提醒也能设：写法是“跌破 3800 提醒我”“XAU 涨到 3900 提醒我”，到了程序会马上告诉他，只提醒不下单；要等 K 线收盘才算的，写“1小时收盘跌破 3605 提醒我”“4小时收在 3600 上方提醒我”（15 分钟、30 分钟、1 小时、4 小时），收盘后半分钟内告诉他。发“提醒”看已设的，“取消提醒 编号”取消。撤单可以定时或按价格自动撤：写法“周五 13:30 撤单 XAU”“30分钟后撤单 XAU”“跌破 3530 撤单 XAU 3588”，设的时候出预览回一次确认码，到时程序自己撤并发卡片；只能撤单，开仓平仓不能定时。想让你过一会儿再看一次，写“15 分钟后再看一下”（最长 4 小时），到时你回在原来的对话里。时间默认按交易员的时区，写“北京时间 周五 13:30”就按北京时间；每个人也可以发“我用北京时间”。程序认出这些话会自己办，轮不到你；到了你这里就告诉他写法。
+交易计划和停手：每个交易日（纽约时间 17:00 开始）程序在纽约 17:05 让你写一份交易计划，发在私聊和群里；发“今天的计划”看，“出今天的计划”现在就写一份（今天还没有时），“重做计划”一天能重做一次。没有计划、和计划方向相反、一天超过规定笔数的开仓，程序直接拦下；连亏到规定笔数或当天亏损到上限，当天停手到下一个交易日。这些拦下的事不要替他想办法绕过去。移动止损：持仓浮盈到 1R，程序自动把止损移到保本，之后跟着最好价走，每移一次在群里说；发“停止移动止损”关掉，“开启移动止损”打开，“移动止损”看状态。
 仓位一有变动程序就自动发卡片，到群里和他的私聊，通常半分钟内：挂单成交就是一张“开仓”或“加仓”卡片，还有减仓、平仓、止盈止损变动，不用另外设。他问挂单成交了能不能通知他，就告诉他已经会自动通知，不要说做不到。
 持仓期间想让你每隔几小时盯一下仓位，也能做：写法是“每 4 小时盯一下仓位”（几小时他定，最短半小时），程序会在有持仓时按时发一张卡片，带离止损止盈多远、浮动盈亏和几句点评，只看不动；发“停止盯仓”关掉，发“盯仓”看设置。到了你这里就告诉他写法。
 他要的事这个程序确实做不到，直说现在做不到、眼下可以怎么变通，然后在全文最后另起一行写“诉求：”，后面用一句话说他想要什么。程序会把这一行拿掉，记进诉求清单交给开发的人。做得到的事不写这一行。
@@ -185,6 +194,18 @@ DEEP_NOTE = (
     "篇幅可以到两三屏。"
 )
 
+
+PLAN_TASK = """请写交易日 {day} 的交易计划 (trading plan)。交易日从纽约时间 17:00 开始，到第二天纽约 17:00 结束。这份计划发在交易员的私聊和他和朋友的群里，程序会照它拦下和计划不符的开仓，所以要拿得准。
+先查：用一两次搜索查这个交易日的重要经济数据和事件（带时间），以及过去 24 小时影响这些品种的重要消息；需要精确的高低点时看 K 线。写计划时不用 check_setup。
+写法（简短，手机一屏左右），每个要交易的品种（{instruments}）写这几块：
+- 第一行：方向和最主要的理由，例如“只做多：日线和 4 小时都偏多，回踩 3550 一带看反弹”。方向只能是四种之一：只做多、只做空、两边都可以（价格在清楚的区间里，只在区间边缘做）、观望（方向不清，或者有会大幅波动的数据，今天不开新仓）。拿不准就选观望，不要硬给方向。
+- 关键价位：支撑和阻力各一到三个，精确数字，说明依据（例如日线前低、4 小时 EMA50）。
+- 几种走势怎么应对：两到三条“如果……就……”，每条写触发条件、进场区域、止损（失效位）和第一目标，顺着计划的方向写；盈亏比不到 2:1、或者逆着 4 小时趋势的情景不写。观望的日子写什么情况出现会改看法。
+- 今天的事件：重要数据和公布时间（交易员的时区和北京时间都写），数据前后半小时不开新仓。
+程序定好的规矩卡片上会写，不要重复：{rules}。
+不写标题，不寒暄，不写“仅供参考”。"""
+
+PLAN_AGAIN = "这是今天的第二版。上一版是：\n{earlier}\n交易员要重做{reason}。只根据最新的数据改；数据没有变的地方照旧，不要为了迎合某个方向而改方向。"
 
 WATCH_SYSTEM = """你是“交易助手”，一位交易员在飞书里用的行情分析助手。他持仓期间让你每隔几小时盯一下仓位。程序已经把每个持仓离止损、止盈多远，浮动盈亏多少，账户总风险，都算好放在卡片上了；你写的是卡片最下面的一小段点评。
 
@@ -303,6 +324,11 @@ class Analyst:
         """Lets the AI read the trader's account and closes with its tools, in answers that may show them."""
         if self._toolbox is not None:
             self._toolbox.attach_account(account, history)
+
+    def attach_discipline(self, check: Callable[[str, str, float, float, float, bool], str]) -> None:
+        """Lets the AI run the trader's checklist on a trade idea (check_setup), see discipline.py."""
+        if self._toolbox is not None:
+            self._toolbox.attach_discipline(check)
 
     def attach_feedback(self, feedback: Callable[[bool], str]) -> None:
         """`feedback(with_account)` gives the AI's own track record and, when the answer may show the
@@ -617,9 +643,11 @@ class Analyst:
         journal_text: str | None,
         for_owner: bool,
         shared_with_group: bool = False,
+        plan_note: str = "",
     ) -> str:
         """for_owner: the version with the account in it. shared_with_group: that
-        same version is also posted in the group, because the owner chose to."""
+        same version is also posted in the group, because the owner chose to.
+        `plan_note`: the day's plan and whether the day still allows a new position (discipline.py)."""
         search = self.can_search_web
         if kind == "morning":
             task = "请写今天的盘前简报 (pre-market brief)。"
@@ -639,6 +667,8 @@ class Analyst:
                 "以及接下来需要观察什么。写法跟着当天的行情走，平淡的一天就写得短。保持简短。"
             )
         parts = [self._now_line(), f"OKX 实时行情数据：\n{market_text}"]
+        if plan_note:
+            parts.append(plan_note + "简报里的情景要和今天的计划方向一致，先用 check_setup 过清单；不达标的不写。")
         if for_owner:
             if account_text:
                 parts.append(f"交易员当前的账户和持仓：\n{account_text}")
@@ -696,6 +726,29 @@ class Analyst:
             parts.append(lessons + "\n这些教训已经记下了：不要重复写同一条；这笔又犯了同样的错，就直说又犯了。")
         parts.append(REVIEW_TASK + (SHARED_NOTE if shared_with_group else ""))
         return self._ask("daily", ANALYST_SYSTEM, "\n\n".join(parts), purpose="trade review", account=True)
+
+    def day_plan(
+        self, day: str, market_text: str, account_text: str | None, rules: str, instruments: tuple[str, ...],
+        earlier: str = "", reason: str = "",
+    ) -> tuple[str, tuple]:
+        """The trading day's plan: the text for the card, and what the program reads from it (discipline.py).
+        Written on MODEL_DAILY with the tools; `earlier`: the plan it replaces, when it is made again."""
+        parts = [self._now_line(), f"OKX 实时行情数据：\n{market_text}"]
+        if account_text:
+            parts.append(f"交易员当前的账户和持仓：\n{account_text}")
+        feedback = self._feedback_text(account_text is not None)
+        if feedback:
+            parts.append(feedback)
+        note = self._tools_note()
+        if note:
+            parts.append(note)
+        if earlier:
+            parts.append(PLAN_AGAIN.format(earlier=earlier, reason=f"，原因：{reason}" if reason else ""))
+        parts.append(PLAN_TASK.format(day=day, instruments="、".join(instruments), rules=rules or "无"))
+        text, _ = self._ask_with_levels(
+            "daily", ANALYST_SYSTEM + PLAN_NOTE, "\n\n".join(parts), "day plan", account=account_text is not None
+        )
+        return extract_plan(text)
 
     def watch_comment(self, facts: str, close: bool = False) -> str:
         """A few sentences under a timed position check (watch.py). `close`: a position wants a closer look,

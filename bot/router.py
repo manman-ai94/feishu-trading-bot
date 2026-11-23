@@ -39,6 +39,7 @@ from . import sources, wishes
 from .alerts import PriceAlerts
 from .analyst import Analyst, AnalystUnavailable
 from .config import Config
+from .discipline import day_label
 from .feishu_client import FeishuClient, FeishuError, IncomingMessage
 from .instruments import ALIASES, InstrumentResolver
 from .knowledge import KnowledgeBase
@@ -75,9 +76,15 @@ HELP_TEXT = """我是交易助手，可以做这些事：
 - 发“成绩单”，看我给过的点位事后对了多少（可以加品种和天数，例如“成绩单 XAU 90天”）
 - 在群里 @我 发“登记本群”，简报和提醒就会发到那个群
 - 私聊我发“重启”，我会重新启动并读取新的配置
+- 交易计划：每个交易日（纽约时间 17:00 开始）我在纽约 17:05 写一份计划发出来，写明今天只做多、只做空、两边都可以还是观望，关键价位和几种走势怎么应对。没有计划、和计划方向相反、超过每天笔数的开仓直接拦下；连亏 3 笔或当天亏到上限就停手到下一个交易日。发“今天的计划”看，“出今天的计划”现在就写，“重做计划”一天能重做一次
+- 移动止损：持仓浮盈到 1R，止损自动移到保本，之后跟着最好价走，每移一次在群里说。发“移动止损”看状态，“停止移动止损”关掉，“开启移动止损”打开
 - 在群里发“@我 设置主人 @某人”（也可以写他的名字），他就和你有一样的权限（提问、看账户、下单，每单照样要他自己回确认码）；“取消主人”拿掉，发“主人”看名单。只有你能设
 
 我每天定时发盘前简报和收盘小结，仓位有变动时会自动提醒。我只做分析、提醒和执行主人确认过的指令，不替任何人做买卖决定。"""
+
+_PLAN_SHOW = re.compile(r"^(?:看一?下|看看)?(?:今天|今日)?的?(?:交易)?计划(?:呢|是什么|是啥)?$|^/plan$")
+_PLAN_MAKE = re.compile(r"^(?:请|帮我|给我)?(?:出|做|写|生成)(?:一份|一下|个)?(?:今天|今日)?的?(?:交易)?计划(?:吧)?$|^/plan new$")
+_PLAN_REDO = re.compile(r"^(?:请|帮我|给我)?(?:重做|重新做|重写|重新写|更新)(?:一下)?(?:今天|今日)?的?(?:交易)?计划|^/plan redo")
 
 OWNER_ONLY_TEXT = "我只响应主人的指令。仓位变动和简报我会自动发到群里。"
 TRADE_OWNER_ONLY_TEXT = "下单、平仓、撤单、改止损这类指令只有主人能发。"
@@ -234,6 +241,8 @@ class Router:
         later: Callable[[float, Callable[[], None]], Callable[[], None]] | None = None,
         alerts: PriceAlerts | None = None,
         watch: PositionWatch | None = None,
+        discipline=None,
+        trail=None,
     ):
         """`save_setting(name, value)` writes one line of .env, so a group the
         owner registers survives a restart. `restart()` ends the process; the
@@ -242,7 +251,8 @@ class Router:
         the trade desk (trading.py), which reads the owner's order commands.
         `journal` holds the track record the owner can ask for. `later(seconds,
         call)` runs a call after a delay and returns what cancels it. `alerts`
-        reads the owner's price alerts ("跌破 3800 提醒我"). `watch` reads "每 4 小时盯一下仓位"."""
+        reads the owner's price alerts ("跌破 3800 提醒我"). `watch` reads "每 4 小时盯一下仓位". `discipline`
+        keeps the day's plan ("今天的计划"); `trail` moves stops ("停止移动止损")."""
         self._cfg = cfg
         self._save_setting = save_setting
         self._restart = restart
@@ -260,6 +270,8 @@ class Router:
         self._later = later or _call_later
         self._alerts = alerts
         self._watch = watch
+        self._discipline = discipline
+        self._trail = trail
         self._lock = threading.Lock()
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._group_questions: dict[str, int] = {}  # local date -> count
@@ -389,6 +401,8 @@ class Router:
             self._learn(message, _note_body(text))
         elif _ZONE_PREF.match(text.strip(" 。.!！~")):
             self._zone_command(message, text)
+        elif self._plan_command(message, text) or self._trail_command(message, text):
+            pass
         elif not self._watch_command(message, text) and not self._recheck_command(message, text):
             # Before the orders: "跌破 3800 提醒我平仓" asks to be told, never for a close.
             alert = self._alerts.handle(text, message.chat_id) if self._alerts is not None else None
@@ -481,6 +495,60 @@ class Router:
         minutes = data.get("minutes") or 0
         asked = data.get("question") or RECHECK_QUESTION
         self._reply_analysis(message, f"（{minutes:g} 分钟前他让你过一会儿再看一次，现在到时间了）{asked}", True)
+
+    def _plan_command(self, message: IncomingMessage, text: str) -> bool:
+        """ "今天的计划", "出今天的计划", "重做计划：原因". False when the message is none of them."""
+        if self._discipline is None:
+            return False
+        said = re.sub(r"\s+", " ", text.strip().strip(" 。.!！~?？")).lower()
+        redo = _PLAN_REDO.match(said)
+        if not redo and not _PLAN_MAKE.match(said) and not _PLAN_SHOW.match(said):
+            return False
+        plan = self._discipline.plan()
+        if not redo and (plan is not None or not _PLAN_MAKE.match(said)):
+            if plan is None:
+                reply = f"今天（交易日 {day_label(self._discipline.today())}）还没有交易计划，现在不能开新仓。发“出今天的计划”，我现在就写一份。"
+                self._feishu.reply_text(message.message_id, reply)
+            else:
+                amounts = message.is_private or self._reporter.group_shares_account
+                card = self._discipline.card(plan, amounts)
+                if _PLAN_MAKE.match(said):
+                    card += "\n\n（今天的计划已经有了。要重做发“重做计划”，可以带上原因，一天能重做一次。）"
+                footer = None if message.is_private else DISCLAIMER
+                self._feishu.reply_markdown(message.message_id, self._discipline.title(plan), card, "turquoise", footer=footer)
+                reply = "（回了今天的交易计划）"
+            self._remember_fixed(message.chat_id, text, "", reply)
+            return True
+        reason = text.strip()[redo.end():].strip(" ：:，,。") if redo else ""
+        done = self._show_working(message)  # "重做计划" with no plan yet writes the first one
+        try:
+            made, why = self._reporter.write_plan(reason=reason, again=bool(redo and plan is not None))
+        finally:
+            done()
+        if made is None:
+            reply = why
+        elif not message.is_private:
+            reply = f"写好了，见群里的“{self._discipline.title(made)}”卡片。"
+        elif message.sender_open_id == self._cfg.owner_open_id:
+            reply = "写好了，卡片已经发给你，也发到了群里。"
+        else:
+            self._feishu.reply_markdown(message.message_id, self._discipline.title(made), self._discipline.card(made, True), "turquoise")
+            self._remember_fixed(message.chat_id, text, "", "（回了今天的交易计划）")
+            return True
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember_fixed(message.chat_id, text, "", reply)
+        return True
+
+    def _trail_command(self, message: IncomingMessage, text: str) -> bool:
+        """ "停止移动止损", "开启移动止损", "移动止损". False when the message is none of them."""
+        if self._trail is None:
+            return False
+        reply = self._trail.handle(text)
+        if reply is None:
+            return False
+        self._feishu.reply_text(message.message_id, reply)
+        self._remember_fixed(message.chat_id, text, "", reply)
+        return True
 
     def _watch_command(self, message: IncomingMessage, text: str) -> bool:
         """ "每 4 小时盯一下仓位", "停止盯仓", "盯仓". False when the message is none of them."""
@@ -1134,6 +1202,9 @@ class Router:
     def _notes(self, message: IncomingMessage, with_account: bool) -> list[str]:
         """What the program knows that the AI cannot see: the zone the asker reads, the watch being off."""
         notes = []
+        plan = self._reporter.plan_note(with_account) if self._discipline is not None else ""
+        if plan:
+            notes.append(plan)
         if self._zone(message.sender_open_id) is BEIJING or getattr(self._zone(message.sender_open_id), "key", "") == "Asia/Shanghai":
             notes.append("提问的人习惯用北京时间，写时刻时北京时间写在前面。")
         if with_account and self._watch is not None:

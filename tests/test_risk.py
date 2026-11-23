@@ -506,7 +506,7 @@ def test_the_check_is_due_an_hour_before_gold_closes_on_friday():
     assert due_jobs(cfg, friday, lambda name: False) == ["weekend"]
     assert due_jobs(cfg, friday.replace(hour=12, minute=59), lambda name: False) == []
     assert due_jobs(cfg, friday, lambda name: name == "weekend") == []
-    assert scheduled_jobs(cfg, friday.replace(day=19)) == []
+    assert [name for name, _ in scheduled_jobs(cfg, friday.replace(day=19))] == ["plan"]  # Thursday: only the day's plan
     assert scheduled_jobs(make_cfg(brief_morning=None, brief_evening=None, weekly_review=None, weekend_check=False), friday) == []
     # Where Friday evening UTC is already Saturday morning, it runs then.
     hanoi = datetime(2026, 11, 21, 4, 10, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))

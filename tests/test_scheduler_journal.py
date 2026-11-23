@@ -26,14 +26,14 @@ def test_jobs_are_due_from_their_time_until_the_grace_period_ends():
     assert due_jobs(cfg, at(16, 6, 0), never) == ["morning"]
     assert due_jobs(cfg, at(16, 7, 29), never) == ["morning"]
     assert due_jobs(cfg, at(16, 7, 30), never) == []  # more than 90 minutes late: skipped
-    assert due_jobs(cfg, at(16, 14, 10), never) == ["evening"]
+    assert due_jobs(cfg, at(16, 14, 10), never) == ["evening", "plan"]  # the day's plan at 17:05 New York
 
 
 def test_weekly_review_only_on_its_weekday():
     cfg = make_cfg()
     assert due_jobs(cfg, at(15, 17, 5), never) == ["weekly"]  # Sunday
     assert due_jobs(cfg, at(16, 17, 5), never) == []  # Monday
-    assert [name for name, _ in scheduled_jobs(cfg, at(15, 0, 0))] == ["morning", "evening", "weekly"]
+    assert [name for name, _ in scheduled_jobs(cfg, at(15, 0, 0))] == ["morning", "evening", "weekly", "plan"]
 
 
 def test_switched_off_jobs_are_never_due():

@@ -185,7 +185,7 @@ class SelfTest:
 
     def _opening(self, spec: InstrumentSpec, last: Decimal) -> Command:
         stop = self._below(last, STOP_PCT) if self._stop_needed() else None
-        return Command("open", inst_id=self._inst_id, direction="long", ord_type="market", size=spec.min_sz * LOTS, unit="contracts", sl=stop)
+        return Command("open", inst_id=self._inst_id, direction="long", ord_type="market", size=spec.min_sz * LOTS, unit="contracts", sl=stop, source="selftest")
 
     def _stop_needed(self) -> bool:
         """The settings refuse an opening order without a stop (TRADE_REQUIRE_STOP, TRADE_MAX_RISK_PCT)."""
@@ -254,14 +254,14 @@ class SelfTest:
         )  # fmt: skip
         merged = self._below(last, MERGED_STOP_PCT)
         self._step(
-            "加仓合成一张止损", Command("open", inst_id=inst_id, direction="long", ord_type="market", size=one, unit="contracts", sl=merged),
+            "加仓合成一张止损", Command("open", inst_id=inst_id, direction="long", ord_type="market", size=one, unit="contracts", sl=merged, source="selftest"),
             lambda view: self._stops_are(view, size, merged, None),
         )  # fmt: skip
         limit_stop = self._below(resting, STOP_PCT) if self._stop_needed() else None
         found: list[tuple[OrderInfo | None, str, str]] = []
         self._step(
             "限价挂单",
-            Command("open", inst_id=inst_id, direction="long", ord_type="limit", size=one, unit="contracts", px=resting, sl=limit_stop),
+            Command("open", inst_id=inst_id, direction="long", ord_type="limit", size=one, unit="contracts", px=resting, sl=limit_stop, source="selftest"),
             lambda view: found.append(self._resting(view, one, resting)) or found[-1][1:],
         )
         order = found[-1][0]  # the check passed, so this is the order it saw
@@ -273,7 +273,7 @@ class SelfTest:
         waiting: list[tuple[str, str, str]] = []
         self._step(
             "突破单",
-            Command("open", inst_id=inst_id, direction="long", ord_type="trigger", size=one, unit="contracts", px=trigger, sl=stop),
+            Command("open", inst_id=inst_id, direction="long", ord_type="trigger", size=one, unit="contracts", px=trigger, sl=stop, source="selftest"),
             lambda view: waiting.append(self._breakout(view, one, trigger, stop)) or waiting[-1][1:],
         )
         algo_id = waiting[-1][0]
@@ -285,7 +285,7 @@ class SelfTest:
         tier_stop = self._below(tiers[-1], STOP_PCT)
         self._step(
             "分两档挂单",
-            Command("open", inst_id=inst_id, direction="long", ord_type="limit", size=one * 2, unit="contracts", sl=tier_stop, tiers=tiers),
+            Command("open", inst_id=inst_id, direction="long", ord_type="limit", size=one * 2, unit="contracts", sl=tier_stop, tiers=tiers, source="selftest"),
             lambda view: self._ladder(view, one, tiers, tier_stop),
         )
         self._step(

@@ -1612,3 +1612,47 @@ def test_the_flat_card_shows_the_last_close():
     [reply] = bench.say("仓位")
     assert "当前没有持仓。" in reply.body and "**最近一笔平仓**：" in reply.body and "XAU 空单 10,000 张" in reply.body
     assert "已实现盈亏 +130.70 USDT" in reply.body
+
+
+# ------------------------------------------------------------ the day's plan and the trailing stop
+
+
+def disciplined(**cfg) -> Bench:
+    from bot.discipline import Discipline
+    from bot.trail import TrailingStops
+
+    bench = Bench(**cfg)
+    discipline = Discipline(bench.cfg, bench.journal, bench.okx, clock=bench.clock)
+    bench.reporter.discipline = bench.router._discipline = discipline
+    bench.router._trail = TrailingStops(bench.cfg, bench.journal, bench.okx, None, lambda title, text: None, clock=bench.clock)
+    return bench
+
+
+def test_the_owner_asks_for_the_plan_has_it_written_and_redoes_it_once():
+    bench = disciplined()
+    out = bench.say("今天的计划")
+    assert out[0].body.startswith("今天（交易日 01-15 周五）还没有交易计划，现在不能开新仓")
+    assert bench.analyst.named("day_plan") == []
+
+    out = bench.say("出今天的计划")
+    assert [(sent.target, sent.title) for sent in out[:-1]][-2:] == [(OWNER, "交易计划 · 01-15 周五"), (GROUP, "交易计划 · 01-15 周五")]
+    assert out[-1].body == "写好了，卡片已经发给你，也发到了群里。"
+
+    out = bench.say("看一下今天的交易计划")
+    assert out[-1].how == "reply_markdown" and out[-1].title == "交易计划 · 01-15 周五" and "只做多" in out[-1].body
+    assert "今天的计划已经有了" in bench.say("出今天的计划", message_id="om_again")[-1].body
+    assert len(bench.analyst.named("day_plan")) == 1
+
+    bench.say("重做计划：非农超预期，金价跌破支撑")
+    assert bench.analyst.named("day_plan")[1]["reason"] == "非农超预期，金价跌破支撑"
+    assert bench.say("重做计划")[-1].body.startswith("今天的计划已经重做过了")
+
+
+def test_the_owner_switches_the_trailing_stop_off_and_on():
+    bench = disciplined()
+    assert bench.say("停止移动止损")[-1].body.startswith("移动止损关了")
+    assert bench.journal.get_setting("trail_stop", "") == "off"
+    assert bench.say("移动止损")[-1].body.startswith("移动止损现在关着")
+    assert bench.say("开启移动止损")[-1].body.startswith("移动止损开了")
+    bench.say("停止移动止损", sender=FRIEND, private=False)  # a friend's words change nothing
+    assert bench.journal.get_setting("trail_stop", "") == "on"

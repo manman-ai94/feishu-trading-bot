@@ -59,6 +59,7 @@ class Position:
     ccy: str = ""  # the currency the margin and the PnL are counted in, e.g. USDT
     coins: float | None = None  # what the contracts add up to, e.g. 10 (XAU); filled in from the contract size
     coin_ccy: str = ""
+    c_time: int = 0  # when OKX opened this position, in milliseconds; additions keep it
 
     @property
     def pnl_ccy(self) -> str:
@@ -130,6 +131,7 @@ class Position:
             mgn_ratio=to_float(row.get("mgnRatio")),
             pos_id=str(row.get("posId", "")),
             u_time=int(to_float(row.get("uTime")) or 0),
+            c_time=int(to_float(row.get("cTime")) or 0),
             stops=stops,
             ccy=str(row.get("ccy", "") or ""),
         )

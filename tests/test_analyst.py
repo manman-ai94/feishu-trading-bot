@@ -687,3 +687,28 @@ def test_two_steps_in_one_sentence_come_back_as_two_lines():
     bot._ask = fake_ask.__get__(bot)
     assert bot.to_command("减仓减5 xau 然后止损设在3730", "（持仓）") == "减仓 XAU 5个\n止损 XAU 3730"
     assert "按先后写成两行" in COMMAND_SYSTEM and "帮我设置" in COMMAND_SYSTEM
+
+
+def test_the_day_plan_is_written_on_the_daily_tier_and_its_block_cut_out():
+    from bot.discipline import PLAN_NOTE
+
+    written = '**今天偏多**，回踩 3,860 附近看多。\n<plan>{"items":[{"inst":"XAU-USDT-SWAP","bias":"long","support":[3860,3840],"resistance":[3920]}]}</plan>'
+    bot, client = analyst(beta=[message(written)])
+    text, items = bot.day_plan("01-12 周二", "最新价：3,880.00", None, "今天最多开 3 笔新仓", ("XAU-USDT-SWAP",))
+    assert text == "**今天偏多**，回踩 3,860 附近看多。" and "<plan>" not in text
+    assert [(i.inst_id, i.bias, i.support, i.resistance) for i in items] == [("XAU-USDT-SWAP", "long", (3860.0, 3840.0), (3920.0,))]
+    [call] = client.beta.messages.calls
+    assert call["system"] == ANALYST_SYSTEM + PLAN_NOTE and call["output_config"] == {"effort": "medium"}
+    asked = call["messages"][0]["content"]
+    asked = asked if isinstance(asked, str) else "".join(block.get("text", "") for block in asked)
+    assert "01-12 周二" in asked and "今天最多开 3 笔新仓" in asked and "原因" not in asked
+
+    bot, client = analyst(beta=[message("今天观望。")])  # no block: nothing the program can hold an order to
+    assert bot.day_plan("01-12 周二", "行情", None, "", ("XAU-USDT-SWAP",), earlier="偏多", reason="数据超预期")[1] is None
+    asked = client.beta.messages.calls[0]["messages"][0]["content"]
+    asked = asked if isinstance(asked, str) else "".join(block.get("text", "") for block in asked)
+    assert "偏多" in asked and "原因：数据超预期" in asked
+
+
+def test_the_ai_is_told_to_give_trade_advice_only_when_the_checklist_passes():
+    assert "check_setup" in ANALYST_SYSTEM and "观望" in ANALYST_SYSTEM

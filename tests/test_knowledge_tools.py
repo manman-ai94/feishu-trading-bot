@@ -155,3 +155,20 @@ def test_tool_failures_come_back_as_errors_not_exceptions(tmp_path):
     assert is_error and "取不到 BTC-USDT-SWAP" in text
     text, is_error = box.run("get_candles", {"symbol": "BTC", "bar": "1H"})
     assert is_error and "连不上 OKX" in text
+
+
+def test_the_checklist_tool_is_offered_once_attached_and_checks_its_input(tmp_path):
+    box, _, _ = toolbox(tmp_path)
+    assert "check_setup" not in [tool["name"] for tool in box.definitions()]
+    asked = []
+    box.attach_discipline(lambda *args: asked.append(args) or "清单（XAU 多）：…\n结论：可以给出交易意见。")
+    names = [tool["name"] for tool in box.definitions()]
+    assert names[:4] == ["get_market", "get_candles", "search_knowledge", "check_setup"]
+    assert all(name.startswith(("get_", "search_", "check_")) for name in names[:4])  # it reads, it changes nothing
+    text, is_error = box.run("check_setup", {"symbol": "黄金", "side": "long", "entry": 3880, "stop": 3860.5, "target": 3930})
+    assert not is_error and text.endswith("可以给出交易意见。")
+    assert asked == [("XAU-USDT-SWAP", "long", 3880.0, 3860.5, 3930.0, False)]
+    text, is_error = box.run("check_setup", {"symbol": "XAU", "side": "buy", "entry": 3880, "stop": 3860, "target": 3930})
+    assert is_error and "side" in text
+    text, is_error = box.run("check_setup", {"symbol": "XAU", "side": "long", "entry": 3880, "stop": "3860", "target": 3930})
+    assert is_error and "stop 要是正数" in text

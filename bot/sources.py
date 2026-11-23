@@ -11,6 +11,7 @@ deciding works for the owner, and which does not.
   own      a command the owner typed in full
   signal   a strategy's signal (kept for the strategy that is not built yet)
   manual   not placed by the bot: the owner opened it in the OKX app
+  trail    a stop moved by the trailing stop (trail.py), never an opening
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ SOURCE_NAMES = {
     "own": "自己写的指令",
     "signal": "策略信号",
     "manual": "OKX 里手动下的",
+    "trail": "移动止损",
 }
 PLAN_WORDS = (
     "按刚才", "按你说的", "按你刚才", "按计划", "按这个计划", "按你的计划", "照计划", "情景", "按照", "照着",

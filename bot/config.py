@@ -76,6 +76,20 @@ def _get_float(name: str, default: float | None, problems: list[str]) -> float |
         return default
 
 
+def _pct_or_off(name: str, default: float, problems: list[str]) -> float | None:
+    """A share of the equity, 0 < x <= 100. 0 or "off" switches it off; left out, the default holds."""
+    raw = _get(name)
+    if raw == "":
+        return default
+    value = _get_float(name, default, problems)
+    if value is None or value <= 0:
+        return None
+    if value > 100:
+        problems.append(f"{name} 是百分比，不能超过 100，按 {default:g} 算")
+        return default
+    return value
+
+
 def _get_int(name: str, default: int, problems: list[str]) -> int:
     value = _get_float(name, float(default), problems)
     return int(value) if value is not None else default
@@ -184,6 +198,12 @@ class Config:
     trade_breaker_hours: int = 24  # ... within this many hours
     trade_stop_trigger: str = "last"  # what price fires a stop the bot places: last, mark or index
     trade_actions: tuple[str, ...] = TRADE_ACTIONS  # the kinds of command that are carried out; the rest are refused
+    # Discipline (discipline.py, trail.py): the day's plan and when the day stops. 0 switches a count off.
+    plan_required: bool = True  # no new position on a trading day without that day's plan, nor against it
+    plan_max_trades: int = 3  # new positions in one trading day
+    plan_max_loss_pct: float | None = 25.0  # a day's realised loss, as a share of the equity it began with, stops it
+    loss_streak_stop: int = 3  # this many losing trades in a row stop the day
+    trail_stop: bool = True  # at 1R in profit the stop goes to break-even, then follows the best price by 2 ATR
 
     @property
     def tz(self) -> ZoneInfo:
@@ -459,6 +479,11 @@ def load_config(env_file: str | os.PathLike | None = ".env") -> tuple[Config, li
         trade_breaker_hours=min(168, max(1, _get_int("TRADE_BREAKER_HOURS", 24, problems))),
         trade_stop_trigger=stop_trigger,
         trade_actions=trade_actions,
+        plan_required=_get_bool("PLAN_REQUIRED", True),
+        plan_max_trades=max(0, _get_int("PLAN_MAX_TRADES", 3, problems)),
+        plan_max_loss_pct=_pct_or_off("PLAN_MAX_LOSS_PCT", 25.0, problems),
+        loss_streak_stop=max(0, _get_int("LOSS_STREAK_STOP", 3, problems)),
+        trail_stop=_get_bool("TRAIL_STOP", True),
     )
 
     if not cfg.feishu_app_id or not cfg.feishu_app_secret:

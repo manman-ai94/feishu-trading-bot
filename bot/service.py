@@ -3,7 +3,9 @@ the group, and sends it."""
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Callable
@@ -13,6 +15,7 @@ from .analyst import Analyst, AnalystUnavailable
 from .book import book_text, read_book
 from .closes import close_lines, history_text, read_closed, read_triggers
 from .config import Config
+from .discipline import DayPlan, day_label, plan_due
 from .feishu_client import FeishuClient
 from .journal import Journal
 from .market import build_market_context
@@ -44,6 +47,7 @@ EVENT_COLOURS = {
 RISK_KINDS = ("margin_warning", "liq_warning", "daily_loss", "no_stop", "risk_level")
 RECENT_ORDERS_HOURS = 24
 RECENT_ORDERS_SHOWN = 8
+STOP_NOTE_SECONDS = 600  # a trailing stop's reason waits this long for the card of its change
 RESULT_NAMES = {"ok": "已执行", "rejected": "没有执行", "partial": "只执行了一部分", "unknown": "结果不确定"}
 
 
@@ -63,7 +67,8 @@ def recent_orders_text(rows: list[dict], tz) -> str:
         detail = row["detail"].replace("\n", "；")
         if len(detail) > 200:
             detail = detail[:200] + "……"
-        lines.append(f"- {when} {mode} {row['summary']}：{RESULT_NAMES.get(row['result'], row['result'])}。{detail}")
+        auto = "（移动止损，程序自动发的，不用确认码）" if row.get("source") == "trail" else ""
+        lines.append(f"- {when} {mode} {row['summary']}{auto}：{RESULT_NAMES.get(row['result'], row['result'])}。{detail}")
     return "\n".join(lines)
 
 
@@ -92,6 +97,10 @@ class Reporter:
         self.breaker_alert: Callable[[], str] | None = None  # set by the app: the trade desk's circuit breaker notice
         self.monitor: Monitor | None = None  # set by the app once both exist
         self.reviewer = None  # review.Reviewer, set by the app when CLOSE_REVIEW is on
+        self.discipline = None  # discipline.Discipline, set by the app: the day's plan and when the day stops
+        self._stop_notes: dict[str, tuple[float, str]] = {}  # instrument -> (when, why its stop is being moved)
+        self._notes_lock = threading.Lock()
+        self._plan_lock = threading.Lock()
 
     # ----------------------------------------------------------- destinations
 
@@ -238,7 +247,29 @@ class Reporter:
 
     # ----------------------------------------------------------------- events
 
+    def expect_stop(self, inst_id: str, line: str) -> None:
+        """Why the next stop change of this instrument happens (a trailing stop's move, trail.py), for the card
+        the monitor sends when it sees it. "" forgets it."""
+        with self._notes_lock:
+            if line:
+                self._stop_notes[inst_id] = (self._clock(), line)
+            else:
+                self._stop_notes.pop(inst_id, None)
+
+    def _with_stop_note(self, event: Event) -> Event:
+        if event.kind != "stop_changed":
+            return event
+        with self._notes_lock:
+            note = self._stop_notes.pop(event.inst_id, None)
+        if note is None or self._clock() - note[0] > STOP_NOTE_SECONDS:
+            return event
+        return replace(
+            event, title=event.title.replace("止盈止损变动", "移动止损"),
+            private_lines=(*event.private_lines, note[1]), public_lines=(*event.public_lines, note[1]),
+        )  # fmt: skip
+
     def notify_event(self, event: Event) -> None:
+        event = self._with_stop_note(event)
         template = "red" if event.warning else EVENT_COLOURS.get(event.kind, "blue")
         hint = self._watch_hint(event)
         try:
@@ -253,6 +284,8 @@ class Reporter:
             self.to_group(event.title, (body or "（无更多信息）") + hint, template, footer=DISCLAIMER)
         if event.kind in ("closed", "reduced") and self.breaker_alert is not None:
             self._tell_breaker()
+        if event.kind in ("closed", "reduced") and self.discipline is not None:
+            self._tell_day_stop()
         if event.kind == "closed" and self.reviewer is not None:
             self.reviewer.on_close(event.inst_id)
 
@@ -285,6 +318,95 @@ class Reporter:
                     self.to_group("熔断：开仓已暂停", text, "red", footer=DISCLAIMER)
         except Exception:
             log.exception("could not check the circuit breaker")
+
+    def _tell_day_stop(self) -> None:
+        """After a close: whether the day has just stopped (losses in a row, or the day's loss limit)."""
+        try:
+            private, public = self.discipline.stop_alert()
+            if private:
+                self._owner_safely("今天停手：不再开新仓", private, "red")
+                if self._cfg.group_chat_id:
+                    self.to_group("今天停手：不再开新仓", private if self.group_shares_account else public, "red", footer=DISCLAIMER)
+        except Exception:
+            log.exception("could not check whether the day stopped")
+
+    # ------------------------------------------------------------------- plans
+
+    def write_plan(self, reason: str = "", again: bool = False) -> tuple[DayPlan | None, str]:
+        """Has the AI write the current trading day's plan, keeps it and sends its card to the owner and the
+        group. Returns (the plan, "") or (None, why not). One at a time: the 17:05 job and a start-up that
+        finds no plan must not write two."""
+        with self._plan_lock:
+            return self._write_plan(reason, again)
+
+    def _write_plan(self, reason: str, again: bool) -> tuple[DayPlan | None, str]:
+        discipline = self.discipline
+        if discipline is None:
+            return None, "交易计划没有打开。"
+        day = discipline.today()
+        earlier = discipline.plan(day)
+        if earlier is not None and not again:
+            return earlier, ""
+        if earlier is not None and discipline.revisions_left(day) <= 0:
+            return None, f"今天的计划已经重做过了，一天只能重做一次。新的交易日 {discipline.next_day_text()}开始。"
+        try:
+            status = discipline.status()
+        except (OkxError, OkxNetworkError):
+            status = None
+        state = self.current_state()
+        account = self.account_for_ai() if state is not None and state.positions else None
+        try:
+            text, items = self._analyst.day_plan(
+                day_label(day), self.market_text(), account, discipline.rules_text(status, amounts=True),
+                self._cfg.tradable_instruments, earlier.text if earlier else "", reason,
+            )  # fmt: skip
+        except AnalystUnavailable as exc:
+            log.warning("the day's plan was not written: %s", exc)
+            return None, f"交易计划没有写成：{exc}"
+        if not items:
+            log.warning("the day's plan came without the block the program reads")
+            return None, "交易计划没有写成：AI 没给出程序能读的方向和关键位。请再发一次“出今天的计划”。"
+        plan = discipline.keep(day, items, text, reason)
+        title = discipline.title(plan)
+        self._owner_safely(title, discipline.card(plan, amounts=True), "turquoise")
+        if self._cfg.group_chat_id:
+            try:
+                self.to_group(title, discipline.card(plan, amounts=self.group_shares_account), "turquoise", footer=DISCLAIMER)
+            except Exception:
+                log.exception("could not send the plan to the group")
+        return plan, ""
+
+    def scheduled_plan(self) -> None:
+        """At 17:05 New York, Sunday to Thursday: the plan of the trading day that has just begun."""
+        if self.discipline is None or plan_due(self._clock()) is None:
+            return
+        self._plan_or_say_why()
+
+    def plan_if_missing(self) -> None:
+        """On start: the plan of a weekday's trading day that has none yet (the first run after an install, or a
+        restart that missed 17:05). Once a day at most, since the plan is kept."""
+        discipline = self.discipline
+        if discipline is None or not self._cfg.plan_required:
+            return
+        day = discipline.today()
+        if day.weekday() >= 5 or discipline.plan(day) is not None:
+            return
+        log.info("the trading day %s has no plan yet: writing it now", day)
+        self._plan_or_say_why()
+
+    def _plan_or_say_why(self) -> None:
+        plan, why = self.write_plan()
+        if plan is None:
+            self._owner_safely("交易计划没有写成", f"{why}\n没有计划时不能开新仓。", "red")
+
+    def plan_note(self, with_status: bool) -> str:
+        if self.discipline is None:
+            return ""
+        try:
+            return self.discipline.notes_for_ai(with_status)
+        except Exception:
+            log.exception("could not write the day's plan out for the AI")
+            return ""
 
     def send_startup(self, downtime: tuple[float, float] | None = None, restarted: str = "", news: str = "") -> None:
         """`downtime` is (last seen running, now) when the bot was off long enough to matter; `restarted` says
@@ -365,8 +487,9 @@ class Reporter:
         if self._cfg.owner_open_id or shared:
             try:
                 text = self._analyst.brief(
-                    kind, market, account, journal if kind == "evening" else None, for_owner=True, shared_with_group=shared
-                )
+                    kind, market, account, journal if kind == "evening" else None, for_owner=True, shared_with_group=shared,
+                    plan_note=self.plan_note(True),
+                )  # fmt: skip
             except AnalystUnavailable as exc:
                 log.warning("%s brief not generated: %s", kind, exc)
                 self._owner_safely(title, f"这次简报没有生成：{exc}", "grey")
@@ -376,7 +499,7 @@ class Reporter:
                     self.to_group(title, text, "indigo", footer=DISCLAIMER)
         if self._cfg.group_chat_id and not shared:
             try:
-                text = self._analyst.brief(kind, market, None, None, for_owner=False)
+                text = self._analyst.brief(kind, market, None, None, for_owner=False, plan_note=self.plan_note(False))
                 self.to_group(title, text, "indigo", footer=DISCLAIMER)
             except AnalystUnavailable as exc:
                 log.warning("group brief not generated: %s", exc)

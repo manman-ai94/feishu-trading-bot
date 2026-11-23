@@ -111,6 +111,28 @@ CLIENT_TOOLS: tuple[dict, ...] = (
         "input_schema": {"type": "object", "properties": {}},
     },
 )
+# Offered once the toolbox has the trader's checklist (discipline.py).
+SETUP_TOOL = {
+    "name": "check_setup",
+    "description": (
+        "The trader's own checklist for one trade idea, run by the program: today's plan and its direction, the "
+        "4-hour and daily trend, how close the entry is to a key level, reward to risk (at least 2:1), major US data "
+        "within half an hour, and whether the day still allows a new position. Call it before writing any concrete "
+        "trade idea (an entry with a stop and a target). If any item fails, do not give the idea: answer 观望 and say "
+        "which item fails."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string", "description": "Ticker, name or OKX instrument id."},
+            "side": {"type": "string", "enum": ["long", "short"]},
+            "entry": {"type": "number", "description": "Entry price; the middle of an entry zone."},
+            "stop": {"type": "number", "description": "Stop-loss (invalidation) price."},
+            "target": {"type": "number", "description": "The first target price."},
+        },
+        "required": ["symbol", "side", "entry", "stop", "target"],
+    },
+}
 # Offered only for an answer that may show the trader's account, and only once the toolbox has a way to read it.
 ACCOUNT_TOOLS: tuple[dict, ...] = (
     {
@@ -158,11 +180,16 @@ class Toolbox:
         self._macro = macro  # macro.Macro, or None when MACRO_DATA is off
         self._account: Callable[[], str | None] | None = None
         self._history: Callable[[int], str] | None = None
+        self._setup: Callable[[str, str, float, float, float, bool], str] | None = None
 
     def attach_account(self, account: Callable[[], str | None], history: Callable[[int], str]) -> None:
         """How the account tools read: `account()` the account and its orders, fresh; `history(days)` the closes.
         Given once the reporter that owns the account reads exists."""
         self._account, self._history = account, history
+
+    def attach_discipline(self, check: Callable[[str, str, float, float, float, bool], str]) -> None:
+        """`check(inst_id, side, entry, stop, target, amounts)`: the checklist's verdict, in words."""
+        self._setup = check
 
     def definitions(self, web_level: int = 0, web_searches: int = WEB_SEARCHES, account: bool = False) -> list[dict]:
         """Tool definitions in a fixed order, so the cached prompt prefix stays the same.
@@ -172,6 +199,8 @@ class Toolbox:
             for tool in CLIENT_TOOLS
             if tool["name"] not in OPTIONAL_TOOLS or getattr(self, OPTIONAL_TOOLS[tool["name"]]) is not None
         ]
+        if self._setup is not None:
+            tools.append(SETUP_TOOL)
         if account and self._account is not None:
             tools.extend(ACCOUNT_TOOLS)
         for tool in WEB_TOOL_SETS[min(web_level, len(WEB_TOOL_SETS) - 1)]:
@@ -203,6 +232,8 @@ class Toolbox:
                 return self._positioning(tool_input), False
             if name == "get_macro":
                 return self._macro_text(), False
+            if name == "check_setup":
+                return self._check_setup(tool_input, account), False
             raise ToolError(f"没有叫 {name} 的工具。")
         except ToolError as exc:
             return str(exc), True
@@ -264,6 +295,21 @@ class Toolbox:
         if not text:
             raise ToolError(f"{inst_id} 没有群体持仓数据。OKX 只给合约提供大户多空比，CFTC 周报目前只接了黄金。")
         return text
+
+    def _check_setup(self, tool_input: dict, account: bool) -> str:
+        if self._setup is None:
+            raise ToolError("这次没有清单可用。")
+        inst_id = self._instrument(tool_input)
+        side = tool_input.get("side")
+        if side not in ("long", "short"):
+            raise ToolError("side 只能是 long 或 short。")
+        prices = []
+        for name in ("entry", "stop", "target"):
+            value = tool_input.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ToolError(f"{name} 要是正数。")
+            prices.append(float(value))
+        return self._setup(inst_id, side, *prices, account)
 
     def _macro_text(self) -> str:
         if self._macro is None:

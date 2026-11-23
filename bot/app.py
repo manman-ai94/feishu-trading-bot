@@ -15,6 +15,7 @@ from .alerts import AlertWatcher, PriceAlerts
 from .analyst import Analyst, Usage
 from .config import Config
 from .crowd import Crowd
+from .discipline import Discipline
 from .econ import ReleaseWatcher
 from .macro import Macro
 from .okx_stream import BUSINESS_CHANNELS, OkxStream, Streams, business_url, stream_url
@@ -31,6 +32,7 @@ from .router import Router
 from .scheduler import Scheduler
 from .service import Reporter
 from .tools import Toolbox
+from .trail import TrailingStops
 from .review import LESSONS_DAYS, LESSONS_SHOWN, Reviewer, lessons_text
 from .track import Levels, Scorer, track_text_for_ai
 from .trading import TradeDesk
@@ -255,6 +257,11 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
 
     desk = build_trade_desk(cfg, journal, okx, resolver, reporter)
     reporter.breaker_alert = desk.breaker_alert
+    discipline = Discipline(cfg, journal, desk.account_reader, breaker=desk.breaker_text_now)
+    desk.discipline = discipline
+    reporter.discipline = discipline
+    analyst.attach_discipline(discipline.check_setup)
+    trail = TrailingStops(cfg, journal, desk.account_reader, desk, reporter.send_alert, reporter.expect_stop)
     alerts = PriceAlerts(
         journal, okx, resolver, lambda: cfg.watch_instruments[0] if cfg.watch_instruments else "",
         shares_with_group=lambda: reporter.group_shares_account, tz=cfg.tz,
@@ -265,7 +272,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     router = Router(
         cfg, feishu, okx, analyst, reporter, bot_open_id, save_setting=save_setting, restart=restart,
         resolver=resolver, knowledge=knowledge, usage=journal.usage_between, trade=desk, journal=journal,
-        alerts=alerts, watch=watch,
+        alerts=alerts, watch=watch, discipline=discipline, trail=trail,
     )  # fmt: skip
     log.info("trading: %s (instruments: %s)", desk.mode, ", ".join(cfg.tradable_instruments))
     log.info("owners: the owner and %d other(s) with the same rights", len(cfg.co_owner_open_ids))
@@ -277,6 +284,19 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         cfg.model_daily, cfg.effort_daily, cfg.effort_account, cfg.model_short, cfg.effort_short, cfg.model_deep, cfg.effort_deep,
         "on" if cfg.web_search else "off", "on" if crowd is not None else "off",
         "on" if macro is not None else "off", len(knowledge.summary()), "on" if cfg.close_review else "off",
+    )  # fmt: skip
+
+    limits = []
+    if cfg.plan_max_trades:
+        limits.append(f"{cfg.plan_max_trades} new position(s) a day")
+    if cfg.loss_streak_stop:
+        limits.append(f"stop after {cfg.loss_streak_stop} losses in a row")
+    if cfg.plan_max_loss_pct:
+        limits.append(f"or a day's loss of {cfg.plan_max_loss_pct:g}%")
+    log.info(
+        "discipline: plan %s, %s; trailing stops %s",
+        "required" if cfg.plan_required else "not required", ", ".join(limits) or "no daily limits",
+        "on" if trail.enabled() else "off",
     )  # fmt: skip
 
     stop = threading.Event()
@@ -296,6 +316,7 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
             "evening": lambda: reporter.send_brief("evening"),
             "weekly": reporter.send_weekly_review,
             "weekend": reporter.send_weekend_check,
+            "plan": reporter.scheduled_plan,
         },
     )
     threading.Thread(target=scheduler.run_forever, args=(stop,), name="scheduler", daemon=True).start()
@@ -310,6 +331,8 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     watcher = AlertWatcher(journal, okx, reporter.send_alert, tz=cfg.tz, act=run_job)
     threading.Thread(target=watcher.run_forever, args=(stop,), name="alerts", daemon=True).start()
     log.info("price alerts: %d active", len(journal.alerts("active")))
+    if cfg.has_okx_keys:
+        threading.Thread(target=trail.run_forever, args=(stop,), name="trail", daemon=True).start()
     if cfg.has_okx_keys:
         threading.Thread(target=watch.run_forever, args=(stop,), name="watch", daemon=True).start()
         watching = watch.watching()
@@ -343,6 +366,8 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
         told(journal)
     except Exception:
         log.exception("could not send the start-up message")
+    if cfg.plan_required:  # after the start-up card: a trading day without its plan gets one now
+        threading.Thread(target=reporter.plan_if_missing, name="plan", daemon=True).start()
 
     # Messages are handled on worker threads so a slow AI answer never blocks
     # the connection to Feishu.

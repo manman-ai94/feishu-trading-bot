@@ -883,10 +883,17 @@ class TradeDesk:
         self.stream_status: Callable[[], str] | None = None  # set by the app: whether OKX's push stream is up
         self._demo_trader = demo_trader
         self._twin: TradeDesk | None = None  # the rehearsal's desk on the demo account, while trading live
+        # Set by the app: the day's plan and when the day stops (discipline.py). The rehearsal's twin has none.
+        self.discipline = None
 
     @property
     def mode(self) -> str:
         return self._mode
+
+    @property
+    def account_reader(self):
+        """The client that reads the account orders go to: the demo account while trading on demo."""
+        return self._okx
 
     def is_command(self, text: str) -> bool:
         """Whether a message reads as an order or as the code of any preview waiting: what the router turns
@@ -1428,6 +1435,53 @@ class TradeDesk:
     def _paused(self) -> bool:
         return self._journal.get_setting(PAUSED_SETTING, "0") == "1"
 
+    # ---------------------------------------------------------------- discipline
+
+    def _check_discipline(self, cmd: Command, direction: str, adding: bool) -> None:
+        """The day's plan and the day's stop (discipline.py): a new position against them is refused."""
+        if self.discipline is None or cmd.source == "selftest":
+            return
+        why = self.discipline.refusal(cmd.inst_id, direction, adding)
+        if why:
+            log.info("discipline: an opening order was refused")
+            raise Refused(why, reason="discipline")
+
+    def breaker_text_now(self) -> str:
+        """Why the circuit breaker holds new positions back; "" when it does not (or is off)."""
+        if self._cfg.trade_breaker_stops <= 0:
+            return ""
+        hits = self._breaker_hits()
+        return f"熔断中（{self._cfg.trade_breaker_hours} 小时内止损 {len(hits)} 次）" if len(hits) >= self._cfg.trade_breaker_stops else ""
+
+    def can_move_stops(self) -> bool:
+        return self._mode != "off" and "stops" in self._cfg.trade_actions
+
+    def move_stop(self, inst_id: str, direction: str, price: float) -> tuple[str, list[str], float]:
+        """A trailing stop's move (trail.py), sent without a confirmation code: the owner agreed to that for
+        this one thing. Only ever towards profit, through the same plan as "止损 XAU 价格", keeping the take-profit.
+        Returns (ok | rejected | partial | unknown, what happened, the price sent). Raises Refused when it may not be done."""
+        if not self.can_move_stops():
+            raise Refused("交易关着，或者改止损没有开放（TRADE_ACTIONS）。")
+        with self._sending:
+            _, state = self._account()
+            position = next((p for p in state.positions if p.inst_id == inst_id and p.direction == direction), None)
+            if position is None:
+                raise Refused("这个仓位已经没了。")
+            spec = self._okx.instrument_spec(inst_id)
+            new = _round_to(_dec(price), spec.tick_sz)
+            sign = 1 if direction == "long" else -1
+            current = position.stop_loss
+            if current is not None and (new - _dec(current)) * sign <= 0:
+                raise Refused(f"止损 {self._price(current, spec)} 已经不比 {_px(new, spec)} 差，不用移。")
+            takes = {s.tp_trigger_px for s in position.stops if s.tp_trigger_px}
+            if len(position.stops) > 1 and len(takes) > 1:
+                raise Refused("这个仓位有几张止盈不一样的止盈止损单，自动合并会丢掉止盈。请先发“止损 品种 价格 止盈 价格”合成一张。")
+            command = Command("stop", inst_id=inst_id, direction=direction, sl=new, source="trail")
+            plan = self._plan_stop(command, None)
+            plan = replace(plan, title=plan.title.replace("修改止盈止损", "移动止损").replace("合并止盈止损", "移动止损"))
+            result, _, _, lines = self._carry_out(plan, source="trail")
+        return result, lines, float(new)
+
     # ---------------------------------------------------------- circuit breaker
 
     def _breaker_hits(self) -> list[Hit]:
@@ -1560,6 +1614,8 @@ class TradeDesk:
         if self._mode != "off":
             lines.append("- 开仓已暂停（发“恢复交易”解除）" if self._paused() else "- 没有暂停")
             lines.append(self._breaker_status())
+            if self.discipline is not None:
+                lines.extend(f"- {line}" for line in self.discipline.status_lines())
             if cfg.trade_stop_trigger != "last":
                 lines.append(f"- 机器人挂的止损止盈按{STOP_TRIGGERS[cfg.trade_stop_trigger]}触发")
         closed = [ACTION_NAMES[action] for action in TRADE_ACTIONS if action not in cfg.trade_actions]
@@ -1872,6 +1928,7 @@ class TradeDesk:
         long = direction == "long"
         word = _side_word(direction)
         same = [p for p in held if p.direction == direction]
+        self._check_discipline(cmd, direction, adding=bool(same))
         if len(same) < len(held) and not account.hedge_mode:
             other = _side_word("short" if long else "long")
             raise Refused(
