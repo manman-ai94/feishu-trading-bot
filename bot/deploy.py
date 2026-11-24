@@ -150,10 +150,12 @@ def extract(archive: zipfile.ZipFile, names: list[str], root: Path) -> None:
 
 
 def bot_processes(root: Path, run: Callable) -> list[int]:
-    """Windows: the python processes running this install's bot ("-m bot run"), which ending the task may leave."""
+    """Windows: the python processes running this install's bot ("-m bot run") and its MT5 worker
+    ("-m bot.mt5_worker"), which ending the task may leave."""
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*-m bot run*' } | ForEach-Object { $_.ProcessId }"
+        "Where-Object { $_.CommandLine -like '*-m bot run*' -or $_.CommandLine -like '*-m bot.mt5_worker*' } | "
+        "ForEach-Object { $_.ProcessId }"
     )
     done = run(["powershell", "-NoProfile", "-Command", script], timeout=60)
     return [int(line) for line in (done.stdout or "").split() if line.strip().isdigit()]

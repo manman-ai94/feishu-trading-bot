@@ -25,6 +25,7 @@ UTC+2 otherwise).
 """
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import threading
@@ -46,6 +47,7 @@ from .models import (
     StopOrder,
     Ticker,
 )
+from .mt5_worker import CALL_TIMEOUT, Mt5Process
 from .okx_client import OkxError, OkxNetworkError
 
 log = logging.getLogger(__name__)
@@ -154,12 +156,12 @@ class Mt5Link:
 
     @property
     def mt5(self):
+        """The MetaTrader5 package, run in a child process (see mt5_worker): a terminal that does not
+        answer holds the package for a minute, and must not hold the rest of the bot with it."""
         if self._module is None:
-            try:
-                import MetaTrader5  # noqa: PLC0415  Windows only; installed on the server
-            except ImportError as exc:
-                raise Mt5Error("mt5_missing", "服务器上还没装 MetaTrader5 这个 Python 包") from exc
-            self._module = MetaTrader5
+            if importlib.util.find_spec("MetaTrader5") is None:  # Windows only; installed on the server
+                raise Mt5Error("mt5_missing", "服务器上还没装 MetaTrader5 这个 Python 包")
+            self._module = Mt5Process(timeout=CALL_TIMEOUT, connect_timeout=self._connect_ms / 1000 + CALL_TIMEOUT)
         return self._module
 
     def _connect(self) -> None:
@@ -198,6 +200,8 @@ class Mt5Link:
                     self._ready = False
                     self._failed_at = self._clock()
                     self._failure = f"MT5 终端没有回应（{code} {message}）。请确认服务器上的 MT5 开着并且登录了账户"
+                    if name == "account_info":
+                        raise Mt5Error("mt5_down", self._failure)
                 if name == "account_info":
                     raise Mt5Error(
                         "mt5_login", "MT5 终端开着，但还没登录交易账户。请远程桌面进服务器，在 MT5 里登录并勾上“保存密码”"
