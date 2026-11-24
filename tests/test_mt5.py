@@ -303,6 +303,9 @@ def test_a_size_from_the_stop_counts_the_spread_and_the_slippage():
     # 1 % of 10 000 is 100; each ounce loses 20 to the stop, 0.3 to the spread and 0.76 to slippage: 4.74 oz.
     assert "点差 0.3" in preview.text and "滑点 0.76" in preview.text
     assert "0.04 手（合 4 XAU）" in preview.text
+    assert "含点差和滑点约" in preview.text and "手续费" not in preview.text  # a standard account pays in the spread
+    with_fee = Mt5Bench(risk_per_trade_pct=1.0, mt5_commission_per_lot=7.0).say("做多 XAU 止损 3780")
+    assert "含点差、手续费和滑点约" in with_fee.text and "手续费 0.07" in with_fee.text
     without = Mt5Bench(risk_per_trade_pct=1.0)
     without.fake.set_price(3800.0, 3800.0)  # no spread, and no slippage allowed for: 20 an ounce, 5 oz
     assert "0.05 手（合 5 XAU）" in without.say("做多 XAU 止损 3780").text
@@ -368,7 +371,8 @@ def test_the_app_builds_the_mt5_clients_and_none_that_trade_while_trading_is_off
 
 
 def test_nothing_to_list_is_an_empty_list_and_a_lost_terminal_is_found_again():
-    reader, fake = client()
+    clock = Clock(START)
+    reader, fake = client(clock=clock)
     fake.history_deals_get = lambda start, end, **kwargs: None  # the package's way of saying "none"
     assert reader.position_history() == []
     calls = []
@@ -378,8 +382,35 @@ def test_nothing_to_list_is_an_empty_list_and_a_lost_terminal_is_found_again():
         reader.account_state()
     fake.initialize = lambda **kwargs: calls.append(kwargs) or True
     fake.positions_get = lambda **kwargs: ()
+    clock.advance(30)
+    with pytest.raises(OkxError, match="没有回应"):  # a stuck terminal is not asked again straight away
+        reader.account_state()
+    assert calls == []
+    clock.advance(31)
     reader.account_state()
     assert len(calls) == 1 and calls[0]["timeout"] == 20_000
+
+
+def test_the_pause_after_a_failed_connect_counts_from_when_the_attempt_ended():
+    """Connecting to a terminal that does not answer can itself take a minute: the next try waits a minute after."""
+    clock = Clock(START)
+    fake = FakeMt5(clock)
+    calls = []
+
+    def slow_refusal(**kwargs):
+        calls.append(clock())
+        clock.advance(65)
+        return False
+
+    fake.initialize = slow_refusal
+    fake.last_error = lambda: (-10005, "IPC timeout")
+    reader, _ = client(fake, clock=clock)
+    with pytest.raises(OkxError, match="IPC timeout"):
+        reader.account_state()
+    clock.advance(5)
+    with pytest.raises(OkxError, match="IPC timeout"):
+        reader.account_state()
+    assert len(calls) == 1
 
 
 def test_without_mt5_path_the_terminal_where_the_installer_puts_it_is_used(tmp_path):

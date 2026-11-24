@@ -237,6 +237,7 @@ def start_stream(cfg: Config, monitor: Monitor, stop: threading.Event) -> Stream
     return Streams(private, business)
 
 
+FIRST_READ_WAIT_SECONDS = 15.0  # how long the start waits for the first account read
 RESTART_DELAY_SECONDS = 2.0  # long enough for the "restarting" reply to leave
 
 
@@ -321,8 +322,11 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
 
     stop = threading.Event()
     if cfg.has_account:
-        monitor.poll_once()  # first read, so the start-up message has the positions
+        # The first read on the monitor's own thread: the start-up card shows the positions when it comes in time,
+        # and a terminal or exchange that does not answer cannot hold the start (and the connection to Feishu) back.
         threading.Thread(target=monitor.run_forever, args=(stop,), name="monitor", daemon=True).start()
+        if not monitor.first_read.wait(FIRST_READ_WAIT_SECONDS):
+            log.warning("the first account read takes long: starting without it")
         stream = start_stream(cfg, monitor, stop)
         desk.stream_status = stream.status if stream is not None else (lambda: f"没开，每 {cfg.poll_seconds} 秒读一次账户")
     else:

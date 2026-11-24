@@ -111,6 +111,8 @@ def test_marked_requests_and_the_card_of_the_version_that_did_them():
     releases.told(journal, "0.20.0")
     assert "不再写成 OKX" in releases.news_text(journal, "9.9.9")  # and 0.20.1
     releases.told(journal, "0.20.1")
+    assert "不再等它" in releases.news_text(journal, "9.9.9")  # and 0.20.2
+    releases.told(journal, "0.20.2")
     assert releases.news_text(journal, "9.9.9") == ""  # a version with no notes and nothing done says nothing
 
 

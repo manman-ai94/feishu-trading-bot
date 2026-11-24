@@ -357,3 +357,21 @@ def test_the_reminder_says_how_to_set_one_only_when_that_would_reach_this_accoun
     assert hint not in text(trading="live", trade_actions=("close",))
     assert hint not in text(trading="demo")  # an order would go to the demo account, not to this position
     assert hint not in text()
+
+
+def test_the_first_round_says_when_it_is_over_even_when_the_read_failed():
+    """The start waits for the first read on this event, so a read that fails must set it too."""
+    import threading
+
+    okx = FakeOkx(make_state())
+    okx.error = OkxError("mt5_down", "连不上 MT5 终端")
+    monitor = Monitor(okx, make_cfg(poll_seconds=60), Journal(":memory:"), lambda event: None, Clock(1_800_000_000.0))
+    stop = threading.Event()
+    assert not monitor.first_read.is_set()
+    worker = threading.Thread(target=monitor.run_forever, args=(stop,), daemon=True)
+    worker.start()
+    assert monitor.first_read.wait(5)
+    stop.set()
+    monitor.poke()
+    worker.join(5)
+    assert monitor.last_error.endswith("连不上 MT5 终端")

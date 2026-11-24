@@ -172,8 +172,9 @@ class Mt5Link:
             log.info("mt5: connected to the terminal")
             return
         code, message = self._error()
-        self._failed_at = now
-        self._failure = f"连不上 MT5 终端（{code} {message}）。请确认服务器上的 MT5 开着"
+        # From when the attempt ended: an attempt on a terminal that does not answer can itself take a minute.
+        self._failed_at = self._clock()
+        self._failure = f"连不上 MT5 终端（{code} {message}）。请确认服务器上的 MT5 开着并且登录了账户"
         raise Mt5Error("mt5_down", self._failure)
 
     def _error(self) -> tuple[int, str]:
@@ -193,8 +194,10 @@ class Mt5Link:
                 code, message = self._error()
                 if name in LIST_CALLS and code in (0, 1):
                     return ()
-                if code <= -10000:  # IPC errors: the terminal is gone
+                if code <= -10000:  # IPC errors: the terminal is gone or stuck; wait before trying it again
                     self._ready = False
+                    self._failed_at = self._clock()
+                    self._failure = f"MT5 终端没有回应（{code} {message}）。请确认服务器上的 MT5 开着并且登录了账户"
                 if name == "account_info":
                     raise Mt5Error(
                         "mt5_login", "MT5 终端开着，但还没登录交易账户。请远程桌面进服务器，在 MT5 里登录并勾上“保存密码”"

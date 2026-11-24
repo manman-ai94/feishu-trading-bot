@@ -264,6 +264,7 @@ class Monitor:
         self._cooldowns: dict[tuple[str, str], float] = {}
         self._wake = threading.Event()  # set by the OKX stream: read the account now, not at the next tick
         self.cycles = 0  # rounds of run_forever: the health check reads it to tell a stuck monitor
+        self.first_read = threading.Event()  # set once the first round has read the account, or failed to
         self._bare_since: dict[tuple, float] = {}  # positions without a stop-loss, and since when
         self._failures = 0
         self._down_reported = False
@@ -341,6 +342,8 @@ class Monitor:
                 self.poll_once()
             except Exception:  # keep the loop alive whatever happens
                 log.exception("monitor poll crashed")
+            finally:
+                self.first_read.set()
             self._wake.wait(self._cfg.poll_seconds)
             self._wake.clear()
 

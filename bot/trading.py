@@ -2181,7 +2181,7 @@ class TradeDesk:
         coins = contracts * per_contract
         if sl is not None:
             loss = (abs(sl - ref) + cost[0]) * coins
-            costs = f"，含手续费和滑点约 {_amt(cost[0] * coins)}（每 1 {spec.ct_val_ccy}：{cost[1]}）" if cost[0] > 0 else ""
+            costs = f"，含{self._cost_names()}约 {_amt(cost[0] * coins)}（每 1 {spec.ct_val_ccy}：{cost[1]}）" if cost[0] > 0 else ""
             lines.append(
                 f"止损 {_px(sl, spec)}（离{entry_name} {abs(sl - ref) / ref * 100:.2f}%，触发后大约亏 {_amt(loss)} {settle}"
                 f"{costs}{self._risk_share(loss, state)}）"
@@ -2397,7 +2397,7 @@ class TradeDesk:
             lines.append(f"第 {number} 档 限价 {_px(price, spec)}：{_contracts_text(each, spec)}，打到止损亏约 {_amt((abs(price - sl) + tier_cost[0]) * each * per_contract)} {settle}")
         lines.append(
             f"止损 {_px(sl, spec)}（每档成交后各自带上；全部成交再打到止损，合计大约亏 {_amt(loss)} {settle}"
-            f"{f'，含手续费和滑点（每 1 {spec.ct_val_ccy}：{tier_cost[1]}）' if tier_cost[0] > 0 else ''}{self._risk_share(loss, state)}）"
+            f"{f'，含{self._cost_names()}（每 1 {spec.ct_val_ccy}：{tier_cost[1]}）' if tier_cost[0] > 0 else ''}{self._risk_share(loss, state)}）"
         )
         if tp is not None:
             gain = sum((abs(tp - price) for price in prices), Decimal(0)) * each * per_contract
@@ -2627,6 +2627,12 @@ class TradeDesk:
             log.warning("could not read the record of %s orders: %s", source, exc)
             return ""
 
+    def _cost_names(self) -> str:
+        """What the costs in a loss are, in words: on MT5 a standard account pays through the spread."""
+        if not self._cfg.mt5:
+            return "手续费和滑点"
+        return "点差、手续费和滑点" if self._cfg.mt5_commission_per_lot else "点差和滑点"
+
     def _cost(self, inst_id: str, ref: Decimal, spec: InstrumentSpec) -> tuple[Decimal, str]:
         """What getting in and out costs per coin on top of the stop's distance, and what it is made of in words:
         OKX's fees both ways (TRADE_FEE_PCT each way) or, on MT5, the spread and the broker's commission
@@ -2720,7 +2726,7 @@ class TradeDesk:
         room_ok = most >= spec.min_sz and most > 0
         fits = f"按这个止损最多开 {_contracts_text(most, spec)}" if room_ok else "按这个止损，最小的数量也超了"
         raise Refused(
-            f"这张单止损触发大约亏 {_amt(loss)} {settle}{'（含手续费和滑点）' if cost > 0 else ''}，占权益 {loss / equity * 100:.1f}%，"
+            f"这张单止损触发大约亏 {_amt(loss)} {settle}{f'（含{self._cost_names()}）' if cost > 0 else ''}，占权益 {loss / equity * 100:.1f}%，"
             f"超过了你设的单笔上限 {cap:g}%（TRADE_MAX_RISK_PCT）。{fits}；只写止损不写数量的话，我按单笔风险算数量。",
             reason="over_cap", fits=most if room_ok else None,
         )
