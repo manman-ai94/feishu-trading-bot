@@ -680,7 +680,8 @@ bot/reports.py        文字排版，含金额的完整版和只有价位的简�
 bot/service.py        决定什么发给你、什么发到群
 bot/router.py         处理收到的消息，执行“只认主人”和账户可见范围的规则
 bot/scheduler.py      定时任务
-bot/feishu_client.py  飞书收发消息（长连接）
+bot/feishu_client.py  飞书收发消息：直接调飞书的接口，不用官方 SDK（它会把飞书所有接口都载进内存，约 140 MB）
+bot/feishu_ws.py      飞书长连接：连上、心跳、断线重连、收事件并回执，照官方 SDK 的做法
 bot/app.py            把各部分接起来
 bot/__main__.py       命令行入口：run、selfcheck、status、account、brief、quote、setenv、checkenv、clearenv、trading、record、wishes、replay、eval
 knowledge/            资料库文件夹（内容不进 GitHub）

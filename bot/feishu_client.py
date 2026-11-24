@@ -2,28 +2,34 @@
 
 The long connection (WebSocket) is opened from this machine outwards, so no
 inbound port, public IP or domain name is needed.
+
+The bot speaks to Feishu itself, without the official SDK (lark-oapi): the SDK loads
+every one of Feishu's APIs, about 140 MB of memory on a 2 GB server, for the few
+calls the bot makes. Sending is Feishu's HTTP API with the app's tenant token; the
+long connection is in feishu_ws.py.
 """
 from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
-import lark_oapi as lark
-from lark_oapi.api.im.v1 import (
-    CreateMessageReactionRequest,
-    CreateMessageReactionRequestBody,
-    CreateMessageRequest,
-    CreateMessageRequestBody,
-    DeleteMessageReactionRequest,
-    Emoji,
-    P2ImMessageReceiveV1,
-    ReplyMessageRequest,
-    ReplyMessageRequestBody,
-)
+import httpx
+
+from .feishu_ws import LongConnection
 
 log = logging.getLogger(__name__)
+
+
+FEISHU_DOMAIN = "https://open.feishu.cn"
+TOKEN_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
+TOKEN_MARGIN = 300  # seconds: a token is renewed this long before it runs out
+TOKEN_REFUSED = {99991661, 99991663, 99991664, 99991665}  # missing, invalid or expired tenant token: fetch a new one
+HTTP_TIMEOUT = 20.0
+JSON_TYPE = "application/json; charset=utf-8"
 
 
 class FeishuError(Exception):
@@ -61,8 +67,30 @@ def markdown_card(title: str, markdown: str, template: str = "blue", footer: str
     return card
 
 
-def parse_message(data: P2ImMessageReceiveV1) -> IncomingMessage | None:
-    """Turn the SDK's event object into our own small message type."""
+class Fields:
+    """An event's JSON read by attribute, as the SDK's event objects were: a field that is not there is None."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict):
+        object.__setattr__(self, "_data", data)
+
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return fields(self._data.get(name))
+
+
+def fields(value):
+    if isinstance(value, dict):
+        return Fields(value)
+    if isinstance(value, list):
+        return [fields(item) for item in value]
+    return value
+
+
+def parse_message(data) -> IncomingMessage | None:
+    """Turn an im.message.receive_v1 event (read by attribute) into our own small message type."""
     event = getattr(data, "event", None)
     message = getattr(event, "message", None)
     sender = getattr(event, "sender", None)
@@ -97,54 +125,75 @@ def parse_message(data: P2ImMessageReceiveV1) -> IncomingMessage | None:
 
 
 class FeishuClient:
-    def __init__(self, app_id: str, app_secret: str, domain: str = lark.FEISHU_DOMAIN):
+    def __init__(self, app_id: str, app_secret: str, domain: str = FEISHU_DOMAIN, http: httpx.Client | None = None, clock=time.time):
         self._app_id = app_id
         self._app_secret = app_secret
-        self._domain = domain
-        self._ws = None  # the long connection's client, once listen() has made it
-        self._client = (
-            lark.Client.builder()
-            .app_id(app_id)
-            .app_secret(app_secret)
-            .domain(domain)
-            .log_level(lark.LogLevel.WARNING)
-            .build()
-        )
+        self._domain = domain.rstrip("/")
+        self._ws: LongConnection | None = None  # the long connection, once listen() has made it
+        self._http = http
+        self._clock = clock
+        self._token = ""
+        self._token_until = 0.0
+        self._token_lock = threading.Lock()
+
+    # ------------------------------------------------------------------ HTTP
+
+    def _client(self) -> httpx.Client:
+        if self._http is None:
+            self._http = httpx.Client(timeout=HTTP_TIMEOUT)
+        return self._http
+
+    def _post_json(self, url: str, body: dict, headers: dict | None = None) -> httpx.Response:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return self._client().post(url, content=data, headers={"Content-Type": JSON_TYPE, **(headers or {})})
+
+    def _tenant_token(self, renew: bool = False) -> str:
+        with self._token_lock:
+            now = self._clock()
+            if renew or not self._token or now >= self._token_until:
+                try:
+                    response = self._post_json(self._domain + TOKEN_PATH, {"app_id": self._app_id, "app_secret": self._app_secret})
+                except httpx.HTTPError as exc:
+                    raise FeishuError("network", f"连不上飞书：{exc}") from exc
+                body = _body(response)
+                if body.get("code") != 0 or not body.get("tenant_access_token"):
+                    raise FeishuError(body.get("code", response.status_code), body.get("msg") or "拿不到 tenant_access_token")
+                self._token = str(body["tenant_access_token"])
+                self._token_until = now + max(60.0, float(body.get("expire") or 7200) - TOKEN_MARGIN)
+            return self._token
+
+    def _call(self, method: str, path: str, params: dict | None = None, body: dict | None = None) -> dict:
+        """One API call with the tenant token. Returns the answer's JSON; FeishuError unless its code is 0."""
+        for attempt in (0, 1):
+            headers = {"Authorization": f"Bearer {self._tenant_token(renew=attempt == 1)}"}
+            try:
+                if body is None:
+                    response = self._client().request(method, self._domain + path, params=params, headers=headers)
+                else:
+                    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                    response = self._client().request(
+                        method, self._domain + path, params=params, content=data, headers={**headers, "Content-Type": JSON_TYPE}
+                    )
+            except httpx.HTTPError as exc:
+                raise FeishuError("network", f"连不上飞书：{exc}") from exc
+            answer = _body(response)
+            code = answer.get("code")
+            if code in TOKEN_REFUSED and attempt == 0:
+                continue
+            if code != 0:
+                raise FeishuError(code if code is not None else response.status_code, answer.get("msg") or response.text[:200])
+            return answer
+        raise FeishuError("token", "飞书不认这个 tenant_access_token")  # not reached: the second attempt returns or raises
 
     # --------------------------------------------------------------- sending
 
     def _send(self, receive_id: str, receive_id_type: str, msg_type: str, content: dict) -> None:
-        request = (
-            CreateMessageRequest.builder()
-            .receive_id_type(receive_id_type)
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(receive_id)
-                .msg_type(msg_type)
-                .content(json.dumps(content, ensure_ascii=False))
-                .build()
-            )
-            .build()
-        )
-        response = self._client.im.v1.message.create(request)
-        if not response.success():
-            raise FeishuError(response.code, response.msg)
+        body = {"receive_id": receive_id, "msg_type": msg_type, "content": json.dumps(content, ensure_ascii=False)}
+        self._call("POST", "/open-apis/im/v1/messages", params={"receive_id_type": receive_id_type}, body=body)
 
     def _reply(self, message_id: str, msg_type: str, content: dict) -> None:
-        request = (
-            ReplyMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .msg_type(msg_type)
-                .content(json.dumps(content, ensure_ascii=False))
-                .build()
-            )
-            .build()
-        )
-        response = self._client.im.v1.message.reply(request)
-        if not response.success():
-            raise FeishuError(response.code, response.msg)
+        body = {"msg_type": msg_type, "content": json.dumps(content, ensure_ascii=False)}
+        self._call("POST", f"/open-apis/im/v1/messages/{message_id}/reply", body=body)
 
     def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
         self._send(receive_id, receive_id_type, "text", {"text": text})
@@ -183,24 +232,11 @@ class FeishuClient:
         Needs no permission beyond im:message. Feishu may still refuse, for
         example in a group shared with another organisation.
         """
-        request = (
-            CreateMessageReactionRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                CreateMessageReactionRequestBody.builder().reaction_type(Emoji.builder().emoji_type(emoji).build()).build()
-            )
-            .build()
-        )
-        response = self._client.im.v1.message_reaction.create(request)
-        if not response.success():
-            raise FeishuError(response.code, response.msg)
-        return getattr(response.data, "reaction_id", None) or ""
+        answer = self._call("POST", f"/open-apis/im/v1/messages/{message_id}/reactions", body={"reaction_type": {"emoji_type": emoji}})
+        return str((answer.get("data") or {}).get("reaction_id") or "")
 
     def remove_reaction(self, message_id: str, reaction_id: str) -> None:
-        request = DeleteMessageReactionRequest.builder().message_id(message_id).reaction_id(reaction_id).build()
-        response = self._client.im.v1.message_reaction.delete(request)
-        if not response.success():
-            raise FeishuError(response.code, response.msg)
+        self._call("DELETE", f"/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}")
 
     # ------------------------------------------------------------- bot info
 
@@ -210,17 +246,10 @@ class FeishuClient:
         members: list[tuple[str, str]] = []
         page_token = ""
         for _ in range(5):  # 100 a page; a trading group is far smaller
-            uri = f"/open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id&page_size=100"
+            params = {"member_id_type": "open_id", "page_size": 100}
             if page_token:
-                uri += f"&page_token={page_token}"
-            request = lark.BaseRequest.builder().http_method(lark.HttpMethod.GET).uri(uri).token_types({lark.AccessTokenType.TENANT}).build()
-            response = self._client.request(request)
-            if not response.success():
-                raise FeishuError(response.code, response.msg)
-            try:
-                data = json.loads(response.raw.content).get("data") or {}
-            except (ValueError, AttributeError, TypeError):
-                break
+                params["page_token"] = page_token
+            data = self._call("GET", f"/open-apis/im/v1/chats/{chat_id}/members", params=params).get("data") or {}
             for item in data.get("items") or []:
                 if item.get("member_id"):
                     members.append((str(item["member_id"]), str(item.get("name") or "")))
@@ -231,49 +260,37 @@ class FeishuClient:
 
     def bot_open_id(self) -> str | None:
         """The bot's own open_id, used to tell whether a group message @-mentions it."""
-        request = (
-            lark.BaseRequest.builder()
-            .http_method(lark.HttpMethod.GET)
-            .uri("/open-apis/bot/v3/info")
-            .token_types({lark.AccessTokenType.TENANT})
-            .build()
-        )
-        response = self._client.request(request)
-        if not response.success():
-            raise FeishuError(response.code, response.msg)
-        try:
-            payload = json.loads(response.raw.content)
-        except (ValueError, AttributeError, TypeError):
-            return None
-        return (payload.get("bot") or {}).get("open_id")
+        return (self._call("GET", "/open-apis/bot/v3/info").get("bot") or {}).get("open_id")
 
     # ------------------------------------------------------------- receiving
 
     def listen(self, on_message: Callable[[IncomingMessage], None]) -> None:
         """Open the long connection and block forever. Call from the main thread."""
 
-        def _on_receive(data: P2ImMessageReceiveV1) -> None:
+        def on_event(payload: dict) -> None:
+            if (payload.get("header") or {}).get("event_type") != "im.message.receive_v1":
+                return
             try:
-                message = parse_message(data)
+                message = parse_message(fields(payload))
                 if message is not None:
                     on_message(message)
             except Exception:
                 log.exception("failed to handle an incoming Feishu message")
 
-        handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(_on_receive).build()
-        ws_client = lark.ws.Client(
-            self._app_id,
-            self._app_secret,
-            event_handler=handler,
-            domain=self._domain,
-            log_level=lark.LogLevel.INFO,
-        )
-        self._ws = ws_client
-        ws_client.start()
+        self._ws = LongConnection(self._app_id, self._app_secret, self._domain, on_event, http=self._client())
+        self._ws.run_forever()
 
     def connected(self) -> bool:
         """Whether the long connection to Feishu is up now. False before listen() has opened it."""
-        return getattr(self._ws, "_conn", None) is not None  # lark keeps the open socket there, None while it is down
+        return getattr(self._ws, "_conn", None) is not None
+
+
+def _body(response: httpx.Response) -> dict:
+    try:
+        answer = response.json()
+    except ValueError:
+        return {}
+    return answer if isinstance(answer, dict) else {}
 
 
 def _as_plain_text(title: str, markdown: str, footer: str | None) -> str:

@@ -1,5 +1,4 @@
-lark-oapi==1.7.5
-websockets==15.0.1  # also pulled in by lark-oapi; the OKX push stream uses its sync client
+websockets==15.0.1  # Feishu's long connection (bot/feishu_ws.py) and the OKX push stream
 anthropic==2.8.0
 python-dotenv==1.2.4
 requests==2.34.2
