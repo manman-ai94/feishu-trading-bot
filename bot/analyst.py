@@ -319,6 +319,9 @@ class Analyst:
         # Which set of web tools to offer; steps down when the API turns one away.
         self._web_level = 0 if cfg.web_search else len(WEB_TOOL_SETS) - 1
         self._feedback: Callable[[bool], str] | None = None
+        # With BROKER=mt5: the account's own rules in words (leverage, stop-out, lot size, overnight charge),
+        # added to the instructions so that questions about margin are answered with the real figures.
+        self.broker_rules: Callable[[], str] | None = None
         self._tiers = {
             "quick": Tier(cfg.model_quick, "low", 1024),
             "daily": Tier(cfg.model_daily, cfg.effort_daily, 16000, tools=True),
@@ -473,8 +476,17 @@ class Analyst:
                 system = system.replace(old, new)
             return system
         if system.startswith("你是“交易助手”"):
-            return system + MT5_NOTE
+            return system + MT5_NOTE + self._broker_rules()
         return system
+
+    def _broker_rules(self) -> str:
+        if self.broker_rules is None:
+            return ""
+        try:
+            return self.broker_rules()
+        except Exception:  # the rules are a help, never a reason not to answer
+            log.exception("could not read the account's rules for the AI")
+            return ""
 
     def _converse(self, tier: Tier, system: str, messages: list[dict], usage: Usage, account: bool = False):
         """Sends the conversation, runs the tools the AI asks for, and returns its final message."""

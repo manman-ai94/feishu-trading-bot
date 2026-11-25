@@ -30,7 +30,7 @@ from typing import Callable
 
 from .closes import FULL_CLOSE_TYPES, Closed, how_it_closed, read_closed, read_triggers
 from . import sources
-from .models import Candle
+from .models import Candle, coin_name
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +151,7 @@ class TradeFacts:
     analysis: str
     order: str
     source: str = ""  # where the opening order came from (sources.SOURCE_NAMES); "manual" when the bot did not place it
+    unit: str = "张"  # what the closed size counts: 张 on OKX, 手 (lots) on MT5
 
     def per_r(self, distance: float | None) -> float | None:
         risk = _risk(self.closed.direction, self.closed.open_px, self.trail.first)
@@ -187,9 +188,14 @@ def facts_text(facts: TradeFacts, tz, rule_pct: float | None) -> str:
     c = facts.closed
     side = "多单" if c.direction == "long" else "空单"
     when = (lambda ts: datetime.fromtimestamp(ts, tz=tz or timezone.utc).strftime("%m-%d %H:%M"))
-    size = f"{facts.coins:,.8g} {facts.coin_ccy}（{c.closed_size:,.10g} 张）" if facts.coins and c.closed_size else (
-        f"{c.closed_size:,.10g} 张" if c.closed_size else "数量不明"
-    )
+    if facts.unit == "手":  # MT5: the lots first, as the terminal shows them
+        size = f"{c.closed_size:,.10g} 手" if c.closed_size else "数量不明"
+        if facts.coins and c.closed_size:
+            size += f"（{facts.coins:,.8g} {coin_name(facts.coin_ccy, facts.unit)}）"
+    else:
+        size = f"{facts.coins:,.8g} {facts.coin_ccy}（{c.closed_size:,.10g} 张）" if facts.coins and c.closed_size else (
+            f"{c.closed_size:,.10g} 张" if c.closed_size else "数量不明"
+        )
     lines = [f"{c.inst_id} {side} {size}，{facts.how}"]
     held = ""
     if c.opened_at:
@@ -367,7 +373,7 @@ class Reviewer:
         opening = self._opening_order(closed)
         start = closed.opened_at or closed.closed_at
         trail = stop_trail(self._journal.snapshots_between(start - 60, closed.closed_at + 60), closed.inst_id, closed.direction)
-        coins, coin_ccy = self._coins(closed)
+        coins, coin_ccy, unit = self._coins(closed)
         risk = _risk(closed.direction, closed.open_px, trail.first)
         planned = risk * coins if risk is not None and coins else None
         risk_pct = planned / trail.equity_at_open * 100 if planned is not None and trail.equity_at_open else None
@@ -390,6 +396,7 @@ class Reviewer:
             trail=trail,
             coins=coins,
             coin_ccy=coin_ccy,
+            unit=unit,
             planned_loss=planned,
             risk_pct=risk_pct,
             r=r_multiple(closed.direction, closed.open_px, closed.close_px, trail.first),
@@ -401,15 +408,16 @@ class Reviewer:
             source=self._source(closed, opening),
         )
 
-    def _coins(self, closed: Closed) -> tuple[float | None, str]:
+    def _coins(self, closed: Closed) -> tuple[float | None, str, str]:
+        """(coins, their currency, what the closed size counts in)."""
         if not closed.closed_size:
-            return None, ""
+            return None, "", "张"
         try:
             spec = self._okx.instrument_spec(closed.inst_id)
         except Exception as exc:
             log.info("review: no contract size for %s (%s)", closed.inst_id, type(exc).__name__)
-            return None, ""
-        return closed.closed_size * float(spec.coins_per_contract), spec.ct_val_ccy
+            return None, "", "张"
+        return closed.closed_size * float(spec.coins_per_contract), spec.ct_val_ccy, spec.unit
 
     def _analysis_line(self, closed: Closed) -> str:
         if not closed.opened_at:

@@ -60,6 +60,7 @@ class Position:
     coins: float | None = None  # what the contracts add up to, e.g. 10 (XAU); filled in from the contract size
     coin_ccy: str = ""
     c_time: int = 0  # when OKX opened this position, in milliseconds; additions keep it
+    unit: str = "张"  # what `qty` counts: 张 (contracts) on OKX, 手 (lots) on MT5
 
     @property
     def pnl_ccy(self) -> str:
@@ -135,6 +136,27 @@ class Position:
             stops=stops,
             ccy=str(row.get("ccy", "") or ""),
         )
+
+
+COIN_NAMES = {"XAU": "盎司", "XAG": "盎司"}  # on MT5, gold and silver are counted in ounces
+
+
+def coin_name(ccy: str, unit: str = "张") -> str:
+    """What the coins of a contract are called to the trader: on MT5 gold is in ounces, not "XAU"."""
+    return COIN_NAMES.get(ccy, ccy) if unit == "手" else ccy
+
+
+def size_text(position: "Position") -> str:
+    """How big a position is, in the account's own units: "0.07 手（7 盎司）" on MT5; on OKX the coins
+    ("7 XAU") or, without a contract size, the contracts."""
+    if position.unit == "手":
+        text = f"{position.qty:,.10g} 手"
+        if position.coins is not None and position.coin_ccy:
+            text += f"（{position.coins:,.8g} {coin_name(position.coin_ccy, position.unit)}）"
+        return text
+    if position.coins is not None and position.coin_ccy:
+        return f"{position.coins:,.8g} {position.coin_ccy}"
+    return f"{position.qty:,.10g} 张"
 
 
 @dataclass(frozen=True)

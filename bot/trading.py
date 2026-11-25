@@ -45,11 +45,11 @@ from .exposure import Exposure, Piece, measure
 from .config import STOP_TRIGGERS, TRADE_ACTIONS, Config
 from .instruments import ALIASES, InstrumentResolver
 from .journal import Journal
-from .models import AccountConfig, AccountState, InstrumentSpec, OrderInfo, Position
+from .models import AccountConfig, AccountState, InstrumentSpec, OrderInfo, Position, coin_name
 from .okx_client import OkxError, OkxNetworkError
 from .reports import currency_lines
 from .times import BEIJING, LOS_ANGELES, when_text, zone_of
-from . import sources
+from . import __version__, sources
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ UNBREAK_WORDS = ("解除熔断", "恢复开仓", "/unbreak")
 SETTINGS_WORDS = ("交易设置", "交易状态", "下单设置", "下单状态", "/trading")
 HELP_WORDS = ("交易帮助", "下单帮助", "怎么下单", "下单指令", "/tradehelp")
 ORDERS_WORDS = ("查挂单", "当前挂单", "当前委托", "挂单", "委托", "/orders")
-SELFTEST_WORDS = ("模拟盘自测", "模拟自测", "下单自测", "自测下单", "/selftest")
+SELFTEST_WORDS = ("模拟盘自测", "模拟自测", "下单自测", "自测下单", "mt5自测", "mt5 自测", "/selftest")  # matched lower-cased
 SIZE_WORDS = ("算仓位", "仓位计算", "计算仓位", "算手数", "/size")
 _ENTRY = re.compile(rf"(?:入场价|入场|进场价|进场|开仓价|开在|价格)\s*{_JOIN}\s*({NUM})")
 SIZE_HELP = "算仓位要写品种和止损价，入场价不写就按现价：算仓位 XAU 止损 3768，或 算仓位 XAU 入场 3873 止损 3768。"
@@ -197,6 +197,22 @@ HELP_TEXT = """**开仓**（只做 USDT 本位永续合约）
 - “交易设置”：看当前是模拟盘还是实盘、各项限额、这把 key 的权限
 - “模拟盘自测”：只在模拟盘（实盘时用 .env 里模拟盘的 key，不碰实盘账户）。我用最小的数量把开仓、止盈止损、减仓、加仓合成止损、挂单、突破单、分档挂单、撤单、平仓各跑一遍，告诉你 OKX 每一步收没收
 - 限额和品种名单只能在服务器的 .env 里改，飞书里改不了。杠杆倍数请在 OKX 里设"""
+
+# With BROKER=mt5 the help speaks of the MT5 account: lots, ounces, and a rehearsal that sends nothing.
+MT5_HELP_WORDING = (
+    ("**开仓**（只做 USDT 本位永续合约）", "**开仓**（MT5 账户里的品种，现在是黄金 XAUUSD）"),
+    ("“做多 XAU 100张”“做空 BTC 0.01个”“做多 XAU 500U”", "“做多 XAU 0.05手”“做空 XAU 5个”“做多 XAU 5000U”"),
+    ("“限价做多 XAU 100张 3850”“挂单做空 BTC 0.01个 68000”", "“限价做多 XAU 0.05手 3850”“挂单做空 XAU 0.05手 3950”"),
+    ("“张”是合约张数，“个”是币的数量（黄金就是盎司），“U”是仓位的名义价值，不是保证金。黄金也可以写“手”，1 手 = 1 XAU",
+     "“手”是 MT5 的手数（黄金 1 手 = 100 盎司，最小 0.01 手），“个”是盎司，“U”是仓位的名义价值，不是保证金。不认“张”"),
+    ("“加仓 XAU 100张”", "“加仓 XAU 0.05手”"),
+    ("“减仓 XAU 100张”", "“减仓 XAU 0.05手”"),
+    ("看当前是模拟盘还是实盘、各项限额、这把 key 的权限", "看登录的是模拟还是实盘账户、各项限额、MT5 能不能自动交易"),
+    ("“模拟盘自测”：只在模拟盘（实盘时用 .env 里模拟盘的 key，不碰实盘账户）。我用最小的数量把开仓、止盈止损、减仓、加仓合成止损、挂单、突破单、分档挂单、撤单、平仓各跑一遍，告诉你 OKX 每一步收没收",
+     "“模拟盘自测”（也可以发“MT5 自测”）：一张单也不发。我用 MT5 自己的下单检查 (order_check)，按最小手数把市价开多开空、限价挂单、突破单（都带止损止盈）和平仓各核对一遍，告诉你交易服务器收不收。下单功能关着时也能做"),
+    ("杠杆倍数请在 OKX 里设", "杠杆是账户在 EC Markets 那边定的"),
+)  # fmt: skip
+MT5_CHECK_SETTING = "mt5_check_last"  # the latest MT5 rehearsal, as JSON
 
 
 # --------------------------------------------------------------------------- commands
@@ -837,7 +853,7 @@ def _side_word(direction: str) -> str:
 
 
 def _contracts_text(contracts: Decimal, spec: InstrumentSpec) -> str:
-    return f"{_plain(contracts)} {spec.unit}（合 {_plain(contracts * spec.coins_per_contract)} {spec.ct_val_ccy}）"
+    return f"{_plain(contracts)} {spec.unit}（合 {_plain(contracts * spec.coins_per_contract)} {coin_name(spec.ct_val_ccy, spec.unit)}）"
 
 
 # ------------------------------------------------------------------------------- desk
@@ -1224,7 +1240,7 @@ class TradeDesk:
     def _dispatch(self, command: Command, in_group: bool = False, sender: str = "") -> Reply:
         kind = command.kind
         if kind == "help":
-            return Reply(HELP_TEXT + f"\n\n现在的状态：{self._mode_line()}", title="下单指令", template="turquoise")
+            return Reply(self._help_text() + f"\n\n现在的状态：{self._mode_line()}", title="下单指令", template="turquoise")
         if kind == "settings":
             return Reply("\n".join(self.status_lines()), title="交易设置", template="grey")
         if kind == "orders":
@@ -1241,6 +1257,8 @@ class TradeDesk:
             reply = self._size(command)
             self._last_sizing = (command.inst_id, self._clock())
             return reply
+        if kind == "selftest" and self._cfg.mt5:
+            return self._mt5_check(command.inst_id)  # sends nothing, so it runs with trading off too
         if self._mode == "off":
             return Reply(self._off_text())
         if kind == "unclear":
@@ -1613,6 +1631,63 @@ class TradeDesk:
             return "现在没有开放任何下单操作，只能看挂单和设置。"
         return f"现在只开放：{'、'.join(open_now)}。"
 
+    def _lever_source(self) -> str:
+        return "MT5 账户的杠杆，只影响保证金" if self._cfg.mt5 else "在 OKX 里设的"
+
+    def _help_text(self) -> str:
+        if not self._cfg.mt5:
+            return HELP_TEXT
+        text = HELP_TEXT
+        for old, new in MT5_HELP_WORDING:
+            text = text.replace(old, new)
+        return text
+
+    def _mt5_check(self, inst_id: str) -> Reply:
+        """The rehearsal on MT5: MT5's own check (order_check) of each kind of order the desk places, at the
+        smallest size and away from the market. The trade server's rules are run, nothing is placed, the
+        account does not change. OKX's rehearsal places real orders on the demo account instead."""
+        allowed = self._cfg.tradable_instruments
+        inst_id = inst_id or (allowed[0] if allowed else "")
+        check = getattr(self._okx, "check_orders", None)
+        if check is None or not inst_id:
+            return Reply("读不到 MT5 账户，没法自测。")
+        try:
+            results = check(inst_id, self._cfg.trade_slippage_pct)
+        except (OkxError, OkxNetworkError) as exc:
+            return Reply(f"MT5 自测没做成：{exc}")
+        failed = [name for name, ok, _ in results if not ok]
+        lines = [
+            f"品种 {inst_id}。每张都是最小手数、离现价 1%，带止损止盈。这是 MT5 自己的下单检查 (order_check)："
+            "交易服务器按真单的规矩核对，但一张单也没有发出去，账户没有任何变化。",
+            "",
+        ]
+        lines += [f"- {'通过' if ok else '**不通过**'}：{name}" + (f"，{words}" if words else "") for name, ok, words in results]
+        lines.append("")
+        if failed:
+            lines.append(f"有 {len(failed)} 项不通过，见上面。改好以后再发一次“MT5 自测”。")
+        else:
+            lines.append("全部通过：这几种单交易服务器都会接受。" + ("" if self._mode != "off" else "下单功能现在关着（TRADING=off），打开要在服务器的 .env 里改。"))
+        now = self._clock()
+        record = {"ts": now, "version": __version__, "inst_id": inst_id, "ok": not failed, "failed": failed}
+        self._journal.set_setting(MT5_CHECK_SETTING, json.dumps(record, ensure_ascii=False))
+        log.info("mt5 rehearsal on %s: %s", inst_id, "passed" if not failed else f"{len(failed)} failed")
+        return Reply("\n".join(lines), title="MT5 自测（只核对，不下单）", template="red" if failed else "green")
+
+    def _mt5_check_text(self) -> str:
+        """The latest MT5 rehearsal, in a line."""
+        raw = self._journal.get_setting(MT5_CHECK_SETTING, "")
+        try:
+            last = json.loads(raw) if raw else None
+            when = datetime.fromtimestamp(float(last["ts"]), tz=self._cfg.tz).strftime("%Y-%m-%d %H:%M") if last else ""
+        except (ValueError, KeyError, TypeError):
+            last = None
+        if not last:
+            return "还没做过。发“MT5 自测”核对一遍，一张单也不发"
+        text = f"{when} 在 v{last.get('version', '?')} 上" + ("全部通过" if last.get("ok") else f"有 {len(last.get('failed') or [])} 项不通过")
+        if last.get("version") != __version__:
+            text += f"。现在是 v{__version__}，可以再发一次“MT5 自测”"
+        return text
+
     def _off_text(self) -> str:
         lines = [
             "下单功能现在是关着的，这条指令没有执行。",
@@ -1692,7 +1767,7 @@ class TradeDesk:
         if self._mode != "off":
             lines.extend(self._funds_lines())
         if cfg.mt5:
-            lines.append("**模拟盘自测**：MT5 上没有。要演练，先在 MT5 里登录模拟账户，再把 TRADING 改成 demo")
+            lines.append(f"**MT5 自测**（只核对，不下单）：{self._mt5_check_text()}")
         else:
             where = ""
             if self._mode == "live":
@@ -2160,7 +2235,7 @@ class TradeDesk:
         mode_word = "全仓" if td_mode == "cross" else "逐仓"
         if lever:
             margin = value / _dec(lever)
-            lines.append(f"杠杆 {lever:g} 倍（在 OKX 里设的），大约占用保证金 {_amt(margin)} {settle}，{mode_word}")
+            lines.append(f"杠杆 {lever:g} 倍（{self._lever_source()}），大约占用保证金 {_amt(margin)} {settle}，{mode_word}")
             available = next((c.avail_eq for c in state.snapshot.currencies if c.ccy == settle), None)
             if available is not None and margin > _dec(available):
                 lines.append(f"注意：可用保证金只有 {_amt(available)} {settle}，可能不够，OKX 会拒单")
@@ -2385,7 +2460,7 @@ class TradeDesk:
         mode_word = "全仓" if td_mode == "cross" else "逐仓"
         if lever:
             margin = value / _dec(lever)
-            lines.append(f"杠杆 {lever:g} 倍（在 OKX 里设的），挂着就会冻结保证金，合计约 {_amt(margin)} {settle}，{mode_word}")
+            lines.append(f"杠杆 {lever:g} 倍（{self._lever_source()}），挂着就会冻结保证金，合计约 {_amt(margin)} {settle}，{mode_word}")
             available = next((c.avail_eq for c in state.snapshot.currencies if c.ccy == settle), None)
             if available is not None and margin > _dec(available):
                 lines.append(f"注意：可用保证金只有 {_amt(available)} {settle}，可能不够，OKX 会拒掉后面几档")

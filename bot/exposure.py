@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Callable
 
-from .models import AccountState, OrderInfo, Position, to_float
+from .models import AccountState, OrderInfo, Position, size_text, to_float
 
 
 def _dec(value) -> Decimal:
@@ -62,7 +62,10 @@ def position_piece(position: Position, coins_per_contract: Decimal) -> Piece:
     long = position.direction == "long"
     coins = _dec(position.qty) * coins_per_contract
     mark = _dec(position.mark_px or position.avg_px or 0)
-    head = f"{position.inst_id} {_side(position.direction)}单 {float(coins):,.8g} {position.coin_ccy or ''}".rstrip()
+    if position.unit == "手":
+        head = f"{position.inst_id} {_side(position.direction)}单 {size_text(position)}"
+    else:
+        head = f"{position.inst_id} {_side(position.direction)}单 {float(coins):,.8g} {position.coin_ccy or ''}".rstrip()
     sl_stops = [s for s in position.stops if s.sl_trigger_px]
     if mark <= 0:
         return Piece(f"{head}，读不到价格", None, position.inst_id, position.direction, True)

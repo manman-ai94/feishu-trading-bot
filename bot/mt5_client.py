@@ -114,6 +114,11 @@ INIT_RETRY_SECONDS = 60.0
 # registry of the user who installed it, and the bot may run as another user.
 DEFAULT_TERMINALS = (r"C:\Program Files\MetaTrader 5\terminal64.exe",)
 STOP_PREFIX = "p:"
+RULES_TTL_SECONDS = 6 * 3600.0
+CHECK_PCT = 1.0  # the rehearsal's orders and stops are this far from the market, in %
+CHECK_PASSED = {0, 10008, 10009}  # order_check answers 0 ("done") when the server would take the request
+SWAP_POINTS, SWAP_DEPOSIT = 1, 4  # SYMBOL_SWAP_MODE_POINTS, SYMBOL_SWAP_MODE_CURRENCY_DEPOSIT
+WEEKDAY_NAMES = {0: "周日", 1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六"}  # MT5's ENUM_DAY_OF_WEEK
 OFFSET_TOLERANCE_SECONDS = 120
 # Calls that return a list: None with no error means there is nothing to list.
 LIST_CALLS = {"positions_get", "orders_get", "history_deals_get", "history_orders_get", "symbols_get"}
@@ -122,6 +127,20 @@ LIST_CALLS = {"positions_get", "orders_get", "history_deals_get", "history_order
 def mt5_id(base: str) -> str:
     """The bot's id of an instrument the broker carries: XAU -> XAU-USD-SWAP."""
     return f"{base.upper()}-USD-SWAP"
+
+
+def broker_wording(symbols: dict[str, str]):
+    """With BROKER=mt5, applied to every message that goes out. Inside, the program names gold XAU-USD-SWAP
+    (OKX's shape, so that the rest of the code is the same for both) and calls its price the mark price; the
+    trader's MT5 says XAUUSD and has no mark price. OKX's own ids (XAU-USDT-SWAP, the crowd data) stay."""
+    names = [(mt5_id(base), symbol) for base, symbol in symbols.items() if symbol]
+
+    def worded(text: str) -> str:
+        for old, new in names:
+            text = text.replace(old, new)
+        return text.replace("标记价格", "现价").replace("标记价", "现价")
+
+    return worded
 
 
 def _number(value) -> str:
@@ -257,6 +276,7 @@ class Mt5Client:
         self._wanted = {base.upper(): symbol for base, symbol in symbols.items()}
         self._found: dict[str, str] = {}  # base -> the symbol as the broker names it (it may carry a suffix)
         self._bases: dict[str, str] = {}  # broker symbol -> base
+        self._rules: tuple[float, str] | None = None  # (when read, the account's rules in words) for the AI
 
     @property
     def market(self):
@@ -429,6 +449,146 @@ class Mt5Client:
         """The currency the account is kept in (USD)."""
         return self._currency()
 
+    # ------------------------------------------------------- the account's rules
+
+    def rules_for_ai(self) -> str:
+        """The account's own rules in words, for the AI's instructions: the leverage, where the broker calls for
+        margin and closes positions, the lot size and the overnight charge. Read from MT5 every few hours: they
+        hardly change, and the instructions are cached while they stay the same. "" when MT5 cannot be read."""
+        now = self._clock()
+        if self._rules is not None and now - self._rules[0] < RULES_TTL_SECONDS:
+            return self._rules[1]
+        try:
+            text = self._rules_text()
+        except (OkxError, OkxNetworkError, AttributeError, TypeError, ValueError) as exc:
+            log.info("mt5: the account's rules could not be read (%s)", exc)
+            return self._rules[1] if self._rules is not None else ""
+        self._rules = (now, text)
+        return text
+
+    def _rules_text(self) -> str:
+        account = self._account()
+        ccy = str(account.currency or "USD")
+        lines = ["", "", "MT5 账户规则（程序从 MT5 读的；讲杠杆、保证金、强平、隔夜费时用这些数，不要用 OKX 的规则，也不要假设别的杠杆）："]
+        leverage = int(float(account.leverage or 0))
+        if leverage:
+            lines.append(
+                f"- 账户杠杆 1:{leverage}。杠杆只决定开仓占多少保证金，不改变盈亏；占用的保证金 = 价格 × 盎司数 ÷ {leverage}。"
+            )
+        call, out = float(account.margin_so_call or 0), float(account.margin_so_so or 0)
+        if int(getattr(account, "margin_so_mode", 0)) == STOPOUT_MONEY:
+            levels = f"净值降到 {_number(call)} {ccy} 发追加保证金通知 (margin call)，降到 {_number(out)} {ccy} 开始强制平仓 (stop out)"
+        else:
+            levels = f"保证金比例（净值 ÷ 已用保证金）降到 {_number(call)}% 发追加保证金通知 (margin call)，降到 {_number(out)}% 开始强制平仓 (stop out)"
+        lines.append(f"- {levels}，从亏得最多的单子平起。")
+        lines.append(f"- {'对冲账户：同一品种多单和空单可以同时拿着，各算各的' if self._hedging(account) else '净持仓账户：同一品种只有一个净仓位'}。")
+        for base in self._wanted:
+            try:
+                symbol = self.symbol(mt5_id(base))
+                info = self._link.call("symbol_info", symbol)
+            except OkxError:
+                continue
+            if info is not None:
+                lines.extend(self._symbol_rules(symbol, info, ccy))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _symbol_rules(symbol: str, info, ccy: str) -> list[str]:
+        size = float(info.trade_contract_size or 0)
+        point = float(info.point or 0)
+        unit = "盎司" if symbol.upper().startswith(("XAU", "XAG")) else "单位"
+        step, least = _number(info.volume_step), _number(info.volume_min)
+        lines = [f"- {symbol}：1 手 = {_number(size)} {unit}，最小 {least} 手，每次加减 {step} 手；价格每走 1，每手盈亏 {_number(size)} {ccy}。"]
+        tick_size, tick_value = float(info.trade_tick_size or 0), float(info.trade_tick_value or 0)
+        per_point = tick_value * point / tick_size if tick_size and tick_value and point else None  # money per point, per lot
+        mode = int(getattr(info, "swap_mode", 0) or 0)
+        long, short = float(info.swap_long or 0), float(info.swap_short or 0)
+        if mode == SWAP_POINTS and per_point:
+            money = (long * per_point, short * per_point)
+        elif mode == SWAP_DEPOSIT:
+            money = (long, short)
+        else:
+            money = None
+        day = WEEKDAY_NAMES.get(int(getattr(info, "swap_rollover3days", 3) or 0), "")
+        if money is not None:
+            lines.append(
+                f"- 隔夜费（库存费，swap）：拿过结算点每手每晚多单 {money[0]:+,.2f} {ccy}、空单 {money[1]:+,.2f} {ccy}（正数是收，负数是付）；"
+                f"{day + '那晚收三天；' if day else ''}结算点是交易服务器的 00:00（纽约 17:00）。"
+            )
+        elif mode:
+            lines.append(f"- 隔夜费（库存费）：多单 {_number(long)}、空单 {_number(short)}（MT5 的计算方式 {mode}，换算成金额前先说明）。")
+        stops = int(getattr(info, "trade_stops_level", 0) or 0)
+        if stops and point:
+            lines.append(f"- 止损止盈和挂单至少离现价 {stops} 点（{_number(stops * point)}）。")
+        return lines
+
+    # ------------------------------------------------- the rehearsal (自测)
+
+    def check_orders(self, inst_id: str, slippage_pct: float = 0.02) -> list[tuple[str, bool, str]]:
+        """MT5's own check of every kind of order the bot places, without placing any: order_check runs the
+        broker's rules (volume, prices, stop distances, margin, whether trading is allowed) on a request and
+        answers as the trade server would, but nothing reaches the account. The smallest size, CHECK_PCT away
+        from the market, with a stop-loss and a take-profit. Returns (what, passed, MT5's words) per check;
+        the first ones are the account's own switches. On OKX the same command runs on the demo account."""
+        account = self._account()
+        terminal = self._link.call("terminal_info")
+        real = int(account.trade_mode) == TRADE_MODE_REAL
+        results = [
+            ("登录的账户", True, "实盘账户" if real else "模拟账户"),
+            ("终端的“算法交易”(Algo Trading)", bool(terminal.trade_allowed), "开着" if terminal.trade_allowed else "关着：机器人下不了单，请在 MT5 工具栏上点开"),
+            ("账户允许交易和 EA 下单", bool(account.trade_allowed) and bool(getattr(account, "trade_expert", True)),
+             "允许" if account.trade_allowed and getattr(account, "trade_expert", True) else RETCODE_TEXT[10026]),
+        ]  # fmt: skip
+        symbol = self.symbol(inst_id)
+        info = self._info(inst_id)
+        tick = self._tick(symbol)
+        bid, ask = float(tick.bid), float(tick.ask)
+        point = float(info.point) or 0.01
+        gap = max((bid + ask) / 2 * CHECK_PCT / 100, int(getattr(info, "trade_stops_level", 0) or 0) * point * 2)
+        price = lambda value: round(value, int(info.digits))  # noqa: E731
+        volume = float(info.volume_min)
+        deviation = max(10, int(ask * slippage_pct / 100 / point))
+        market = {"action": ACTION_DEAL, "symbol": symbol, "volume": volume, "deviation": deviation, "type_time": TIME_GTC,
+                  "type_filling": Mt5TradeClient._filling(info), "magic": MAGIC, "comment": f"{BOT_PREFIX}-check"}  # fmt: skip
+        pending = {"action": ACTION_PENDING, "symbol": symbol, "volume": volume, "type_time": TIME_GTC,
+                   "type_filling": FILLING_RETURN, "magic": MAGIC, "comment": f"{BOT_PREFIX}-check"}  # fmt: skip
+
+        def order(kind: int, at: float, long: bool) -> dict:
+            base = market if kind in (ORDER_BUY, ORDER_SELL) else pending
+            sl, tp = (at - gap, at + gap) if long else (at + gap, at - gap)
+            return {**base, "type": kind, "price": price(at), "sl": price(sl), "tp": price(tp)}
+
+        requests = [
+            ("市价开多，带止损止盈", order(ORDER_BUY, ask, True)),
+            ("市价开空，带止损止盈", order(ORDER_SELL, bid, False)),
+            (f"限价买单（现价下方 {CHECK_PCT:g}%）", order(BUY_LIMIT, bid - gap, True)),
+            (f"限价卖单（现价上方 {CHECK_PCT:g}%）", order(SELL_LIMIT, ask + gap, False)),
+            ("突破单：涨破做多 (buy stop)", order(BUY_STOP, ask + gap, True)),
+            ("突破单：跌破做空 (sell stop)", order(SELL_STOP, bid - gap, False)),
+        ]
+        tickets = sorted(self._tickets(symbol), key=lambda row: int(row.time_msc))
+        if tickets:
+            row = tickets[0]
+            long = int(row.type) == POSITION_BUY
+            close = {**market, "type": ORDER_SELL if long else ORDER_BUY, "price": bid if long else ask, "position": int(row.ticket),
+                     "volume": min(volume, float(row.volume))}  # fmt: skip
+            requests.append((f"平掉现有{_side('long' if long else 'short')}单的一部分（{_number(close['volume'])} 手）", close))
+        for name, request in requests:
+            results.append((name, *self._checked(request)))
+        return results
+
+    def _checked(self, request: dict) -> tuple[bool, str]:
+        result = self._link.call("order_check", request)
+        if result is None:
+            code, message = self._link.last_error()
+            return False, f"MT5 没有回应（{code} {message}）"
+        retcode = int(result.retcode)
+        words = RETCODE_TEXT.get(retcode) or str(getattr(result, "comment", "") or "")
+        if retcode in CHECK_PASSED:
+            margin = float(getattr(result, "margin", 0) or 0)
+            return True, f"交易服务器会接受，占保证金约 {margin:,.2f}" if margin else "交易服务器会接受"
+        return False, f"{words or '交易服务器不接受'}（{retcode}）"
+
     def _hedging(self, account=None) -> bool:
         account = account or self._account()
         return int(getattr(account, "margin_mode", MARGIN_HEDGING)) == MARGIN_HEDGING
@@ -517,6 +677,7 @@ class Mt5Client:
                     ccy=currency,
                     coins=volume * size if size else None,
                     coin_ccy=base if size else "",
+                    unit="手",
                 )
             )
         return positions

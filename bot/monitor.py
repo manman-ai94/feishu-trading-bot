@@ -13,7 +13,7 @@ from typing import Callable
 from .closes import FULL_CLOSE_TYPES, close_lines, how_it_closed, read_closed, read_triggers
 from .config import Config
 from .journal import Journal
-from .models import AccountState, Position
+from .models import AccountState, Position, size_text
 from .okx_client import OkxClient, OkxError, OkxNetworkError
 from .risk import LEVEL_WORDS, AccountRisk, PositionRisk, liq_line, readings, stop_line
 
@@ -63,6 +63,8 @@ def _money(value: float | None, ccy: str = "USD") -> str:
 
 
 def _size(position: Position) -> str:
+    if position.unit == "手":
+        return size_text(position)
     text = f"{_qty(position.qty)} 张"
     if position.coins is not None and position.coin_ccy:
         text += f"（合 {position.coins:,.8g} {position.coin_ccy}）"
@@ -156,7 +158,7 @@ def _stops_line(position: Position) -> str:
 
 def position_brief(position: Position) -> str:
     """The position in one line, to open an alert with: what it is and how it stands right now."""
-    size = f"{position.coins:,.8g} {position.coin_ccy}" if position.coins is not None and position.coin_ccy else f"{_qty(position.qty)} 张"
+    size = size_text(position) if position.unit == "手" or position.coins is None or not position.coin_ccy else f"{position.coins:,.8g} {position.coin_ccy}"
     return (
         f"{position.inst_id} {_side(position)}单 {size}，均价 {_px(position.avg_px)}，标记价 {_px(position.mark_px)}，"
         f"浮动盈亏 {_money(position.upl, position.pnl_ccy)}，{_stops_line(position)}"

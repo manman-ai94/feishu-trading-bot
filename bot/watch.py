@@ -30,7 +30,7 @@ from . import econ
 from .analyst import PRICES, UNKNOWN_MODEL_PRICE, AnalystUnavailable
 from .indicators import atr
 from .market import build_market_context, candles_text, fmt_price
-from .models import AccountState, Candle, Position
+from .models import AccountState, Candle, Position, size_text
 
 log = logging.getLogger(__name__)
 
@@ -244,9 +244,7 @@ def _side(position: Position) -> str:
 
 
 def _size(position: Position) -> str:
-    if position.coins is not None and position.coin_ccy:
-        return f"{position.coins:,.8g} {position.coin_ccy}"
-    return f"{position.qty:,.10g} 张"
+    return size_text(position)
 
 
 def _atrs(gap: float, hour_atr: float | None) -> str:

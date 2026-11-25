@@ -18,6 +18,10 @@ class FakeMt5:
         self.leverage = 100
         self.margin_mode = 2  # hedging
         self.symbols = {"XAUUSD": dict(bid=bid, ask=ask, contract=100.0, step=0.01, min=0.01, digits=2, point=0.01)}
+        self.swap = (-57.22, 23.55)  # points a lot a night: long, short (gold at EC Markets)
+        self.stops_level = 0  # points a stop must keep from the price
+        self.checks: list[dict] = []  # the requests order_check was given
+        self.check_fail: dict[int, int] = {}  # order type -> the retcode order_check answers for it
         self.positions: list[NS] = []
         self.orders: list[NS] = []
         self.history_orders: list[NS] = []
@@ -117,6 +121,8 @@ class FakeMt5:
             name=name, visible=True, digits=spec["digits"], point=spec["point"], trade_tick_size=spec["point"],
             trade_contract_size=spec["contract"], volume_min=spec["min"], volume_max=100.0, volume_step=spec["step"],
             trade_mode=4, currency_base="XAU", currency_profit="USD", filling_mode=1, bid=spec["bid"], ask=spec["ask"],
+            trade_tick_value=spec["point"] * spec["contract"], swap_mode=1, swap_long=self.swap[0], swap_short=self.swap[1],
+            swap_rollover3days=3, trade_stops_level=self.stops_level,
         )  # fmt: skip
 
     def symbol_info(self, name: str):
@@ -154,6 +160,29 @@ class FakeMt5:
 
     def history_deals_get(self, start, end, **kwargs):
         return tuple(row for row in self.deals if start <= row.time <= end)
+
+    def order_check(self, request: dict):
+        """The broker's rules on a request, without placing it: 0 ("Done") or the retcode it would refuse with."""
+        self.checks.append(dict(request))
+        if not self.logged_in:
+            return None
+        spec = self.symbols[request["symbol"]]
+        kind, price = request.get("type", 0), float(request.get("price") or 0)
+        sl, tp = float(request.get("sl") or 0), float(request.get("tp") or 0)
+        long = kind in (0, 2, 4)
+        gap = self.stops_level * spec["point"]
+        code = self.check_fail.get(kind, 0)
+        if not code and not self.algo_trading:
+            code = 10027
+        elif not code and request["volume"] < spec["min"]:
+            code = 10014
+        elif not code and ((kind == 2 and price >= spec["ask"]) or (kind == 3 and price <= spec["bid"])
+                           or (kind == 4 and price <= spec["ask"]) or (kind == 5 and price >= spec["bid"])):  # fmt: skip
+            code = 10015
+        elif not code and ((sl and (sl >= price - gap if long else sl <= price + gap)) or (tp and (tp <= price + gap if long else tp >= price - gap))):
+            code = 10016
+        margin = request["volume"] * spec["contract"] * (price or spec["ask"]) / self.leverage
+        return NS(retcode=code, comment="Done" if not code else "Invalid request", margin=margin if not code else 0.0, request=dict(request))
 
     def order_send(self, request: dict):
         self.requests.append(dict(request))

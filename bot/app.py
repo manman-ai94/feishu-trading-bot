@@ -26,7 +26,7 @@ from .instruments import InstrumentResolver
 from .journal import Journal
 from .knowledge import KnowledgeBase
 from .monitor import Monitor
-from .mt5_client import Mt5Client, Mt5Link, Mt5TradeClient
+from .mt5_client import Mt5Client, Mt5Link, Mt5TradeClient, broker_wording
 from .okx_client import OkxClient, OkxError, OkxNetworkError
 from .okx_trade import OkxTradeClient
 from .router import Router
@@ -196,6 +196,8 @@ def build_ai(
         month_spend=month_spend,
         on_levels=keep_levels if track else None,
     )
+    if isinstance(okx, Mt5Client):
+        analyst.broker_rules = okx.rules_for_ai
     analyst.attach_feedback(lambda with_account: feedback_text(cfg, journal, time.time(), with_account))
     return analyst, resolver, knowledge
 
@@ -256,6 +258,8 @@ def run(cfg: Config, env_file: str | os.PathLike = ".env") -> None:
     macro = build_macro(cfg)
     analyst, resolver, knowledge = build_ai(cfg, okx, journal, crowd, macro=macro)
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
+    if cfg.mt5:
+        feishu.wording = broker_wording(dict(cfg.mt5_symbols))
     gauge = RiskGauge(okx)
     reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, gauge=gauge, macro=macro)
     analyst.attach_account(lambda: reporter.account_for_ai(fresh=True), reporter.history_for_ai)

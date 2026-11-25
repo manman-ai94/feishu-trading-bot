@@ -301,6 +301,10 @@ def send_brief(cfg: Config, kind: str) -> int:
     macro = build_macro(cfg)
     analyst, _, _ = build_ai(cfg, okx, journal, crowd, macro=macro)
     feishu = FeishuClient(cfg.feishu_app_id, cfg.feishu_app_secret, cfg.feishu_domain)
+    if cfg.mt5:
+        from .mt5_client import broker_wording
+
+        feishu.wording = broker_wording(dict(cfg.mt5_symbols))
     reporter = Reporter(cfg, feishu, okx, analyst, journal, crowd=crowd, macro=macro)
     reporter.monitor = Monitor(okx, cfg, journal, lambda event: None)
     if cfg.has_account:

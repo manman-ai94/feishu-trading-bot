@@ -284,9 +284,9 @@ class Mt5Bench:
 def test_an_order_in_lots_goes_to_mt5_after_the_code():
     bench = Mt5Bench()
     preview = bench.say("做多 XAU 0.1手 止损 3780")
-    assert "0.1 手（合 10 XAU）" in preview.text and "确认 1111" in preview.text
+    assert "0.1 手（合 10 盎司）" in preview.text and "确认 1111" in preview.text
     done = bench.say("确认 1111")
-    assert "已成交 0.1 手（合 10 XAU），均价 3,800.30" in done.text
+    assert "已成交 0.1 手（合 10 盎司），均价 3,800.30" in done.text
     [ticket] = bench.fake.positions
     assert (ticket.volume, ticket.sl, ticket.comment) == (0.1, 3780.0, "ftb0001")
 
@@ -302,13 +302,13 @@ def test_a_size_from_the_stop_counts_the_spread_and_the_slippage():
     preview = bench.say("做多 XAU 止损 3780")
     # 1 % of 10 000 is 100; each ounce loses 20 to the stop, 0.3 to the spread and 0.76 to slippage: 4.74 oz.
     assert "点差 0.3" in preview.text and "滑点 0.76" in preview.text
-    assert "0.04 手（合 4 XAU）" in preview.text
+    assert "0.04 手（合 4 盎司）" in preview.text
     assert "含点差和滑点约" in preview.text and "手续费" not in preview.text  # a standard account pays in the spread
     with_fee = Mt5Bench(risk_per_trade_pct=1.0, mt5_commission_per_lot=7.0).say("做多 XAU 止损 3780")
     assert "含点差、手续费和滑点约" in with_fee.text and "手续费 0.07" in with_fee.text
     without = Mt5Bench(risk_per_trade_pct=1.0)
     without.fake.set_price(3800.0, 3800.0)  # no spread, and no slippage allowed for: 20 an ounce, 5 oz
-    assert "0.05 手（合 5 XAU）" in without.say("做多 XAU 止损 3780").text
+    assert "0.05 手（合 5 盎司）" in without.say("做多 XAU 止损 3780").text
 
 
 def test_the_stop_of_a_position_is_moved_on_mt5():

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .models import AccountState, Position
+from .models import AccountState, Position, size_text
 from .monitor import Event
 from .risk import AccountRisk, PositionRisk, leverage_line, liq_line, position_risk_lines
 
@@ -40,6 +40,8 @@ def _side(position: Position) -> str:
 
 
 def _size(position: Position) -> str:
+    if position.unit == "手":
+        return size_text(position)
     text = f"{position.qty:g} 张"
     if position.coins is not None and position.coin_ccy:
         text += f"（合 {position.coins:,.8g} {position.coin_ccy}）"

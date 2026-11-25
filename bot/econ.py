@@ -25,7 +25,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from .indicators import atr
-from .models import AccountState, OrderInfo, Position
+from .models import AccountState, OrderInfo, Position, size_text
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ def _side(direction: str) -> str:
 
 
 def position_line(position: Position, hour_atr: float | None) -> str:
-    size = f"{position.coins:,.8g} {position.coin_ccy}" if position.coins is not None and position.coin_ccy else f"{position.qty:,.10g} 张"
+    size = size_text(position)
     head = f"{position.inst_id} {_side(position.direction)}单 {size}，标记价 {_num(position.mark_px)}"
     stops = [s.sl_trigger_px for s in position.stops if s.sl_trigger_px is not None]
     if not stops:

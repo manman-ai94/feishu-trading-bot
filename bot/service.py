@@ -180,7 +180,9 @@ class Reporter:
             log.exception("could not measure the account's total risk")
             return []
         equity = Decimal(str(state.snapshot.total_eq or 0))
-        return card_lines(exposure, equity, self._cfg.trade_max_total_risk_pct)
+        # The unit of the losses: the account's own (USD on an MT5 account), USDT for OKX's USDT contracts.
+        ccy = state.positions[0].pnl_ccy if state.positions else ("USD" if self._cfg.mt5 else "USDT")
+        return card_lines(exposure, equity, self._cfg.trade_max_total_risk_pct, ccy)
 
     def account_for_ai(self, fresh: bool = False) -> str | None:
         """The account, the positions and every order waiting on it (the bot's and those placed by hand),

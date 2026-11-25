@@ -51,6 +51,8 @@ NEWS_AHEAD_SECONDS = 30 * 60
 NEWS_AFTER_SECONDS = 15 * 60  # the first quarter of an hour after a release is as wild as the run-up
 KEY_LEVEL_ATR = 0.25  # "near a key level": within this share of a normal day's range
 MAX_LEVELS = 4
+WHY_CHARS = 160  # the reason kept with each instrument's plan
+PLAN_EXCERPT_CHARS = 400  # a plan written before reasons were kept: this much of its text goes to the AI instead
 STATUS_TTL_SECONDS = 60.0
 STOP_TOLD_SETTING = "day_stop_told"  # the trading day whose stop was announced
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -66,8 +68,8 @@ PLAN_NOTE = """
 
 给程序的记录：
 在全文的最后另起一行，附一段给程序读的计划，交易员看不到这一段。程序靠它拦下和计划不符的开仓，所以必须和正文一致。格式严格如下，写在一行里，不要放进代码块：
-<plan>{"items":[{"inst":"XAU-USDT-SWAP","bias":"long","support":[支撑位],"resistance":[阻力位]}]}</plan>
-inst 写 OKX 的品种代码。bias 只能是 long（只做多）、short（只做空）、both（区间里两边都可以）或 none（观望，不开新仓）。support 和 resistance 各写一到四个最关键的价位，普通数字，不带逗号和引号，和正文里的数字完全一致。每个要做计划的品种写一项。"""
+<plan>{"items":[{"inst":"XAU-USDT-SWAP","bias":"long","support":[支撑位],"resistance":[阻力位],"why":"理由"}]}</plan>
+inst 写 OKX 的品种代码。bias 只能是 long（只做多）、short（只做空）、both（区间里两边都可以）或 none（观望，不开新仓）。support 和 resistance 各写一到四个最关键的价位，普通数字，不带逗号和引号，和正文里的数字完全一致。why 用一两句话（60 字以内）写为什么定这个方向，要和正文的理由一致：之后有人问“为什么今天这样定”，程序把它原样拿出来。每个要做计划的品种写一项。"""
 
 
 # ------------------------------------------------------------------ the trading day
@@ -113,12 +115,16 @@ class InstrumentPlan:
     bias: str  # long | short | both | none
     support: tuple[float, ...] = ()
     resistance: tuple[float, ...] = ()
+    why: str = ""  # the reason the plan gave for the direction, kept for "why is today 观望?"
 
     def allows(self, direction: str) -> bool:
         return self.bias == "both" or self.bias == direction
 
     def as_row(self) -> dict:
-        return {"inst": self.inst_id, "bias": self.bias, "support": list(self.support), "resistance": list(self.resistance)}
+        row = {"inst": self.inst_id, "bias": self.bias, "support": list(self.support), "resistance": list(self.resistance)}
+        if self.why:
+            row["why"] = self.why
+        return row
 
     @property
     def base(self) -> str:
@@ -171,7 +177,8 @@ def _item(row) -> InstrumentPlan | None:
     bias = str(row.get("bias", "")).strip().lower()
     if not _INSTRUMENT.match(inst_id) or bias not in BIASES:
         return None
-    return InstrumentPlan(inst_id, bias, _levels(row.get("support")), _levels(row.get("resistance")))
+    why = " ".join(str(row.get("why") or "").split())[:WHY_CHARS]
+    return InstrumentPlan(inst_id, bias, _levels(row.get("support")), _levels(row.get("resistance")), why)
 
 
 def extract_plan(text: str) -> tuple[str, tuple[InstrumentPlan, ...] | None]:
@@ -467,6 +474,7 @@ class Discipline:
                 levels = levels_text(item)
                 parts.append(f"{item.inst_id} {BIASES[item.bias]}" + (f"（{levels}）" if levels else ""))
             head = f"今天的交易计划（交易日 {day_label(day)}，程序存的）：{'；'.join(parts)}。"
+            head += self._plan_reasons(plan)
         if not with_status:
             return head
         try:
@@ -479,6 +487,19 @@ class Discipline:
         if self._cfg.plan_max_trades:
             left = f"今天还能开 {max(0, self._cfg.plan_max_trades - status.opened)} 笔新仓，"
         return head + f"{left}最近连亏 {status.streak} 笔。"
+
+    @staticmethod
+    def _plan_reasons(plan: DayPlan) -> str:
+        """Why the plan says what it says, as it was written: the reasons kept with each instrument, or, for a
+        plan written before they were kept, the start of its text. Asked "why 观望?", the AI quotes this rather
+        than making a reason up afterwards."""
+        reasons = [f"{item.inst_id}：{item.why}" for item in plan.items if item.why]
+        if reasons:
+            return f"写计划时的理由：{'；'.join(reasons)}。被问到为什么这样定时，先照这个理由说，再说现在有什么变化。"
+        excerpt = " ".join(plan.text.split())[:PLAN_EXCERPT_CHARS]
+        if not excerpt:
+            return ""
+        return f"写计划时的原文（开头一段）：{excerpt}……被问到为什么这样定时，按这段原文说，再说现在有什么变化。"
 
     def stop_alert(self) -> tuple[str, str]:
         """After a close: the notice that the day has just stopped, (with amounts, without); ("", "") when there

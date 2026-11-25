@@ -131,6 +131,9 @@ class FeishuClient:
         self._domain = domain.rstrip("/")
         self._ws: LongConnection | None = None  # the long connection, once listen() has made it
         self._http = http
+        # Applied to every text, title and card that goes out: on MT5 it puts the broker's names on things
+        # (XAUUSD, 现价) where the program says XAU-USD-SWAP and 标记价. None leaves the words as they are.
+        self.wording: Callable[[str], str] | None = None
         self._clock = clock
         self._token = ""
         self._token_until = 0.0
@@ -195,11 +198,14 @@ class FeishuClient:
         body = {"msg_type": msg_type, "content": json.dumps(content, ensure_ascii=False)}
         self._call("POST", f"/open-apis/im/v1/messages/{message_id}/reply", body=body)
 
+    def _worded(self, text: str | None) -> str | None:
+        return self.wording(text) if self.wording is not None and text else text
+
     def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
-        self._send(receive_id, receive_id_type, "text", {"text": text})
+        self._send(receive_id, receive_id_type, "text", {"text": self._worded(text)})
 
     def reply_text(self, message_id: str, text: str) -> None:
-        self._reply(message_id, "text", {"text": text})
+        self._reply(message_id, "text", {"text": self._worded(text)})
 
     def send_markdown(
         self,
@@ -211,6 +217,7 @@ class FeishuClient:
         footer: str | None = None,
     ) -> None:
         """Send a card; if Feishu rejects the card, fall back to plain text."""
+        title, markdown, footer = self._worded(title), self._worded(markdown), self._worded(footer)
         try:
             self._send(receive_id, receive_id_type, "interactive", markdown_card(title, markdown, template, footer))
         except FeishuError as exc:
@@ -218,6 +225,7 @@ class FeishuClient:
             self.send_text(receive_id, _as_plain_text(title, markdown, footer), receive_id_type)
 
     def reply_markdown(self, message_id: str, title: str, markdown: str, template: str = "blue", footer: str | None = None) -> None:
+        title, markdown, footer = self._worded(title), self._worded(markdown), self._worded(footer)
         try:
             self._reply(message_id, "interactive", markdown_card(title, markdown, template, footer))
         except FeishuError as exc:
